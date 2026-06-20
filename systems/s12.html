@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>12 Task scheduler — System Design Curriculum</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head><body>
+<div class="wrap">
+<nav class="side" id="side"></nav>
+<main><div class="reading" id="top">
+<div class="crumb"><a href="../index.html">Curriculum</a> / Part III · Systems / Cluster D — Coordination</div><h1>12 · Distributed Task Scheduler (Cadence / SQS+Lambda)</h1>
+<div class="summary"><div class="hard"><b>Hard constraint:</b> you can't have exactly-once execution and fault-tolerance without a too-expensive distributed transaction — accept at-least-once + idempotent workers.</div><div class="prims"><b>Primitives exercised:</b> <a href="../primitives/p9.html">P9</a>, <a href="../primitives/p10.html">P10</a> (cron firer), <a href="../primitives/p16.html">P16</a> (leasing).</div><p>Idempotency as first-class; visibility timeout; dead-letter queue; the "who fires the cron?" problem (single scheduler + distributed lock); task leasing with renewal.</p></div>
+
+<hr>
+
+<h2 class="sec">1 &middot; Requirements &amp; scale</h2>
+<p><b>Functional:</b> run a unit of work reliably &mdash; now, later, or on a schedule
+&mdash; with retries and no duplicate <em>effect</em>. <b>Non-functional:</b> at-least
+-once execution, fault tolerance, horizontal worker scale, visibility into failures.</p>
+<div class="estimate">Back-of-envelope
+10,000,000 tasks/day                         ~ 115/s avg, bursty
+each task: lease -> run -> ack, with retries
+delayed tasks                                 a future-time index scanned continuously
+</div>
+
+<h2 class="sec">2 &middot; High-level architecture</h2>
+<pre class="mermaid">
+graph LR
+  P[producer] --> Q[(task queue)]
+  Q -->|lease w/ visibility timeout| W1[worker]
+  Q --> W2[worker]
+  W1 -->|ack on success| Q
+  W1 -->|fail x N| DLQ[(dead-letter queue)]
+  SCH[scheduler + lock] -->|enqueue due tasks| Q
+</pre>
+
+<h2 class="sec">3 &middot; The hard constraint, in depth</h2>
+<div class="hard"><p>You cannot get both <b>exactly-once execution</b> and fault
+tolerance without an expensive distributed transaction. A worker can finish a task and
+crash before acking &mdash; so the task will run again. The accepted answer is
+<b>at-least-once delivery + idempotent workers</b> (<a href="../primitives/p9.html">P9</a>): make running
+twice produce the same result, and stop chasing true exactly-once.</p></div>
+
+<h2 class="sec">4 &middot; Component deep dives</h2>
+<h3>Visibility timeout &amp; leasing</h3>
+<p>When a worker picks up a task it becomes invisible to others for T seconds (the
+visibility timeout / lease). If the worker finishes and acks, the task is deleted; if it
+dies, the lease expires and another worker retakes it. Long tasks renew the lease.</p>
+<h3>Retries &amp; dead-letter queue</h3>
+<p>Transient failures retry with exponential backoff; after N failures the task moves to
+a <b>DLQ</b> for inspection so a poison message can&rsquo;t loop forever. You always want
+a DLQ.</p>
+<h3>Cron in a distributed system (P10)</h3>
+<p>"Who fires the scheduled job?" If every node fires it, it runs N times. The standard
+answer: a single scheduler elected via a distributed lock / leader election
+(<a href="../primitives/p10.html">P10</a>, <a href="../systems/s13.html">S13</a>), which enqueues due tasks for the
+worker pool.</p>
+
+<h2 class="sec">5 &middot; Real-world example</h2>
+<div class="example">
+<span class="tag">AWS SQS + Lambda &amp; Uber Cadence</span>
+<p>The simple case is <b>SQS + Lambda</b>: SQS provides at-least-once delivery, a
+<b>visibility timeout</b> so two consumers don&rsquo;t process the same message at once,
+and a built-in <b>dead-letter queue</b> after a max receive count; Lambda workers must
+be idempotent because redelivery happens. For complex multi-step jobs, Uber built
+<b>Cadence</b> (now Temporal), which persists workflow state so a long-running task
+resumes exactly where it left off after a crash and handles retries/timeouts as
+first-class concepts &mdash; the same at-least-once + idempotency philosophy, scaled to
+durable workflows (and the engine behind sagas, <a href="../primitives/p14.html">P14</a>).</p>
+</div>
+
+<h2 class="sec">6 &middot; Tradeoffs &amp; alternatives</h2>
+<p>A plain queue (SQS) is simple but you build orchestration yourself; a workflow engine
+(Temporal/Cadence) handles state and retries but is heavier. Shorter visibility timeouts
+recover from dead workers faster but risk double-processing live-but-slow ones.</p>
+
+<h2 class="sec">7 &middot; Key talking points</h2>
+<ul>
+<li>At-least-once + idempotent workers; drop the exactly-once dream (<a href="../primitives/p9.html">P9</a>).</li>
+<li>Visibility timeout / lease prevents double-running.</li>
+<li>Always a dead-letter queue for poison tasks.</li>
+<li>Single elected scheduler for cron (<a href="../primitives/p10.html">P10</a>).</li>
+<li>Exponential backoff on retries.</li>
+</ul>
+
+<h2 class="sec">8 &middot; Further reading</h2>
+<ul>
+<li><a href="https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-visibility-timeout.html">SQS visibility timeout</a> &middot; <a href="https://temporal.io/">Temporal</a></li>
+</ul>
+
+<div class="prevnext"><a href="s11.html">&larr; S11 &middot; Notification</a><a href="s13.html">S13 &middot; Distributed lock &rarr;</a></div>
+</div></main>
+</div>
+<a href="#top" class="backtop" title="Back to top">&uarr;</a>
+<script type="module">
+  import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+  mermaid.initialize({ startOnLoad: true, theme: 'neutral' });
+</script>
+<script>window.SITE_BASE="../";</script>
+<script src="../assets/site.js"></script>
+</body></html>

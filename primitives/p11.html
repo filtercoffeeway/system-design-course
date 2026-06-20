@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>P11 CDN / edge — System Design Curriculum</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head><body>
+<div class="wrap">
+<nav class="side" id="side"></nav>
+<main><div class="reading" id="top">
+<div class="crumb"><a href="../index.html">Curriculum</a> / Part II · Primitives / P11</div><h1>P11 · CDN &amp; edge caching</h1>
+<div class="summary"><div class="field"><b>What it is:</b> serving bytes from a node close to the user, so origin only sees cache misses.</div>
+<div class="field"><b>Reach for it when:</b> large static assets at high concurrency, or any read-heavy content with geographic spread.</div>
+<div class="field"><b>The lever:</b> origin populates the CDN; CDN serves users; the design question becomes "what populates the edge and how is it invalidated?" 301 (cached forever, cheap, kills analytics) vs 302 (always hits you, countable).</div>
+<div class="newprob"><b>New problem it hands you:</b> edge staleness/invalidation; cache-miss stampede on origin; cost of cache fill for long-tail content.</div>
+<div class="prims"><b>Exemplified by:</b> <a href="../systems/s16.html">Video streaming</a>, <a href="../systems/s14.html">URL shortener</a>.</div></div>
+
+<hr>
+
+<h2 class="sec">1 &middot; The problem it solves</h2>
+<p>Serving large or popular content from a single origin to a global audience is slow
+(speed of light) and ruinously expensive (origin bandwidth). A <b>CDN</b> caches
+content at <b>edge</b> locations near users so the origin only handles cache misses.</p>
+
+<h2 class="sec">2 &middot; How it works</h2>
+<pre class="mermaid">
+graph LR
+  U[user] --> E[edge PoP near user]
+  E -->|hit| U
+  E -->|miss: pull once| O[origin]
+  O --> E
+</pre>
+<p>The user hits the nearest point of presence; on a hit it&rsquo;s served from the
+edge, on a miss the edge pulls from origin once and caches it. The design question
+becomes "what populates the edge, and how is it invalidated?" &mdash; not "how do I
+serve the bytes?" For redirects, <code>301</code> is cached by browsers (cheap, but you
+lose click analytics) while <code>302</code> always returns to you (countable, pricier).</p>
+
+<h2 class="sec">3 &middot; The new bottleneck it hands you</h2>
+<div class="newprob">
+<p><b>Invalidation/staleness</b> at the edge (purging across hundreds of PoPs is its
+own system), <b>cache-miss stampede</b> on origin when a popular object expires
+everywhere at once, and the <b>cost of filling</b> the long tail (rarely-watched
+content that never gets a hit to amortize the fill).</p>
+</div>
+
+<h2 class="sec">4 &middot; Real-world example</h2>
+<div class="example">
+<span class="tag">Netflix Open Connect</span>
+<p>Netflix runs its own CDN, <b>Open Connect</b>, and places purpose-built caching
+appliances <em>inside ISP networks and internet exchanges</em> &mdash; as close to
+subscribers as physically possible. Crucially it <b>pre-positions</b> content:
+during off-peak hours Open Connect proactively pushes the titles predicted to be
+popular in each region onto those appliances, so at peak almost every byte is served
+from an edge box on the user&rsquo;s own ISP and the origin serves almost nothing. That
+is "what populates the edge?" answered by prediction rather than on-demand misses. See
+<a href="../systems/s16.html">Video streaming</a>.</p>
+</div>
+
+<h2 class="sec">5 &middot; Applying it in a design</h2>
+<p>For any static/large/read-heavy asset: <i>"CDN at the edge; origin only takes
+misses; the real work is the fill and invalidation strategy."</i> Pair with
+<a href="../primitives/p4.html">caching</a> patterns at the edge.</p>
+
+<h2 class="sec">6 &middot; Pitfalls</h2>
+<ul>
+<li>Designing the serving path but ignoring the fill/invalidation path.</li>
+<li>Synchronized TTL expiry causing origin stampede.</li>
+</ul>
+
+<h2 class="sec">7 &middot; Further reading</h2>
+<ul>
+<li><a href="https://openconnect.netflix.com/en/">Netflix Open Connect</a></li>
+</ul>
+
+<div class="prevnext"><a href="p10.html">&larr; P10 &middot; Consensus / fencing</a><a href="p12.html">P12 &middot; Tail latency &rarr;</a></div>
+</div></main>
+</div>
+<a href="#top" class="backtop" title="Back to top">&uarr;</a>
+<script type="module">
+  import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+  mermaid.initialize({ startOnLoad: true, theme: 'neutral' });
+</script>
+<script>window.SITE_BASE="../";</script>
+<script src="../assets/site.js"></script>
+</body></html>

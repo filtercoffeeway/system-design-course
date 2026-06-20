@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>P4 Caching — System Design Curriculum</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head><body>
+<div class="wrap">
+<nav class="side" id="side"></nav>
+<main><div class="reading" id="top">
+<div class="crumb"><a href="../index.html">Curriculum</a> / Part II · Primitives / P4</div><h1>P4 · Caching strategies</h1>
+<div class="summary"><div class="field"><b>What it is:</b> a fast tier in front of a slow one, exploiting locality.</div>
+<div class="field"><b>Reach for it when:</b> reads dominate writes and read latency is the complaint (the URL shortener is 1000:1 reads:writes — a caching problem in a storage costume).</div>
+<div class="field"><b>The lever:</b> placement (client, edge/CDN, app-tier, DB buffer pool); write policy — cache-aside (lazy), write-through (consistent, slower writes), write-back (fast writes, crash risk); eviction (LRU/LFU/TTL).</div>
+<div class="newprob"><b>New problem it hands you: invalidation</b> (stale data when the source changes) and <b>stampede / thundering herd</b> (a hot key expires, N requests hit origin at once — mitigate with coalescing, early refresh, locks). Plus cold-start misses and memory cost.</div>
+<div class="prims"><b>Exemplified by:</b> <a href="../systems/s14.html">URL shortener</a>, <a href="../systems/s16.html">Video (CDN)</a>, <a href="../systems/s9.html">Social feed</a>, <a href="../systems/s10.html">Chat</a>, <a href="../systems/s3.html">KV (Bloom filter)</a>.</div></div>
+
+<hr>
+
+<h2 class="sec">1 &middot; The problem it solves</h2>
+<p>The cheapest request is the one you don&rsquo;t make. A cache puts a fast tier in
+front of a slow one (memory in front of disk, an edge node in front of an origin) and
+exploits locality: a small set of hot items serves most reads. The
+<a href="../systems/s14.html">URL shortener</a> is 1000:1 reads:writes &mdash; it is a caching problem
+wearing a storage costume.</p>
+
+<h2 class="sec">2 &middot; How it works (cache-aside)</h2>
+<pre class="mermaid">
+graph LR
+  A[app] -->|1 get| C[(cache)]
+  C -->|hit| A
+  A -->|2 miss -> read| DB[(database)]
+  DB --> A
+  A -->|3 set| C
+</pre>
+<p>The dominant pattern is <b>cache-aside</b>: app checks cache, on miss reads the DB
+and populates the cache. <b>Write-through</b> writes cache and DB together
+(consistent, slower writes). <b>Write-back</b> writes cache now and DB later (fast,
+risky on crash). Eviction is LRU/LFU/TTL.</p>
+
+<h2 class="sec">3 &middot; The new bottleneck it hands you</h2>
+<div class="newprob">
+<p><b>Invalidation</b> &mdash; one of the two hard problems in CS &mdash; is keeping the
+cache honest when the source changes; a stale entry serves wrong data until it expires
+or is purged. <b>Stampede / thundering herd</b>: a hot key expires and thousands of
+requests miss simultaneously and crush the origin. Defenses: request coalescing (one
+miss fills, others wait), probabilistic early expiration, and <b>leases</b>. Plus
+cold-start misses and the memory cost of the cache itself.</p>
+</div>
+
+<h2 class="sec">4 &middot; Real-world example</h2>
+<div class="example">
+<span class="tag">Facebook (Memcache)</span>
+<p>Facebook&rsquo;s "Scaling Memcache at Facebook" (NSDI 2013) is the canonical caching
+war story. Two of their fixes map straight to the bottlenecks above. <b>Leases</b>
+attack both stampedes and stale sets: on a miss, memcache hands exactly one client a
+lease token to recompute the value; other clients wait briefly rather than all
+hitting the DB, and a stale set whose lease was invalidated is rejected. They also run
+<b>pools</b> (separating high-churn keys from stable ones so eviction patterns
+don&rsquo;t interfere) and <b>regional replication</b> with a careful invalidation
+pipeline driven off the database commit log. The lesson: at scale, the cache&rsquo;s
+hard problems are invalidation and stampede, not hit rate.</p>
+</div>
+
+<h2 class="sec">5 &middot; Applying it in a design</h2>
+<p>Reach for a cache the moment reads dominate and a hot set exists. Name the tradeoff:
+<i>"cache-aside with a short TTL; I&rsquo;ll coalesce misses to prevent stampede and
+accept bounded staleness."</i> If you can&rsquo;t tolerate staleness, move to
+write-through and invalidate on write.</p>
+
+<h2 class="sec">6 &middot; Pitfalls</h2>
+<ul>
+<li>No stampede protection on hot keys.</li>
+<li>Caching with no invalidation plan ("we&rsquo;ll just TTL it" hides bugs).</li>
+<li>Caching user-specific data with a shared key (leaks across users).</li>
+</ul>
+
+<h2 class="sec">7 &middot; Further reading</h2>
+<ul>
+<li><a href="https://www.usenix.org/system/files/conference/nsdi13/nsdi13-final170_update.pdf">Scaling Memcache at Facebook (NSDI 2013)</a></li>
+<li><a href="https://redis.io/docs/latest/develop/use/patterns/">Redis caching patterns</a></li>
+</ul>
+
+<div class="prevnext"><a href="p3.html">&larr; P3 &middot; Replication / consistency</a><a href="p5.html">P5 &middot; Write- vs read-time &rarr;</a></div>
+</div></main>
+</div>
+<a href="#top" class="backtop" title="Back to top">&uarr;</a>
+<script type="module">
+  import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+  mermaid.initialize({ startOnLoad: true, theme: 'neutral' });
+</script>
+<script>window.SITE_BASE="../";</script>
+<script src="../assets/site.js"></script>
+</body></html>

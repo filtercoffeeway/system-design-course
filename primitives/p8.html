@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>P8 Tiered / columnar — System Design Curriculum</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head><body>
+<div class="wrap">
+<nav class="side" id="side"></nav>
+<main><div class="reading" id="top">
+<div class="crumb"><a href="../index.html">Curriculum</a> / Part II · Primitives / P8</div><h1>P8 · Tiered &amp; columnar storage</h1>
+<div class="summary"><div class="field"><b>What it is:</b> matching the storage format and medium to the access pattern and the data's age.</div>
+<div class="field"><b>Reach for it when:</b> storage cost grows unbounded, or analytical scans read few columns over many rows.</div>
+<div class="field"><b>The lever:</b> columnar layout (Parquet/ORC) to read only projected columns; compression (Gorilla for time series); immutable time-partitioned blocks; lifecycle tiers hot→warm→cold by access-frequency decay.</div>
+<div class="newprob"><b>New problem it hands you:</b> cold-tier read latency; (de)compression CPU; columnar is great for scans but poor for point writes/updates; immutability turns updates into append + compaction.</div>
+<div class="prims"><b>Exemplified by:</b> <a href="../systems/s6.html">Datadog</a>, <a href="../systems/s8.html">Distributed SQL</a>, <a href="../systems/s5.html">Object store</a>, <a href="../systems/s16.html">Video</a>.</div></div>
+
+<hr>
+
+<h2 class="sec">1 &middot; The problem it solves</h2>
+<p>Two different cost problems: analytical queries that read a few columns over
+billions of rows waste enormous I/O in a row store, and data that is rarely read
+shouldn&rsquo;t sit on expensive hot storage. <b>Columnar</b> layout fixes the first;
+<b>tiering</b> fixes the second.</p>
+
+<h2 class="sec">2 &middot; How it works</h2>
+<p><b>Columnar</b> (Parquet, ORC): store all values of a column together. A query that
+selects 3 of 200 columns reads only those 3, and same-type runs compress beautifully
+(dictionary, run-length, delta). <b>Tiering</b>: keep recent/hot data on fast storage,
+roll older data to cheaper tiers on an access-frequency decay
+(hot &rarr; warm &rarr; cold/archive). Time-series systems combine both: immutable,
+time-partitioned, compressed blocks that age into object storage.</p>
+<pre class="mermaid">
+graph LR
+  H[hot: SSD, fine-grained] --> W[warm: rolled up]
+  W --> C[cold: object store / archive]
+</pre>
+
+<h2 class="sec">3 &middot; The new bottleneck it hands you</h2>
+<div class="newprob">
+<p>Columnar is superb for scans but <b>poor for point writes/updates</b> &mdash; you
+rewrite column files, so it&rsquo;s append/batch oriented, not OLTP. Compression trades
+<b>CPU</b> for I/O. Tiering trades <b>cold-tier latency</b> (a query over archived data
+is slow) and, for object storage, request cost. Immutability means updates become
+append + compaction.</p>
+</div>
+
+<h2 class="sec">4 &middot; Real-world example</h2>
+<div class="example">
+<span class="tag">Google Dremel / BigQuery</span>
+<p>Dremel (the engine behind BigQuery) stores data in a <b>columnar</b> format and
+scans only the projected columns across thousands of nodes, which is how it scans
+terabytes in seconds without indexes &mdash; the columnar read is the optimization. Its
+open-source descendant <b>Parquet</b> is now the default analytical file format
+(used by Spark, Presto, Snowflake). On the tiering side, Amazon <b>S3 storage
+classes</b> (Standard &rarr; Infrequent Access &rarr; Glacier) implement the
+access-frequency decay model: cheaper per-GB, slower/per-request-pricier to read.</p>
+</div>
+
+<h2 class="sec">5 &middot; Applying it in a design</h2>
+<p>For analytics: <i>"columnar storage with predicate/projection pushdown so we only
+read needed columns."</i> For cost: <i>"hot data fine-grained on SSD, roll up and tier
+to object storage after N days."</i> See <a href="../systems/s8.html">Distributed SQL</a> and
+<a href="../systems/s6.html">Datadog</a>.</p>
+
+<h2 class="sec">6 &middot; Pitfalls</h2>
+<ul>
+<li>Using columnar for a write-heavy OLTP workload.</li>
+<li>Tiering data to cold storage that&rsquo;s still queried interactively.</li>
+</ul>
+
+<h2 class="sec">7 &middot; Further reading</h2>
+<ul>
+<li><a href="https://research.google/pubs/pub36632/">Dremel: Interactive Analysis of Web-Scale Datasets</a></li>
+<li><a href="https://parquet.apache.org/">Apache Parquet</a> &middot; <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/storage-class-intro.html">S3 storage classes</a></li>
+</ul>
+
+<div class="prevnext"><a href="p7.html">&larr; P7 &middot; Scatter-gather</a><a href="p9.html">P9 &middot; Idempotency &rarr;</a></div>
+</div></main>
+</div>
+<a href="#top" class="backtop" title="Back to top">&uarr;</a>
+<script type="module">
+  import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+  mermaid.initialize({ startOnLoad: true, theme: 'neutral' });
+</script>
+<script>window.SITE_BASE="../";</script>
+<script src="../assets/site.js"></script>
+</body></html>

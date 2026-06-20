@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>3 Key-value store — System Design Curriculum</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head><body>
+<div class="wrap">
+<nav class="side" id="side"></nav>
+<main><div class="reading" id="top">
+<div class="crumb"><a href="../index.html">Curriculum</a> / Part III · Systems / Cluster A — Foundations</div><h1>3 · Key-Value Store (Redis / DynamoDB-style)</h1>
+<div class="summary"><div class="hard"><b>Hard constraint:</b> CAP felt viscerally — under partition, return stale (AP) or error (CP). The choice is the application's, and you must reason about it explicitly.</div><div class="prims"><b>Primitives exercised:</b> <a href="../primitives/p17.html">P17</a> (LSM/WAL/Bloom), <a href="../primitives/p2.html">P2</a> (consistent hashing), <a href="../primitives/p3.html">P3</a>, <a href="../primitives/p4.html">P4</a>.</div><p>LSM vs B-tree; WAL for crash recovery; consistent hashing; single-/multi-leader/leaderless quorum; eventual consistency + vector clocks; Bloom filters to skip disk on misses.</p></div>
+
+<hr>
+
+<h2 class="sec">1 &middot; Requirements &amp; scale</h2>
+<p><b>Functional:</b> <code>get(key)</code> / <code>put(key, value)</code> at planet
+scale, always-on. <b>Non-functional:</b> very high throughput, low latency,
+incremental scalability, and tolerance of node and network failure &mdash; with a
+deliberate consistency choice.</p>
+<div class="estimate">Back-of-envelope
+100,000,000,000 keys x 1 KB                 = 100 TB logical
+replication factor 3                         = 300 TB
+1,000,000 ops/s / 50,000 ops/s per node      ~ 20+ nodes just for throughput
+</div>
+
+<h2 class="sec">2 &middot; High-level architecture</h2>
+<pre class="mermaid">
+graph LR
+  C[client] --> CO[coordinator node]
+  CO -->|consistent hash ring| N1[replica 1]
+  CO --> N2[replica 2]
+  CO --> N3[replica 3]
+</pre>
+<p>Keys are placed on a consistent-hash ring (<a href="../primitives/p2.html">P2</a>) and replicated to
+the next N nodes. Any node can coordinate a request; writes/reads use quorums.</p>
+
+<h2 class="sec">3 &middot; The hard constraint, in depth</h2>
+<div class="hard"><p>CAP is felt viscerally here. Under a network partition you must
+either return a possibly-stale value (AP) or refuse to answer (CP). Dynamo-style stores
+choose <b>availability</b> and expose tunable quorums (R + W &gt; N for read-your-writes
+overlap); a CP store like a Raft-replicated KV chooses consistency and rejects writes
+in a minority partition. The interviewer wants you to pick deliberately and justify
+it from the use case.</p></div>
+
+<h2 class="sec">4 &middot; Component deep dives</h2>
+<h3>Storage engine (P17)</h3>
+<p>LSM-tree (memtable &rarr; SSTables &rarr; compaction) for write-heavy workloads, WAL
+for durability, Bloom filters to skip disk on misses &mdash; see <a href="../primitives/p17.html">P17</a>.</p>
+<h3>Partitioning &amp; replication (P2, P3)</h3>
+<p>Consistent hashing with virtual nodes spreads data and makes scaling incremental;
+each key&rsquo;s value is replicated to N successors. Quorum reads/writes and tunable
+consistency are the <a href="../primitives/p3.html">P3</a> dial.</p>
+<h3>Conflict handling</h3>
+<p>With leaderless writes, two clients can update concurrently. <b>Vector clocks /
+version vectors</b> detect causally-concurrent versions; the app (or last-writer-wins)
+reconciles. <b>Hinted handoff</b> lets a temporarily-down replica&rsquo;s writes be
+parked on a neighbor and replayed later; <b>Merkle-tree anti-entropy</b> repairs
+divergent replicas in the background.</p>
+
+<h2 class="sec">5 &middot; Real-world example</h2>
+<div class="example">
+<span class="tag">Amazon Dynamo / DynamoDB</span>
+<p>Amazon&rsquo;s 2007 <b>Dynamo</b> paper is the blueprint: consistent hashing + virtual
+nodes, quorum reads/writes (R + W &gt; N), vector clocks for conflict detection, hinted
+handoff for transient failures, and Merkle trees for anti-entropy &mdash; all chosen to
+keep the shopping cart writable even during failures (an "add to cart" must never be
+rejected). The managed descendant, <b>DynamoDB</b>, keeps the partitioned + replicated
+core (three AZs) and exposes the consistency dial as eventually- vs strongly-consistent
+reads. Cassandra and Riak are open-source embodiments of the same paper.</p>
+</div>
+
+<h2 class="sec">6 &middot; Tradeoffs &amp; alternatives</h2>
+<p>Leaderless AP maximizes availability but pushes conflict handling onto you. A
+Raft/Paxos-replicated CP KV (etcd-like) gives linearizable reads but sacrifices
+availability in a partition and write throughput. The hot-key problem (<a href="../primitives/p2.html">P2</a>)
+&mdash; a single wide partition &mdash; is the classic operational failure.</p>
+
+<h2 class="sec">7 &middot; Key talking points</h2>
+<ul>
+<li>Open with the CAP choice and justify AP vs CP from the use case.</li>
+<li>Consistent hashing + vnodes for elastic partitioning (<a href="../primitives/p2.html">P2</a>).</li>
+<li>Quorums (R + W &gt; N) as the consistency dial (<a href="../primitives/p3.html">P3</a>).</li>
+<li>LSM + WAL + Bloom internals (<a href="../primitives/p17.html">P17</a>).</li>
+<li>Vector clocks, hinted handoff, Merkle anti-entropy for AP correctness.</li>
+</ul>
+
+<h2 class="sec">8 &middot; Further reading</h2>
+<ul>
+<li><a href="https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf">Dynamo (SOSP 2007)</a></li>
+<li><a href="https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Introduction.html">Amazon DynamoDB docs</a></li>
+</ul>
+
+<div class="prevnext"><a href="s2.html">&larr; S2 &middot; Kafka</a><a href="s4.html">S4 &middot; RDBMS scaling &rarr;</a></div>
+</div></main>
+</div>
+<a href="#top" class="backtop" title="Back to top">&uarr;</a>
+<script type="module">
+  import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+  mermaid.initialize({ startOnLoad: true, theme: 'neutral' });
+</script>
+<script>window.SITE_BASE="../";</script>
+<script src="../assets/site.js"></script>
+</body></html>

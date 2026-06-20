@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>16 Video streaming — System Design Curriculum</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head><body>
+<div class="wrap">
+<nav class="side" id="side"></nav>
+<main><div class="reading" id="top">
+<div class="crumb"><a href="../index.html">Curriculum</a> / Part III · Systems / Cluster E — Domain-specific</div><h1>16 · Video Streaming (YouTube / Netflix)</h1>
+<div class="summary"><div class="hard"><b>Hard constraint:</b> you never stream origin→user at scale; every byte must be cached at the edge — the question is always "what populates the CDN?"</div><div class="prims"><b>Primitives exercised:</b> <a href="../primitives/p11.html">P11</a>, <a href="../primitives/p8.html">P8</a>, <a href="../primitives/p1.html">P1</a> (chunked upload + async transcode).</div><p>Encoding pipeline (one upload → N renditions via async workers); adaptive bitrate (HLS/DASH, player switches on static segments); CDN as the entire read path; resumable chunked upload; manifest files.</p></div>
+
+<hr>
+
+<h2 class="sec">1 &middot; Requirements &amp; scale</h2>
+<p><b>Functional:</b> upload, transcode, store, and stream video to huge concurrent
+audiences across varying devices and bandwidths. <b>Non-functional:</b> smooth playback
+(adaptive quality), low startup latency, and origin bandwidth that doesn&rsquo;t melt.</p>
+<div class="estimate">Back-of-envelope
+peak: tens of millions of concurrent streams x several Mbps = many Tbps
+one upload -> N renditions (240p..4K) x codecs = large transcode fan-out
+=> you cannot serve this from origin; the CDN is the system
+</div>
+
+<h2 class="sec">2 &middot; High-level architecture</h2>
+<pre class="mermaid">
+graph LR
+  UP[upload] --> CH[chunked store]
+  CH --> TR[transcode workers: N renditions]
+  TR --> OBJ[(object store: segments + manifests)]
+  OBJ --> CDN[CDN edge]
+  CDN --> PLY[player: adaptive bitrate]
+</pre>
+
+<h2 class="sec">3 &middot; The hard constraint, in depth</h2>
+<div class="hard"><p>You <b>never stream origin&rarr;user at scale</b>. Every video byte
+must be served from a CDN edge near the user; the origin only fills the edge. So the real
+design question is always <em>"what populates the CDN, and when?"</em> &mdash; not "how do
+I serve the video?" (<a href="../primitives/p11.html">P11</a>).</p></div>
+
+<h2 class="sec">4 &middot; Component deep dives</h2>
+<h3>Encoding pipeline</h3>
+<p>One upload becomes many <b>renditions</b> (resolutions/bitrates/codecs) produced by
+async transcode workers &mdash; an embarrassingly parallel batch job. Each rendition is cut
+into short <b>segments</b> (2&ndash;10s).</p>
+<h3>Adaptive bitrate (ABR)</h3>
+<p><b>HLS/DASH</b>: the server publishes a <b>manifest</b> listing segment URLs per
+rendition; the <em>player</em> measures bandwidth and switches quality segment-by-segment.
+The server just serves static files &mdash; intelligence lives in the client.</p>
+<h3>CDN &amp; fill (P11)</h3>
+<p>Segments live in an <a href="../systems/s5.html">object store</a> and are cached at the edge; popular
+titles are pre-positioned (<a href="../primitives/p11.html">P11</a>). Origin sees only misses.</p>
+<h3>Resumable upload</h3>
+<p>Large files upload in chunks by index so a dropped connection resumes mid-file.</p>
+
+<h2 class="sec">5 &middot; Real-world example</h2>
+<div class="example">
+<span class="tag">Netflix</span>
+<p>Netflix transcodes each title into a large matrix of renditions (per resolution,
+bitrate, codec, and even per-title/per-scene optimized encodes) ahead of time, cuts them
+into segments, and serves everything via its own CDN, <b>Open Connect</b>
+(<a href="../primitives/p11.html">P11</a>), whose appliances sit inside ISPs. During off-peak it
+<b>pre-positions</b> predicted-popular content onto those boxes, so at peak the user
+streams from an edge appliance on their own ISP and Netflix&rsquo;s origin serves almost
+nothing. The player runs adaptive bitrate over the segment manifest. Encoding is a batch
+problem; serving is a CDN problem.</p>
+</div>
+
+<h2 class="sec">6 &middot; Tradeoffs &amp; alternatives</h2>
+<p>More renditions = better quality/efficiency per device but more transcode cost and
+storage. Pre-positioning wastes storage on titles that flop but guarantees peak
+performance; on-demand fill is cheaper but risks origin load. Own-CDN (Netflix) vs
+commercial CDN (most others) trades capex/control for simplicity.</p>
+
+<h2 class="sec">7 &middot; Key talking points</h2>
+<ul>
+<li>The CDN is the system; origin only fills it (<a href="../primitives/p11.html">P11</a>).</li>
+<li>One upload &rarr; many renditions via async transcode.</li>
+<li>ABR (HLS/DASH): static segments + manifest, smarts in the player.</li>
+<li>Pre-position popular content; segments in object store (<a href="../systems/s5.html">S5</a>, <a href="../primitives/p8.html">P8</a>).</li>
+<li>Chunked resumable upload.</li>
+</ul>
+
+<h2 class="sec">8 &middot; Further reading</h2>
+<ul>
+<li><a href="https://openconnect.netflix.com/en/">Netflix Open Connect</a> &middot; <a href="https://netflixtechblog.com/">Netflix Tech Blog (per-title encoding)</a></li>
+</ul>
+
+<div class="prevnext"><a href="s15.html">&larr; S15 &middot; Ride-sharing</a><a href="s17.html">S17 &middot; Payment &rarr;</a></div>
+</div></main>
+</div>
+<a href="#top" class="backtop" title="Back to top">&uarr;</a>
+<script type="module">
+  import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+  mermaid.initialize({ startOnLoad: true, theme: 'neutral' });
+</script>
+<script>window.SITE_BASE="../";</script>
+<script src="../assets/site.js"></script>
+</body></html>

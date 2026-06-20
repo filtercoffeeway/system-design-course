@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>P5 Write- vs read-time — System Design Curriculum</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head><body>
+<div class="wrap">
+<nav class="side" id="side"></nav>
+<main><div class="reading" id="top">
+<div class="crumb"><a href="../index.html">Curriculum</a> / Part II · Primitives / P5</div><h1>P5 · Write-time vs read-time cost (fan-out &amp; precomputation)</h1>
+<div class="summary"><div class="field"><b>What it is:</b> choosing <em>when</em> you pay for an answer — eagerly at write (precompute) or lazily at read (on demand).</div>
+<div class="field"><b>Reach for it when:</b> a single event must reach many consumers, or an expensive query is read far more than its inputs change.</div>
+<div class="field"><b>The lever:</b> fan-out on write/materialize (fast reads, expensive writes, storage grows with audience); fan-out on read/compute-on-demand (cheap writes, slow reads); hybrid by node degree or query frequency. Write-time rollup vs read-time aggregation is the same dial for metrics.</div>
+<div class="newprob"><b>New problem it hands you:</b> push → storage blowup and the <b>hot producer</b> (celebrity write triggers millions of synchronous fan-outs). Pull → read latency and repeated recompute. Hybrid → two code paths + a hot-node classifier.</div>
+<div class="prims"><b>Exemplified by:</b> <a href="../systems/s9.html">Social feed</a>, <a href="../systems/s6.html">Datadog</a>, <a href="../systems/s14.html">URL shortener</a>, <a href="../systems/s11.html">Notification</a>.</div></div>
+
+<hr>
+
+<h2 class="sec">1 &middot; The problem it solves</h2>
+<p>Some answers are expensive to compute. You can pay at <b>write time</b>
+(precompute and store the answer so reads are cheap) or at <b>read time</b> (store the
+inputs and compute on demand). This is the deepest tension in feeds, notifications,
+and analytics: write amplification vs read amplification.</p>
+
+<h2 class="sec">2 &middot; How it works (fan-out)</h2>
+<pre class="mermaid">
+graph TD
+  POST[user posts] -->|fan-out on write| F1[follower feed]
+  POST --> F2[follower feed]
+  POST --> F3[follower feed]
+  RP[reader opens feed] -->|fan-out on read| M[merge followees on the fly]
+</pre>
+<p><b>Fan-out on write</b> pushes a new item into every consumer&rsquo;s precomputed
+view: reads are O(1), but a write costs O(audience) and storage grows with audience.
+<b>Fan-out on read</b> stores the item once and merges at query time: writes are
+cheap, reads are expensive. <b>Hybrid</b> picks per node based on degree.</p>
+
+<h2 class="sec">3 &middot; The new bottleneck it hands you</h2>
+<div class="newprob">
+<p>Push gives you <b>storage blow-up</b> and the <b>hot producer</b>: one write from an
+account with 100M followers triggers 100M synchronous fan-out operations &mdash; the
+naive push model collapses on celebrities (<a href="../systems/s9.html">social feed</a>). Pull gives
+you <b>slow reads</b> and repeated recomputation. Hybrid gives you two code paths plus
+a classifier deciding who is "hot."</p>
+</div>
+
+<h2 class="sec">4 &middot; Real-world example</h2>
+<div class="example">
+<span class="tag">Twitter timelines</span>
+<p>Twitter&rsquo;s home timeline is the textbook hybrid. For ordinary users it
+<b>fans out on write</b>: a tweet is pushed into each follower&rsquo;s precomputed
+timeline (held in Redis), so reading your timeline is a fast cache read. But for
+accounts with millions of followers, pushing to every follower is prohibitively
+expensive, so those tweets are <b>pulled at read time</b> and merged into your timeline
+when you load it. The system literally chooses the strategy per author based on
+follower count &mdash; the consequence chain (push&rarr;hot producer) forced the split.</p>
+</div>
+
+<h2 class="sec">5 &middot; Applying it in a design</h2>
+<p>Ask: how lopsided is read vs write, and how skewed is fan-out? Default to push for
+fast reads, then carve out the heavy hitters to pull. Say: <i>"fan-out on write into a
+per-user timeline, hybrid pull for celebrity accounts to dodge the write
+amplification."</i> The same dial appears in metrics as write-time rollup vs read-time
+aggregation (<a href="../systems/s6.html">Datadog</a>).</p>
+
+<h2 class="sec">6 &middot; Pitfalls</h2>
+<ul>
+<li>Pure push with no celebrity carve-out.</li>
+<li>Precomputing views that are rarely read (wasted writes/storage).</li>
+<li>Forgetting ranking: an ML-ranked feed can&rsquo;t be a simple chronological merge.</li>
+</ul>
+
+<h2 class="sec">7 &middot; Further reading</h2>
+<ul>
+<li><a href="https://www.infoq.com/presentations/Twitter-Timeline-Scalability/">Twitter timeline scalability (InfoQ)</a></li>
+<li>See <a href="../systems/s9.html">Social feed</a> for the full system.</li>
+</ul>
+
+<div class="prevnext"><a href="p4.html">&larr; P4 &middot; Caching</a><a href="p6.html">P6 &middot; Inverted index &rarr;</a></div>
+</div></main>
+</div>
+<a href="#top" class="backtop" title="Back to top">&uarr;</a>
+<script type="module">
+  import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+  mermaid.initialize({ startOnLoad: true, theme: 'neutral' });
+</script>
+<script>window.SITE_BASE="../";</script>
+<script src="../assets/site.js"></script>
+</body></html>

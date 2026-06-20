@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>P13 Real-time / routing — System Design Curriculum</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head><body>
+<div class="wrap">
+<nav class="side" id="side"></nav>
+<main><div class="reading" id="top">
+<div class="crumb"><a href="../index.html">Curriculum</a> / Part II · Primitives / P13</div><h1>P13 · Real-time connections &amp; routing</h1>
+<div class="summary"><div class="field"><b>What it is:</b> maintaining persistent bidirectional channels to many clients and delivering a message to the right one.</div>
+<div class="field"><b>Reach for it when:</b> server-initiated push, live updates, presence.</div>
+<div class="field"><b>The lever:</b> WebSocket/SSE; stateful connection servers; a fast lookup <code>user_id → server_id</code> (Redis) updated on every connect/disconnect; per-conversation sequence numbers for ordering.</div>
+<div class="newprob"><b>New problem it hands you: routing</b> — which of 10k connection servers holds recipient B's socket? The lookup must be fast and consistent. Connection state is hard to scale and fail over; reconnection needs dedup.</div>
+<div class="prims"><b>Exemplified by:</b> <a href="../systems/s10.html">Chat</a>, <a href="../systems/s11.html">Notification</a>.</div></div>
+
+<hr>
+
+<h2 class="sec">1 &middot; The problem it solves</h2>
+<p>Request/response over HTTP is client-initiated; it can&rsquo;t push. For chat, live
+updates, and presence you need the server to send to the client the instant something
+happens, over a <b>persistent connection</b> &mdash; and then you need to find the
+right connection among millions.</p>
+
+<h2 class="sec">2 &middot; How it works</h2>
+<pre class="mermaid">
+graph LR
+  A[user A] <-->|WebSocket| GA[gateway 3]
+  B[user B] <-->|WebSocket| GB[gateway 47]
+  GA -->|"lookup: B -> gw47"| RT[(routing registry)]
+  GA -->|forward| GB
+  GB --> B
+</pre>
+<p><b>WebSocket</b> (or SSE for one-way) holds an open, stateful connection on a
+<b>connection/gateway server</b>. To deliver A&rarr;B, A&rsquo;s gateway must learn
+which gateway holds B&rsquo;s socket via a fast registry
+(<code>user_id &rarr; server_id</code>, e.g. in Redis), updated on every connect and
+disconnect. Per-conversation sequence numbers give ordering.</p>
+
+<h2 class="sec">3 &middot; The new bottleneck it hands you</h2>
+<div class="newprob">
+<p><b>Routing</b> is the hard part: the registry must be fast, consistent, and updated
+on every churn event (millions of connects/disconnects). <b>Connection state</b> is
+hard to scale and to fail over &mdash; if a gateway dies, every client must reconnect
+and re-register. Reconnection needs dedup so resends don&rsquo;t duplicate messages.</p>
+</div>
+
+<h2 class="sec">4 &middot; Real-world example</h2>
+<div class="example">
+<span class="tag">Slack / Discord</span>
+<p>Slack clients hold a WebSocket to a <b>gateway</b> tier; on login the client calls
+an endpoint that returns a WebSocket URL and the initial state, then receives events
+(messages, typing, presence) pushed over that socket. Discord runs a similar
+<b>gateway</b> that fans guild/channel events to the right connections, backed by an
+internal routing layer that knows which gateway node holds each session. In both, the
+defining engineering problem is presence and routing at scale &mdash; tracking who is
+online and which node holds their socket &mdash; not the message store itself. See
+<a href="../systems/s10.html">Chat</a>.</p>
+</div>
+
+<h2 class="sec">5 &middot; Applying it in a design</h2>
+<p><i>"Persistent WebSockets on a stateful gateway tier, a Redis registry mapping user
+&rarr; gateway updated on connect/disconnect, and per-conversation sequence numbers for
+ordering."</i> Call out reconnection + dedup.</p>
+
+<h2 class="sec">6 &middot; Pitfalls</h2>
+<ul>
+<li>Polling instead of persistent connections at scale.</li>
+<li>Forgetting the registry must update on every disconnect (stale routes).</li>
+<li>Treating global message ordering as required (per-conversation is enough).</li>
+</ul>
+
+<h2 class="sec">7 &middot; Further reading</h2>
+<ul>
+<li><a href="https://discord.com/developers/docs/topics/gateway">Discord Gateway docs</a></li>
+<li>See <a href="../systems/s10.html">Chat system</a>.</li>
+</ul>
+
+<div class="prevnext"><a href="p12.html">&larr; P12 &middot; Tail latency</a><a href="p14.html">P14 &middot; Saga / compensation &rarr;</a></div>
+</div></main>
+</div>
+<a href="#top" class="backtop" title="Back to top">&uarr;</a>
+<script type="module">
+  import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+  mermaid.initialize({ startOnLoad: true, theme: 'neutral' });
+</script>
+<script>window.SITE_BASE="../";</script>
+<script src="../assets/site.js"></script>
+</body></html>

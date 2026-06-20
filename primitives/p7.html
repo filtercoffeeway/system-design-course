@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>P7 Scatter-gather — System Design Curriculum</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head><body>
+<div class="wrap">
+<nav class="side" id="side"></nav>
+<main><div class="reading" id="top">
+<div class="crumb"><a href="../index.html">Curriculum</a> / Part II · Primitives / P7</div><h1>P7 · Scatter-gather &amp; partial aggregation</h1>
+<div class="summary"><div class="field"><b>What it is:</b> fan a query to all shards, compute partials locally, merge centrally.</div>
+<div class="field"><b>Reach for it when:</b> the answer spans partitions (search ranking, group-by, cross-shard query).</div>
+<div class="field"><b>The lever:</b> push computation to the data (partial aggregates, top-K per shard), then combine; minimize what crosses the network.</div>
+<div class="newprob"><b>New problem it hands you:</b> <b>the slowest shard sets the latency</b> (tail latency, see <a href="../primitives/p12.html">P12</a>); <b>shuffle</b> (redistribution for joins/group-by) becomes the dominant cost; partials can be approximate (local-only stats).</div>
+<div class="prims"><b>Exemplified by:</b> <a href="../systems/s8.html">Distributed SQL</a>, <a href="../systems/s7.html">Search</a>, <a href="../systems/s6.html">Datadog</a>.</div></div>
+
+<hr>
+
+<h2 class="sec">1 &middot; The problem it solves</h2>
+<p>When data is partitioned (<a href="../primitives/p2.html">P2</a>), no single node can answer a query
+that spans the whole keyspace &mdash; a search ranking, a global aggregate, a
+group-by. <b>Scatter-gather</b> fans the query out to every shard, has each compute a
+<em>partial</em> answer locally, and merges the partials centrally.</p>
+
+<h2 class="sec">2 &middot; How it works</h2>
+<pre class="mermaid">
+graph TD
+  Q[coordinator] --> S1[shard 1: partial agg]
+  Q --> S2[shard 2: partial agg]
+  Q --> S3[shard 3: partial agg]
+  S1 --> M[merge partials]
+  S2 --> M
+  S3 --> M
+  M --> R[result]
+</pre>
+<p>The art is pushing computation <em>to</em> the data: each shard returns a small
+partial (a top-K, a partial sum, a merged sketch) instead of raw rows, so the network
+and the coordinator stay cheap. Aggregations that are associative/commutative (sum,
+count, max, mergeable sketches) parallelize cleanly; ones that aren&rsquo;t (exact
+median, distinct-count) need approximations.</p>
+
+<h2 class="sec">3 &middot; The new bottleneck it hands you</h2>
+<div class="newprob">
+<p><b>The slowest shard sets the latency</b> &mdash; a query that touches 100 shards is
+as slow as the worst of 100, so tail latency dominates (<a href="../primitives/p12.html">P12</a>; hedge
+or set per-shard timeouts). <b>Shuffle</b> &mdash; when a join or group-by needs to
+redistribute data <em>between</em> shards &mdash; becomes the dominant cost in
+analytics (<a href="../systems/s8.html">distributed SQL</a>). And partials computed from local-only
+stats can be approximate (e.g. distributed IDF, <a href="../primitives/p6.html">P6</a>).</p>
+</div>
+
+<h2 class="sec">4 &middot; Real-world example</h2>
+<div class="example">
+<span class="tag">Elasticsearch (query-then-fetch)</span>
+<p>An Elasticsearch search runs in two scatter-gather phases. In the <b>query phase</b>
+the coordinator scatters the query to every shard; each returns just the top-K
+document <em>IDs and scores</em> (tiny). The coordinator merges these into a global
+top-K. Then in the <b>fetch phase</b> it gathers the full documents for only those K
+winners from the relevant shards. Returning IDs first, not whole documents, is the
+"push the cheap partial, gather the expensive part last" pattern &mdash; and the query
+is bounded by the slowest shard in the scatter.</p>
+</div>
+
+<h2 class="sec">5 &middot; Applying it in a design</h2>
+<p>Use it for any cross-partition read. Say: <i>"scatter to all shards, each returns a
+partial top-K / partial aggregate, coordinator merges &mdash; and I&rsquo;ll bound the
+slowest shard with a timeout or hedge."</i></p>
+
+<h2 class="sec">6 &middot; Pitfalls</h2>
+<ul>
+<li>Shipping raw rows to the coordinator instead of partials.</li>
+<li>Ignoring tail latency / one slow shard.</li>
+<li>Assuming non-mergeable aggregates parallelize.</li>
+</ul>
+
+<h2 class="sec">7 &middot; Further reading</h2>
+<ul>
+<li><a href="https://www.elastic.co/guide/en/elasticsearch/reference/current/search-your-data.html">Elasticsearch distributed search</a></li>
+<li>Dean &amp; Barroso, <a href="https://research.google/pubs/pub40801/">The Tail at Scale</a></li>
+</ul>
+
+<div class="prevnext"><a href="p6.html">&larr; P6 &middot; Inverted index</a><a href="p8.html">P8 &middot; Tiered / columnar &rarr;</a></div>
+</div></main>
+</div>
+<a href="#top" class="backtop" title="Back to top">&uarr;</a>
+<script type="module">
+  import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+  mermaid.initialize({ startOnLoad: true, theme: 'neutral' });
+</script>
+<script>window.SITE_BASE="../";</script>
+<script src="../assets/site.js"></script>
+</body></html>

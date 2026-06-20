@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>P12 Tail latency — System Design Curriculum</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head><body>
+<div class="wrap">
+<nav class="side" id="side"></nav>
+<main><div class="reading" id="top">
+<div class="crumb"><a href="../index.html">Curriculum</a> / Part II · Primitives / P12</div><h1>P12 · Tail latency: hedging &amp; load shedding</h1>
+<div class="summary"><div class="field"><b>What it is:</b> defending p99/p999 when the average is fine but the worst case isn't — especially in any scatter-gather where the slowest of N dominates.</div>
+<div class="field"><b>Reach for it when:</b> fan-out reads, SLO-bound APIs, or "median is fast but users complain."</div>
+<div class="field"><b>The lever:</b> hedged/backup requests (send a second after a delay, take the first back); tight timeouts + retry budgets; load shedding (reject early when overloaded); request prioritization.</div>
+<div class="newprob"><b>New problem it hands you:</b> hedging wastes duplicate work and can amplify load under stress; shedding drops real requests; aggressive timeouts can turn a slow success into a failure.</div>
+<div class="prims"><b>Exemplified by:</b> <a href="../systems/s8.html">Distributed SQL</a>, <a href="../systems/s7.html">Search</a>, <a href="../systems/s10.html">Chat</a> — anywhere <a href="../primitives/p7.html">P7</a> is in play.</div></div>
+
+<hr>
+
+<h2 class="sec">1 &middot; The problem it solves</h2>
+<p>In a request that fans out to many services or shards, the <em>average</em> is a
+lie: if each backend is usually fast but occasionally slow, the overall request is as
+slow as the slowest of N. At fan-out 100, a 1-in-100 slow event hits almost every
+request. Tail latency (p99, p999) is the real user experience.</p>
+
+<h2 class="sec">2 &middot; How it works</h2>
+<p>Levers: <b>hedged requests</b> (send the request, and if no reply within, say, the
+p95, send a duplicate to another replica and take whichever returns first);
+<b>tied requests</b> (let replicas cancel each other once one starts); aggressive
+<b>timeouts + retry budgets</b>; <b>load shedding</b> (reject early when overloaded so
+you fail fast instead of degrading everyone); and request <b>prioritization</b>.</p>
+<pre class="mermaid">
+graph LR
+  R[request] --> A[replica A]
+  R -.->|if A slow past p95| B[replica B]
+  A --> F[take first response]
+  B --> F
+</pre>
+
+<h2 class="sec">3 &middot; The new bottleneck it hands you</h2>
+<div class="newprob">
+<p>Hedging <b>wastes work</b> (duplicate requests) and, if naive, <b>amplifies load</b>
+exactly when the system is already stressed &mdash; so hedge only above a high
+percentile and cap the extra load. Shedding <b>drops real requests</b>. Aggressive
+timeouts can turn a slow success into an outright failure.</p>
+</div>
+
+<h2 class="sec">4 &middot; Real-world example</h2>
+<div class="example">
+<span class="tag">Google</span>
+<p>Dean &amp; Barroso&rsquo;s "The Tail at Scale" (CACM 2013) is the foundational
+account and comes from Google&rsquo;s own serving systems. Their <b>hedged requests</b>
+technique &mdash; send to a second replica only after the first has missed the 95th
+percentile &mdash; reportedly cut the 99.9th-percentile latency of a benchmark read
+service dramatically while adding only a couple percent more total requests. The
+companion idea, <b>tied requests</b>, lets the two copies cancel each other so you
+rarely pay for both. It&rsquo;s the canonical proof that you fight the tail with
+redundancy, not just faster code.</p>
+</div>
+
+<h2 class="sec">5 &middot; Applying it in a design</h2>
+<p>Whenever you scatter-gather (<a href="../primitives/p7.html">P7</a>) or have an SLO: <i>"I&rsquo;ll
+hedge above p95 to a second replica and shed load past capacity, accepting a few
+percent extra requests to protect p99.9."</i></p>
+
+<h2 class="sec">6 &middot; Pitfalls</h2>
+<ul>
+<li>Hedging from the first millisecond (doubles load).</li>
+<li>Retrying into an already-overloaded system (retry storms) &mdash; use budgets + backoff.</li>
+<li>Optimizing the median while p99 quietly kills UX.</li>
+</ul>
+
+<h2 class="sec">7 &middot; Further reading</h2>
+<ul>
+<li><a href="https://research.google/pubs/pub40801/">Dean &amp; Barroso &mdash; The Tail at Scale</a></li>
+</ul>
+
+<div class="prevnext"><a href="p11.html">&larr; P11 &middot; CDN / edge</a><a href="p13.html">P13 &middot; Real-time / routing &rarr;</a></div>
+</div></main>
+</div>
+<a href="#top" class="backtop" title="Back to top">&uarr;</a>
+<script type="module">
+  import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+  mermaid.initialize({ startOnLoad: true, theme: 'neutral' });
+</script>
+<script>window.SITE_BASE="../";</script>
+<script src="../assets/site.js"></script>
+</body></html>

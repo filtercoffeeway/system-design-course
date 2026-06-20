@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>8 Distributed SQL — System Design Curriculum</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head><body>
+<div class="wrap">
+<nav class="side" id="side"></nav>
+<main><div class="reading" id="top">
+<div class="crumb"><a href="../index.html">Curriculum</a> / Part III · Systems / Cluster B — Read, search, analytics</div><h1>8 · Distributed SQL Engine (Presto / BigQuery-style)</h1>
+<div class="summary"><div class="hard"><b>Hard constraint:</b> shuffle (cross-node redistribution for joins/group-by) is the bottleneck; every optimizer decision reduces to minimizing shuffle.</div><div class="prims"><b>Primitives exercised:</b> <a href="../primitives/p8.html">P8</a> (columnar), <a href="../primitives/p7.html">P7</a>, <a href="../primitives/p12.html">P12</a>, <a href="../primitives/p2.html">P2</a> (pruning).</div><p>Columnar storage; predicate/projection pushdown + partition pruning; cost-based planning; hash vs sort-merge vs broadcast join; exchange/shuffle operators; vectorized execution.</p></div>
+
+<hr>
+
+<h2 class="sec">1 &middot; Requirements &amp; scale</h2>
+<p><b>Functional:</b> ad-hoc analytical SQL (joins, group-by, aggregates) over
+petabytes, no pre-built indexes. <b>Non-functional:</b> interactive-ish latency on huge
+scans, elastic parallelism, read-mostly.</p>
+<div class="estimate">Back-of-envelope
+1 PB table, query selects 3 of 200 columns
+row store: read ~all 1 PB                    -> hopeless
+columnar: read 3/200 of data                 ~ 15 TB scanned
++ partition pruning by date                  ~ only relevant partitions
+distribute scan across 1,000 workers         -> seconds, if shuffle is small
+</div>
+
+<h2 class="sec">2 &middot; High-level architecture</h2>
+<pre class="mermaid">
+graph TD
+  SQL[query] --> PL[planner / optimizer]
+  PL --> ST1[stage: scan + filter]
+  ST1 -->|exchange / shuffle| ST2[stage: join / aggregate]
+  ST2 --> R[result]
+</pre>
+<p>The planner compiles SQL into a DAG of stages run by many workers. Scans read only
+projected columns from columnar files; stages exchange data through shuffles for joins
+and group-bys.</p>
+
+<h2 class="sec">3 &middot; The hard constraint, in depth</h2>
+<div class="hard"><p><b>Shuffle</b> &mdash; redistributing data across the network so that
+rows that must be joined or grouped land on the same worker &mdash; is the bottleneck.
+The optimizer&rsquo;s real job is not to compute faster but to <em>avoid reading and
+moving data</em>: predicate pushdown, projection pushdown, partition pruning, and
+choosing join strategies that minimize shuffle volume. Every plan decision reduces to
+"how do I move less data?"</p></div>
+
+<h2 class="sec">4 &middot; Component deep dives</h2>
+<h3>Columnar scan + pushdown (P8)</h3>
+<p>Parquet/ORC let you read only needed columns and skip row groups via min/max stats;
+the planner pushes filters and projections down into the scan (<a href="../primitives/p8.html">P8</a>).</p>
+<h3>Join strategies</h3>
+<p><b>Broadcast join</b> (ship the small table to every worker &mdash; no shuffle of the
+big one), <b>hash/shuffle join</b> (repartition both tables by key), <b>sort-merge
+join</b> (for sorted/huge inputs). Cost-based planning estimates row counts to pick.</p>
+<h3>Execution</h3>
+<p>Vectorized, column-at-a-time processing (SIMD) instead of row-at-a-time; exchange
+operators implement the shuffle.</p>
+
+<h2 class="sec">5 &middot; Real-world example</h2>
+<div class="example">
+<span class="tag">Presto / Trino &amp; Google BigQuery</span>
+<p><b>Presto</b> (built at Facebook, now also Trino) is a distributed MPP SQL engine
+that queries data <em>in place</em> (S3, HDFS, etc.) by compiling SQL into stages of
+workers and shuffling between them &mdash; Meta runs it over exabyte-scale warehouses
+for interactive analytics. Google <b>BigQuery</b> (built on Dremel, <a href="../primitives/p8.html">P8</a>)
+separates storage from compute and fans a query across thousands of slots over
+columnar storage; its planner aggressively prunes and pushes down so a multi-TB scan
+returns in seconds. Both live or die by minimizing shuffle.</p>
+</div>
+
+<h2 class="sec">6 &middot; Tradeoffs &amp; alternatives</h2>
+<p>MPP engines are built for big scans, not point lookups or updates &mdash; use an
+<a href="../systems/s4.html">OLTP database</a> for those. Pre-aggregation/materialized views trade
+storage and freshness for query speed. More workers help scans but not a
+shuffle-bound query.</p>
+
+<h2 class="sec">7 &middot; Key talking points</h2>
+<ul>
+<li>Columnar + pushdown + partition pruning: read less (<a href="../primitives/p8.html">P8</a>).</li>
+<li>Shuffle is the bottleneck; the optimizer minimizes data movement.</li>
+<li>Broadcast vs shuffle vs sort-merge joins by table size.</li>
+<li>Scatter-gather stages; slowest worker sets latency (<a href="../primitives/p7.html">P7</a>, <a href="../primitives/p12.html">P12</a>).</li>
+<li>Vectorized execution.</li>
+</ul>
+
+<h2 class="sec">8 &middot; Further reading</h2>
+<ul>
+<li><a href="https://trino.io/docs/current/">Trino (Presto) docs</a> &middot; <a href="https://research.google/pubs/pub36632/">Dremel paper</a></li>
+</ul>
+
+<div class="prevnext"><a href="s7.html">&larr; S7 &middot; Search engine</a><a href="s9.html">S9 &middot; Social feed &rarr;</a></div>
+</div></main>
+</div>
+<a href="#top" class="backtop" title="Back to top">&uarr;</a>
+<script type="module">
+  import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+  mermaid.initialize({ startOnLoad: true, theme: 'neutral' });
+</script>
+<script>window.SITE_BASE="../";</script>
+<script src="../assets/site.js"></script>
+</body></html>

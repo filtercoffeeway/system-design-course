@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>7 Search engine — System Design Curriculum</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head><body>
+<div class="wrap">
+<nav class="side" id="side"></nav>
+<main><div class="reading" id="top">
+<div class="crumb"><a href="../index.html">Curriculum</a> / Part III · Systems / Cluster B — Read, search, analytics</div><h1>7 · Search Engine (Elasticsearch / Lucene)</h1>
+<div class="summary"><div class="hard"><b>Hard constraint:</b> distributed relevance — each shard has only local term stats, so global IDF needs a separate pass or approximation.</div><div class="prims"><b>Primitives exercised:</b> <a href="../primitives/p6.html">P6</a>, <a href="../primitives/p2.html">P2</a>, <a href="../primitives/p7.html">P7</a>, <a href="../primitives/p12.html">P12</a>.</div><p>Inverted index construction (tokenize/stem/posting lists); TF-IDF/BM25; immutable segments + merge; near-real-time gap; sharded scatter-gather ranking with fetch-then-enrich.</p></div>
+
+<hr>
+
+<h2 class="sec">1 &middot; Requirements &amp; scale</h2>
+<p><b>Functional:</b> full-text and faceted search over a large corpus, ranked by
+relevance, near-real-time. <b>Non-functional:</b> low query latency, high indexing
+throughput, horizontal scale.</p>
+<div class="estimate">Back-of-envelope
+1,000,000,000 docs x 5 KB                    = 5 TB corpus (text)
+inverted index                               ~ fraction of corpus, vocabulary-bound
+shards                                        corpus / per-shard capacity (e.g. 20-50 GB/shard)
+query                                         scatter to all shards, merge top-K
+</div>
+
+<h2 class="sec">2 &middot; High-level architecture</h2>
+<pre class="mermaid">
+graph TD
+  W[writes] --> IDX[index: immutable segments]
+  Q[query coordinator] --> S1[shard 1] & S2[shard 2] & S3[shard 3]
+  S1 --> M[merge top-K]
+  S2 --> M
+  S3 --> M
+  M --> F[fetch full docs for winners]
+</pre>
+
+<h2 class="sec">3 &middot; The hard constraint, in depth</h2>
+<div class="hard"><p>Relevance in a distributed index is the deep problem: each shard
+holds only <b>local term statistics</b>, but a correct TF-IDF/BM25 score needs
+<b>global</b> document frequency (IDF). So scores from different shards aren&rsquo;t
+directly comparable &mdash; you either run a distributed-frequency pass, accept an
+approximation, or use enough docs per shard that local stats approximate global. This
+is why relevance looks off on small or skewed indexes.</p></div>
+
+<h2 class="sec">4 &middot; Component deep dives</h2>
+<h3>Inverted index + segments (P6)</h3>
+<p>Tokenize/stem &rarr; posting lists with tf + positions; written as immutable
+segments, merged in the background; new docs searchable after a ~1s refresh &mdash; see
+<a href="../primitives/p6.html">P6</a>.</p>
+<h3>Distributed query: query-then-fetch (P7)</h3>
+<p>The coordinator scatters to all shards; each returns its top-K IDs + scores; the
+coordinator merges to a global top-K, then fetches full documents for only those
+winners (<a href="../primitives/p7.html">P7</a>). The slowest shard sets latency (<a href="../primitives/p12.html">P12</a>).</p>
+<h3>Scoring</h3>
+<p>BM25 by default; relevance is not keyword matching but a tuned ranking of term
+importance, document length, and field boosts.</p>
+
+<h2 class="sec">5 &middot; Real-world example</h2>
+<div class="example">
+<span class="tag">Elasticsearch (Lucene)</span>
+<p>Elasticsearch shards an index across nodes; each shard is a full Lucene index of
+immutable segments. A search runs Lucene&rsquo;s <b>query-then-fetch</b> across shards as
+above. To tame distributed IDF, Elasticsearch defaults to per-shard scoring (good
+enough when shards are large and uniform) but offers a <code>dfs_query_then_fetch</code>
+mode that first gathers global term statistics across shards for accurate scoring at
+the cost of an extra round trip &mdash; the exact tradeoff the hard constraint predicts.
+Near-real-time comes from the ~1s refresh creating new segments.</p>
+</div>
+
+<h2 class="sec">6 &middot; Tradeoffs &amp; alternatives</h2>
+<p>More shards = more parallelism but worse tail latency and worse local-IDF
+approximation; fewer shards = better relevance but less scale. For pure analytics over
+structured data a <a href="../systems/s8.html">columnar SQL engine</a> beats search; for vector
+similarity you&rsquo;d add an ANN index alongside the inverted index.</p>
+
+<h2 class="sec">7 &middot; Key talking points</h2>
+<ul>
+<li>Inverted index + immutable segments + ~1s refresh (<a href="../primitives/p6.html">P6</a>).</li>
+<li>Query-then-fetch: ship top-K IDs, fetch docs last (<a href="../primitives/p7.html">P7</a>).</li>
+<li>Distributed IDF is the relevance wall; name the dfs tradeoff.</li>
+<li>BM25 ranking, not keyword matching.</li>
+<li>Shard count trades scale vs relevance vs tail latency.</li>
+</ul>
+
+<h2 class="sec">8 &middot; Further reading</h2>
+<ul>
+<li><a href="https://www.elastic.co/guide/en/elasticsearch/reference/current/search-your-data.html">Elasticsearch search internals</a></li>
+<li><a href="https://lucene.apache.org/">Apache Lucene</a></li>
+</ul>
+
+<div class="prevnext"><a href="s6.html">&larr; S6 &middot; Datadog</a><a href="s8.html">S8 &middot; Distributed SQL &rarr;</a></div>
+</div></main>
+</div>
+<a href="#top" class="backtop" title="Back to top">&uarr;</a>
+<script type="module">
+  import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+  mermaid.initialize({ startOnLoad: true, theme: 'neutral' });
+</script>
+<script>window.SITE_BASE="../";</script>
+<script src="../assets/site.js"></script>
+</body></html>

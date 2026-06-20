@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>10 Chat — System Design Curriculum</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head><body>
+<div class="wrap">
+<nav class="side" id="side"></nav>
+<main><div class="reading" id="top">
+<div class="crumb"><a href="../index.html">Curriculum</a> / Part III · Systems / Cluster C — High fan-out</div><h1>10 · Chat System (WhatsApp / Slack)</h1>
+<div class="summary"><div class="hard"><b>Hard constraint:</b> routing — when A messages B, how does A's server find which of 10k connection servers holds B's socket?</div><div class="prims"><b>Primitives exercised:</b> <a href="../primitives/p13.html">P13</a>, <a href="../primitives/p4.html">P4</a> (routing lookup), <a href="../primitives/p1.html">P1</a> (offline delivery).</div><p>WebSocket/SSE; stateful connection servers; per-conversation sequence numbers (global ordering impossible and unnecessary); delivery receipts as a separate event stream; presence as high-frequency aggregation; client-side dedup on retry.</p></div>
+
+<hr>
+
+<h2 class="sec">1 &middot; Requirements &amp; scale</h2>
+<p><b>Functional:</b> 1:1 and group messaging, delivery + read receipts, presence,
+history, offline delivery. <b>Non-functional:</b> real-time push, ordered per
+conversation, durable, at huge connection counts.</p>
+<div class="estimate">Back-of-envelope
+2,000,000,000 users, say 400M concurrent online
+connections per gateway (efficient stack)    ~ on the order of 1M+ per server
+=> hundreds of gateway servers just to hold sockets
+presence heartbeats                           hundreds of millions/min -> aggregation problem
+</div>
+
+<h2 class="sec">2 &middot; High-level architecture</h2>
+<pre class="mermaid">
+graph LR
+  A[user A] <-->|WebSocket| G1[gateway]
+  B[user B] <-->|WebSocket| G2[gateway]
+  G1 -->|"B -> G2?"| REG[(routing registry)]
+  G1 --> MQ[message service + store]
+  MQ --> G2 --> B
+</pre>
+
+<h2 class="sec">3 &middot; The hard constraint, in depth</h2>
+<div class="hard"><p><b>Routing.</b> When A sends to B, A&rsquo;s gateway must find which
+of thousands of gateway servers currently holds B&rsquo;s socket. That requires a fast,
+always-current registry (<code>user_id &rarr; gateway</code>) updated on every connect
+and disconnect &mdash; millions of churn events. If B is offline, the message must be
+stored and delivered on reconnect. Connection state, not the message table, is the
+scaling problem (<a href="../primitives/p13.html">P13</a>).</p></div>
+
+<h2 class="sec">4 &middot; Component deep dives</h2>
+<h3>Connections &amp; routing (P13)</h3>
+<p>Persistent WebSockets on stateful gateways; a Redis registry for routing; rebalance
+and re-register on gateway failure &mdash; see <a href="../primitives/p13.html">P13</a>.</p>
+<h3>Ordering &amp; delivery</h3>
+<p>Per-conversation sequence numbers (global ordering is impossible and unnecessary).
+Delivery state (sent/delivered/read) is a <em>separate</em> event stream, not embedded
+in the message. Client-side dedup handles retried sends (<a href="../primitives/p9.html">P9</a>).</p>
+<h3>Storage &amp; offline</h3>
+<p>Messages persisted (store-and-forward) so offline users get them on reconnect; some
+systems (WhatsApp historically) delete server copies once delivered.</p>
+<h3>Presence</h3>
+<p>Online/last-seen is a high-frequency aggregation of heartbeats &mdash; expensive at
+scale, often approximate.</p>
+
+<h2 class="sec">5 &middot; Real-world example</h2>
+<div class="example">
+<span class="tag">WhatsApp</span>
+<p>WhatsApp famously served tens of millions of users with a tiny team by building on
+<b>Erlang/OTP</b> running on FreeBSD &mdash; a runtime designed for millions of
+lightweight concurrent processes, one per connection. They reported pushing a single
+server to very high simultaneous connection counts (on the order of a million-plus),
+which is the whole game for chat: the scarce resource is open sockets and the routing
+between them, not message storage. Messages were store-and-forward and deleted from
+servers after delivery. Slack and Discord solve the same routing/presence problem with
+a gateway tier (<a href="../primitives/p13.html">P13</a>).</p>
+</div>
+
+<h2 class="sec">6 &middot; Tradeoffs &amp; alternatives</h2>
+<p>WebSocket (bidirectional) vs SSE/long-poll (simpler, one-way). Keeping vs deleting
+server-side history trades storage/cost vs multi-device sync. Strong per-conversation
+ordering is cheap; global ordering is not and isn&rsquo;t needed.</p>
+
+<h2 class="sec">7 &middot; Key talking points</h2>
+<ul>
+<li>Persistent connections; the scarce resource is sockets (<a href="../primitives/p13.html">P13</a>).</li>
+<li>Routing registry updated on every connect/disconnect.</li>
+<li>Per-conversation sequence numbers; receipts as a separate stream.</li>
+<li>Store-and-forward for offline; client dedup (<a href="../primitives/p9.html">P9</a>).</li>
+<li>Presence as high-frequency aggregation.</li>
+</ul>
+
+<h2 class="sec">8 &middot; Further reading</h2>
+<ul>
+<li><a href="https://blog.whatsapp.com/1-million-is-so-2011">WhatsApp engineering &mdash; scaling connections</a></li>
+<li>See <a href="../primitives/p13.html">P13 real-time connections</a>.</li>
+</ul>
+
+<div class="prevnext"><a href="s9.html">&larr; S9 &middot; Social feed</a><a href="s11.html">S11 &middot; Notification &rarr;</a></div>
+</div></main>
+</div>
+<a href="#top" class="backtop" title="Back to top">&uarr;</a>
+<script type="module">
+  import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+  mermaid.initialize({ startOnLoad: true, theme: 'neutral' });
+</script>
+<script>window.SITE_BASE="../";</script>
+<script src="../assets/site.js"></script>
+</body></html>

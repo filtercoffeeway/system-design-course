@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>18 Web crawler — System Design Curriculum</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head><body>
+<div class="wrap">
+<nav class="side" id="side"></nav>
+<main><div class="reading" id="top">
+<div class="crumb"><a href="../index.html">Curriculum</a> / Part III · Systems / Cluster E — Domain-specific</div><h1>18 · Web Crawler</h1>
+<div class="summary"><div class="hard"><b>Hard constraint:</b> the URL frontier must be distributed (too big for one node) yet ordered (prioritized) — a distributed priority queue is non-trivial.</div><div class="prims"><b>Primitives exercised:</b> <a href="../primitives/p2.html">P2</a>, <a href="../primitives/p1.html">P1</a>, <a href="../primitives/p4.html">P4</a> (DNS caching), graph traversal.</div><p>URL frontier (priority queue by freshness); politeness (robots.txt, per-domain rate limit); near-duplicate detection (SimHash/MinHash); mandatory DNS caching; recrawl scheduling via change-frequency backoff.</p></div>
+
+<hr>
+
+<h2 class="sec">1 &middot; Requirements &amp; scale</h2>
+<p><b>Functional:</b> traverse the web graph, fetch pages, extract links, store content
+for indexing, and recrawl as pages change. <b>Non-functional:</b> web-scale throughput,
+politeness toward sites, deduplication, and prioritization of what to crawl next.</p>
+<div class="estimate">Back-of-envelope
+target 1,000,000,000 pages, recrawl periodically
+1,000 pages/s sustained                       ~ 86M/day -> ~12 days for a billion
+each page: DNS + fetch + parse + dedup + enqueue new links
+politeness: &lt;= 1 concurrent / small rate per domain
+</div>
+
+<h2 class="sec">2 &middot; High-level architecture</h2>
+<pre class="mermaid">
+graph LR
+  F[(URL frontier: prioritized + per-domain)] --> FET[fetchers]
+  FET --> DNS[DNS cache]
+  FET --> PARSE[parse + extract links]
+  PARSE --> DEDUP{seen? near-dup?}
+  DEDUP -->|new| F
+  PARSE --> STORE[(content store)]
+</pre>
+
+<h2 class="sec">3 &middot; The hard constraint, in depth</h2>
+<div class="hard"><p>The <b>URL frontier</b> must be <em>distributed</em> (it&rsquo;s far
+too large for one node) yet <em>ordered</em> (crawl high-priority/fresh pages first) and
+<em>polite</em> (never hammer one domain). A distributed priority queue with per-domain
+rate limiting is non-trivial &mdash; the practical answers are per-domain queues (a
+sorted set per host) or Kafka topics with priority, plus a scheduler that releases URLs
+respecting each domain&rsquo;s politeness delay.</p></div>
+
+<h2 class="sec">4 &middot; Component deep dives</h2>
+<h3>Frontier &amp; politeness</h3>
+<p>Two-level: a front queue orders by priority/freshness; a back queue per domain enforces
+politeness (one in flight, respect <code>robots.txt</code> and crawl-delay). Partition by
+domain so a host&rsquo;s pages stay together (<a href="../primitives/p2.html">P2</a>).</p>
+<h3>Deduplication</h3>
+<p>Exact URL dedup (seen-set, often a Bloom filter, <a href="../primitives/p17.html">P17</a>) plus
+<b>near-duplicate</b> content detection via <b>SimHash/MinHash</b> so mirror pages and
+boilerplate aren&rsquo;t re-stored.</p>
+<h3>DNS caching</h3>
+<p>Millions of lookups make DNS a bottleneck; an aggressive local DNS cache is mandatory
+(<a href="../primitives/p4.html">P4</a>).</p>
+<h3>Recrawl scheduling</h3>
+<p>Pages change at different rates; schedule recrawls with exponential backoff keyed to
+observed change frequency &mdash; crawl news hourly, an archive monthly.</p>
+
+<h2 class="sec">5 &middot; Real-world example</h2>
+<div class="example">
+<span class="tag">Googlebot / Mercator</span>
+<p>The architecture traces to the <b>Mercator</b> crawler (Heydon &amp; Najork) and the
+original Google crawler (Brin &amp; Page): a prioritized URL frontier, per-host politeness
+queues, a seen-URL set, content fingerprinting to avoid duplicates, and a DNS cache.
+Modern <b>Googlebot</b> adds crawl-budget management (how much to crawl a site without
+overloading it) and change-frequency-driven recrawl scheduling. The defining challenge is
+the same: a frontier that is simultaneously huge, ordered, and polite.</p>
+</div>
+
+<h2 class="sec">6 &middot; Tradeoffs &amp; alternatives</h2>
+<p>Breadth-first is simple but ignores importance; priority crawling fetches valuable
+pages first at the cost of frontier complexity. Aggressive recrawl keeps the index fresh
+but wastes bandwidth on stable pages. Bloom-filter dedup is memory-cheap but admits rare
+false positives (a page skipped).</p>
+
+<h2 class="sec">7 &middot; Key talking points</h2>
+<ul>
+<li>The frontier: distributed + prioritized + polite is the wall.</li>
+<li>Per-domain politeness queues; respect robots.txt (<a href="../primitives/p2.html">P2</a>).</li>
+<li>Exact + near-duplicate dedup (Bloom + SimHash) (<a href="../primitives/p17.html">P17</a>).</li>
+<li>Mandatory DNS caching (<a href="../primitives/p4.html">P4</a>).</li>
+<li>Change-frequency-based recrawl scheduling.</li>
+</ul>
+
+<h2 class="sec">8 &middot; Further reading</h2>
+<ul>
+<li><a href="https://www.cindyxiaoxiaoli.com/post/mercator-a-scalable-extensible-web-crawler">Mercator: A Scalable, Extensible Web Crawler</a></li>
+<li><a href="http://infolab.stanford.edu/~backrub/google.html">The Anatomy of a Large-Scale Hypertextual Web Search Engine (Brin &amp; Page)</a></li>
+</ul>
+
+<div class="prevnext"><a href="s17.html">&larr; S17 &middot; Payment</a><span></span></div>
+</div></main>
+</div>
+<a href="#top" class="backtop" title="Back to top">&uarr;</a>
+<script type="module">
+  import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+  mermaid.initialize({ startOnLoad: true, theme: 'neutral' });
+</script>
+<script>window.SITE_BASE="../";</script>
+<script src="../assets/site.js"></script>
+</body></html>

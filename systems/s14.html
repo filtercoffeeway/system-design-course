@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>14 URL shortener — System Design Curriculum</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head><body>
+<div class="wrap">
+<nav class="side" id="side"></nav>
+<main><div class="reading" id="top">
+<div class="crumb"><a href="../index.html">Curriculum</a> / Part III · Systems / Cluster E — Domain-specific</div><h1>14 · URL Shortener (bit.ly style)</h1>
+<div class="summary"><div class="hard"><b>Hard constraint:</b> sub-millisecond lookup — a CDN/Redis cache at the edge <em>is</em> the read architecture; the storage system barely matters.</div><div class="prims"><b>Primitives exercised:</b> <a href="../primitives/p4.html">P4</a>, <a href="../primitives/p11.html">P11</a>, <a href="../primitives/p5.html">P5</a> (analytics).</div><p>Base62 encoding; read-heavy optimization (1000× redirects); collision avoidance (pre-generate vs hash-and-check); 301 vs 302 tradeoff; click analytics as the same ingestion pattern as Datadog.</p></div>
+
+<hr>
+
+<h2 class="sec">1 &middot; Requirements &amp; scale</h2>
+<p><b>Functional:</b> shorten a long URL to a short code; redirect the code to the
+original; optional analytics. <b>Non-functional:</b> redirects are read-heavy and must
+be sub-millisecond; codes are globally unique and never collide.</p>
+<div class="estimate">Back-of-envelope
+100,000,000 new links/day                    ~ 1,200 writes/s
+read:write ~ 1000:1                            ~ 1,200,000 redirects/s
+code space: 62^7                              ~ 3.5x10^12 (7 base62 chars is plenty)
+storage: 100M/day x 365 x ~500 B             ~ 18 TB/yr (fits sharded KV)
+</div>
+
+<h2 class="sec">2 &middot; High-level architecture</h2>
+<pre class="mermaid">
+graph LR
+  U[user] --> CDN[CDN / edge cache]
+  CDN -->|hit| U
+  CDN -->|miss| SVC[redirect service]
+  SVC --> CACHE[(Redis)]
+  CACHE -->|miss| KV[(sharded KV: code -> URL)]
+  SHORTEN[shorten API] --> KGS[key-gen service] --> KV
+</pre>
+
+<h2 class="sec">3 &middot; The hard constraint, in depth</h2>
+<div class="hard"><p>The lookup must be <b>sub-millisecond</b> at enormous read volume,
+so a CDN/Redis cache at the edge <em>is</em> the read architecture (<a href="../primitives/p4.html">P4</a>,
+<a href="../primitives/p11.html">P11</a>). The backing store barely matters because almost every read is a
+cache hit on a small set of hot links. This is fundamentally a caching problem, not a
+storage problem.</p></div>
+
+<h2 class="sec">4 &middot; Component deep dives</h2>
+<h3>Code generation</h3>
+<p>Two approaches: <b>hash-and-check</b> (hash the URL, take N chars, retry on
+collision) or a <b>key-generation service</b> that pre-generates unique base62 codes and
+hands them out in batches (no collision checks on the hot path). Base62 (a-z,A-Z,0-9)
+keeps codes short and URL-safe; 7 chars covers trillions.</p>
+<h3>Read path (P4/P11)</h3>
+<p>Edge CDN &rarr; Redis &rarr; sharded KV, in that order; the vast majority of redirects
+never reach the KV store.</p>
+<h3>301 vs 302</h3>
+<p><b>301</b> (permanent) is cached by browsers forever &mdash; cheapest for you but you
+lose per-click analytics; <b>302</b> (temporary) always returns to your server &mdash;
+more load but you count every click. Choose by whether analytics matter.</p>
+<h3>Analytics</h3>
+<p>Each redirect emits a click event into the same ingestion pattern as
+<a href="../systems/s6.html">Datadog</a> (batch &rarr; queue &rarr; aggregate), kept off the redirect hot
+path.</p>
+
+<h2 class="sec">5 &middot; Real-world example</h2>
+<div class="example">
+<span class="tag">Bitly / TinyURL</span>
+<p>URL shorteners like Bitly serve billions of redirects and are built around exactly
+this shape: a tiny key&rarr;URL mapping fronted by aggressive caching/CDN so redirects
+are effectively cache hits, base62-style short codes, and a separate asynchronous
+analytics pipeline that counts clicks without slowing the redirect. The interesting
+engineering is all on the read/cache and analytics sides; the storage of the mapping is
+almost trivial.</p>
+</div>
+
+<h2 class="sec">6 &middot; Tradeoffs &amp; alternatives</h2>
+<p>Hash-and-check is stateless but needs collision handling; a key-gen service removes
+hot-path collisions but adds a component. 301 saves load but kills analytics. Custom
+vanity codes complicate uniqueness.</p>
+
+<h2 class="sec">7 &middot; Key talking points</h2>
+<ul>
+<li>It&rsquo;s a caching/read problem &mdash; CDN + Redis is the architecture (<a href="../primitives/p4.html">P4</a>, <a href="../primitives/p11.html">P11</a>).</li>
+<li>Base62 codes; key-gen service vs hash-and-check.</li>
+<li>301 vs 302 = caching vs analytics.</li>
+<li>Async click pipeline off the hot path (<a href="../systems/s6.html">S6</a> pattern).</li>
+</ul>
+
+<h2 class="sec">8 &middot; Further reading</h2>
+<ul>
+<li><a href="https://www.educative.io/blog/system-design-tinyurl">System design: URL shortener (overview)</a></li>
+</ul>
+
+<div class="prevnext"><a href="s13.html">&larr; S13 &middot; Distributed lock</a><a href="s15.html">S15 &middot; Ride-sharing &rarr;</a></div>
+</div></main>
+</div>
+<a href="#top" class="backtop" title="Back to top">&uarr;</a>
+<script type="module">
+  import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+  mermaid.initialize({ startOnLoad: true, theme: 'neutral' });
+</script>
+<script>window.SITE_BASE="../";</script>
+<script src="../assets/site.js"></script>
+</body></html>

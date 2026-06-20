@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>17 Payment — System Design Curriculum</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head><body>
+<div class="wrap">
+<nav class="side" id="side"></nav>
+<main><div class="reading" id="top">
+<div class="crumb"><a href="../index.html">Curriculum</a> / Part III · Systems / Cluster E — Domain-specific</div><h1>17 · Payment System</h1>
+<div class="summary"><div class="hard"><b>Hard constraint:</b> you can't span a distributed transaction across your DB and an external processor — only your side is controllable. Saga + idempotency + reconciliation is the standard answer.</div><div class="prims"><b>Primitives exercised:</b> <a href="../primitives/p14.html">P14</a>, <a href="../primitives/p9.html">P9</a>, <a href="../primitives/p3.html">P3</a> (strong consistency).</div><p>Double-entry bookkeeping (entries sum to zero → bug detection); idempotency keys on payment APIs; saga with compensations; reconciliation as the correctness net; exactly-once via a transactional idempotency table.</p></div>
+
+<hr>
+
+<h2 class="sec">1 &middot; Requirements &amp; scale</h2>
+<p><b>Functional:</b> move money correctly &mdash; charge, transfer, refund &mdash;
+integrating external processors/banks. <b>Non-functional:</b> correctness above all (no
+lost or double money), auditability, and the one domain where eventual consistency is
+unacceptable.</p>
+<div class="estimate">Back-of-envelope
+correctness target: zero money created/destroyed (must reconcile to the cent)
+external dependencies: card networks, banks, Stripe -- you control only your side
+throughput secondary to correctness + auditability
+</div>
+
+<h2 class="sec">2 &middot; High-level architecture</h2>
+<pre class="mermaid">
+graph LR
+  API[payment API + idempotency] --> LEDGER[(double-entry ledger)]
+  API --> SAGA[saga: authorize -> capture -> notify]
+  SAGA --> EXT[external processor / bank]
+  RECON[reconciliation job] --> LEDGER
+  RECON --> EXT
+</pre>
+
+<h2 class="sec">3 &middot; The hard constraint, in depth</h2>
+<div class="hard"><p>You <b>cannot wrap a distributed transaction</b> across your database
+and an external processor (Stripe, a bank) &mdash; you only control your side and
+can&rsquo;t two-phase-commit with VISA. So the standard answer is <b>saga + idempotency +
+reconciliation</b>: drive the steps with compensations (<a href="../primitives/p14.html">P14</a>), make
+every call idempotent (<a href="../primitives/p9.html">P9</a>), and run a batch that compares your ledger
+to the processor&rsquo;s statement to catch and fix any drift.</p></div>
+
+<h2 class="sec">4 &middot; Component deep dives</h2>
+<h3>Double-entry ledger</h3>
+<p>Every transaction is two entries (a debit and a credit) that must sum to zero. This
+isn&rsquo;t accounting nostalgia &mdash; it&rsquo;s a built-in invariant: if the books
+don&rsquo;t balance, you have a bug. The ledger is append-only and immutable (corrections
+are new entries, never edits).</p>
+<h3>Idempotency (P9)</h3>
+<p>Idempotency keys on payment APIs so a retried charge doesn&rsquo;t double-charge; the
+result is stored transactionally with the ledger write &mdash; see <a href="../primitives/p9.html">P9</a>.</p>
+<h3>Saga / compensation (P14)</h3>
+<p>A payment is multi-step (authorize &rarr; capture &rarr; notify); each step has a
+compensating action (void/refund) if a later step fails (<a href="../primitives/p14.html">P14</a>).</p>
+<h3>Reconciliation</h3>
+<p>A nightly job matches your ledger against the processor/bank statement line by line;
+mismatches are flagged and resolved. This is the real correctness guarantee &mdash; not a
+real-time one.</p>
+
+<h2 class="sec">5 &middot; Real-world example</h2>
+<div class="example">
+<span class="tag">Stripe / Uber ledger</span>
+<p>Stripe&rsquo;s API is built on <b>idempotency keys</b> (<a href="../primitives/p9.html">P9</a>) precisely
+so charge retries are safe, and internally money movement is modeled as immutable
+double-entry ledger entries with reconciliation against banks/card networks. Uber built
+<b>LedgerStore</b>, a purpose-built immutable double-entry ledger handling tens of billions
+of entries to record every financial event (fares, payouts, refunds) with strong
+auditability. Both show the pattern: idempotent APIs, an append-only double-entry ledger
+as the source of truth, sagas for multi-step flows, and reconciliation as the final net.</p>
+</div>
+
+<h2 class="sec">6 &middot; Tradeoffs &amp; alternatives</h2>
+<p>Strong consistency and auditability are non-negotiable, so you accept lower throughput
+and more process than other domains. 2PC across your services is possible but blocks; a
+saga is preferred. Real-time guarantees are impossible against external parties &mdash;
+reconciliation is how you make it right after the fact.</p>
+
+<h2 class="sec">7 &middot; Key talking points</h2>
+<ul>
+<li>Double-entry ledger: entries sum to zero = built-in bug detector.</li>
+<li>Idempotency keys to prevent double-charge (<a href="../primitives/p9.html">P9</a>).</li>
+<li>Saga + compensation for multi-step flows (<a href="../primitives/p14.html">P14</a>).</li>
+<li>Reconciliation is the real correctness mechanism, not real-time.</li>
+<li>You only control your side; no distributed txn with the bank.</li>
+</ul>
+
+<h2 class="sec">8 &middot; Further reading</h2>
+<ul>
+<li><a href="https://stripe.com/blog/idempotency">Stripe &mdash; idempotency</a> &middot; <a href="https://www.uber.com/blog/how-ledgerstore-supports-trillions-of-indexes/">Uber LedgerStore</a></li>
+</ul>
+
+<div class="prevnext"><a href="s16.html">&larr; S16 &middot; Video streaming</a><a href="s18.html">S18 &middot; Web crawler &rarr;</a></div>
+</div></main>
+</div>
+<a href="#top" class="backtop" title="Back to top">&uarr;</a>
+<script type="module">
+  import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+  mermaid.initialize({ startOnLoad: true, theme: 'neutral' });
+</script>
+<script>window.SITE_BASE="../";</script>
+<script src="../assets/site.js"></script>
+</body></html>

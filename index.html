@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>System Design Curriculum — A bottleneck-first toolkit</title>
+<link rel="stylesheet" href="assets/style.css">
+</head><body>
+<div class="wrap">
+<nav class="side" id="side"></nav>
+<main><div class="reading" id="top">
+
+  <h1>System Design Curriculum</h1>
+  <p class="tagline">A bottleneck-first, composable toolkit</p>
+
+  <p class="lead">The goal is not to memorize 50 problems. It is to build a
+  <strong>mix-and-match toolkit</strong>: given any system — including one you've
+  never seen — you locate the bottleneck, reach for the right primitive, and reason
+  about the <em>new</em> bottleneck that primitive introduces. The 18 named systems
+  are case studies that prove each primitive in a real domain.</p>
+
+  <div class="formula">A system is
+  <code>(dominant bottleneck) + (the primitives you compose to relieve it)
+  + (the secondary bottlenecks that composition creates)</code>.</div>
+
+  <h3 id="how">How to use this site</h3>
+  <p>Three parts, indexed in the order you actually work through a design:
+  <strong>Part I</strong> (the catalog below) is the diagnosis layer;
+  <strong>Part II</strong> is one page per composable primitive;
+  <strong>Part III</strong> is one page per system case study. Each primitive and
+  system page has a <em>Full write-up</em> placeholder for you to expand.</p>
+
+  <hr>
+
+  <h2 class="part">Part I — Diagnosis</h2>
+  <h2 class="sec" id="catalog">The Bottleneck Catalog</h2>
+  <p>Read it as: <strong>you observe a symptom → you have candidate levers → each
+  lever hands you a new problem to defend.</strong> No lever is free. Naming the
+  cost you're accepting is the move that matters.</p>
+  <div class="tablewrap"><table>
+    <thead><tr><th>Symptom (the bottleneck)</th><th>Candidate levers</th><th>New bottleneck each lever introduces</th></tr></thead>
+    <tbody>
+      <tr><td>Write throughput too high</td><td>Batch/async buffer; log-structured (LSM) writes; partition the write key; pre-aggregate at source</td><td>Lost ordering; partition skew (hot partition); compaction cost; loss of raw detail</td></tr>
+      <tr><td>Read latency too high</td><td>Cache; read replica; denormalize; precompute (fan-out on write); CDN/edge</td><td>Invalidation + stampede; replication lag; write amplification + storage blowup; edge staleness</td></tr>
+      <tr><td>One write fans out to many readers</td><td>Fan-out on write (push); fan-out on read (pull); hybrid by node degree</td><td>Storage linear in followers + hot-user (push); slow reads (pull); two code paths (hybrid)</td></tr>
+      <tr><td>A single key/partition is hot</td><td>Split the key; request coalescing/dedup; dedicated cache replica; hybrid fan-out</td><td>Recombination logic; cache consistency; detecting hot keys in real time</td></tr>
+      <tr><td>Cross-shard joins / queries</td><td>Denormalize; co-locate by shard key; scatter-gather then merge</td><td>Write amplification; rigid access patterns; fan-out reads + tail latency</td></tr>
+      <tr><td>Full scan over huge dataset</td><td>Columnar storage; predicate/projection pushdown; partition pruning; MPP</td><td>Shuffle becomes the bottleneck; planning complexity; bad plans on bad stats</td></tr>
+      <tr><td>Search/lookup over a large corpus</td><td>Inverted index; secondary indexes; materialized views</td><td>Near-real-time gap; distributed IDF problem; index storage cost</td></tr>
+      <tr><td>Storage cost growing unbounded</td><td>Tiered storage; erasure coding vs replication; compression; retention/TTL</td><td>Cold-tier latency; reconstruction cost; (de)compression CPU; data gone after TTL</td></tr>
+      <tr><td>Need coordination / a single leader</td><td>Consensus (Raft/Paxos); distributed lock; leader election</td><td>Quorum-majority latency; slow-but-alive holder → need fencing tokens</td></tr>
+      <tr><td>Need exactly-once / no double effect</td><td>Idempotency keys; transactional dedup table; saga + compensation</td><td>Can't guarantee across external systems; reconciliation cost</td></tr>
+      <tr><td>Real-time push to clients</td><td>Persistent connections (WebSocket/SSE); stateful connection servers</td><td>Connection-state routing; reconnection/dedup</td></tr>
+      <tr><td>Tail latency (p99/p999) too high</td><td>Hedged requests; aggressive timeouts; load shedding; backpressure</td><td>Wasted duplicate work; dropped requests; upstream must handle "slow down"</td></tr>
+      <tr><td>Geo / proximity queries</td><td>Geohash / quad-tree bucketing</td><td>Radius-vs-result-set precision tradeoff; boundary cells</td></tr>
+      <tr><td>Producer outpaces consumer</td><td>Backpressure; bounded buffers; drop/sample; durable queue</td><td>Data loss (drop); unbounded queue lag; latency grows</td></tr>
+    </tbody>
+  </table></div>
+  <p><strong>How to drive it:</strong> state the dominant bottleneck → pick a lever
+  → name the new bottleneck it creates → decide whether that one is acceptable or
+  needs its own lever. That chain <em>is</em> the design.</p>
+
+  <hr>
+
+  <h2 class="part">Part II — The Primitives</h2>
+  <p>Composable building blocks. One page each.</p>
+  <div class="grid">
+    <a class="tile" href="primitives/p1.html"><div class="k">P1</div><div class="t">Batching / async buffering</div></a>
+    <a class="tile" href="primitives/p2.html"><div class="k">P2</div><div class="t">Partitioning / hot-key</div></a>
+    <a class="tile" href="primitives/p3.html"><div class="k">P3</div><div class="t">Replication / consistency</div></a>
+    <a class="tile" href="primitives/p4.html"><div class="k">P4</div><div class="t">Caching strategies</div></a>
+    <a class="tile" href="primitives/p5.html"><div class="k">P5</div><div class="t">Write- vs read-time cost</div></a>
+    <a class="tile" href="primitives/p6.html"><div class="k">P6</div><div class="t">Inverted index</div></a>
+    <a class="tile" href="primitives/p7.html"><div class="k">P7</div><div class="t">Scatter-gather</div></a>
+    <a class="tile" href="primitives/p8.html"><div class="k">P8</div><div class="t">Tiered / columnar storage</div></a>
+    <a class="tile" href="primitives/p9.html"><div class="k">P9</div><div class="t">Idempotency</div></a>
+    <a class="tile" href="primitives/p10.html"><div class="k">P10</div><div class="t">Consensus / fencing</div></a>
+    <a class="tile" href="primitives/p11.html"><div class="k">P11</div><div class="t">CDN / edge caching</div></a>
+    <a class="tile" href="primitives/p12.html"><div class="k">P12</div><div class="t">Tail latency</div></a>
+    <a class="tile" href="primitives/p13.html"><div class="k">P13</div><div class="t">Real-time / routing</div></a>
+    <a class="tile" href="primitives/p14.html"><div class="k">P14</div><div class="t">Saga / compensation</div></a>
+    <a class="tile" href="primitives/p15.html"><div class="k">P15</div><div class="t">Geospatial indexing</div></a>
+    <a class="tile" href="primitives/p16.html"><div class="k">P16</div><div class="t">Backpressure</div></a>
+    <a class="tile" href="primitives/p17.html"><div class="k">P17</div><div class="t">Storage internals</div></a>
+  </div>
+
+  <hr>
+
+  <h2 class="part">Part III — The Systems</h2>
+  <p>Case studies. Each leads with its hard constraint and the primitives it exercises.</p>
+  <div class="grid">
+    <a class="tile" href="systems/s1.html"><div class="k">1</div><div class="t">Rate limiter</div></a>
+    <a class="tile" href="systems/s2.html"><div class="k">2</div><div class="t">Kafka</div></a>
+    <a class="tile" href="systems/s3.html"><div class="k">3</div><div class="t">Key-value store</div></a>
+    <a class="tile" href="systems/s4.html"><div class="k">4</div><div class="t">RDBMS scaling</div></a>
+    <a class="tile" href="systems/s5.html"><div class="k">5</div><div class="t">Object store</div></a>
+    <a class="tile" href="systems/s6.html"><div class="k">6</div><div class="t">Datadog</div></a>
+    <a class="tile" href="systems/s7.html"><div class="k">7</div><div class="t">Search engine</div></a>
+    <a class="tile" href="systems/s8.html"><div class="k">8</div><div class="t">Distributed SQL</div></a>
+    <a class="tile" href="systems/s9.html"><div class="k">9</div><div class="t">Social feed</div></a>
+    <a class="tile" href="systems/s10.html"><div class="k">10</div><div class="t">Chat</div></a>
+    <a class="tile" href="systems/s11.html"><div class="k">11</div><div class="t">Notification</div></a>
+    <a class="tile" href="systems/s12.html"><div class="k">12</div><div class="t">Task scheduler</div></a>
+    <a class="tile" href="systems/s13.html"><div class="k">13</div><div class="t">Distributed lock</div></a>
+    <a class="tile" href="systems/s14.html"><div class="k">14</div><div class="t">URL shortener</div></a>
+    <a class="tile" href="systems/s15.html"><div class="k">15</div><div class="t">Ride-sharing</div></a>
+    <a class="tile" href="systems/s16.html"><div class="k">16</div><div class="t">Video streaming</div></a>
+    <a class="tile" href="systems/s17.html"><div class="k">17</div><div class="t">Payment</div></a>
+    <a class="tile" href="systems/s18.html"><div class="k">18</div><div class="t">Web crawler</div></a>
+  </div>
+
+  <hr>
+
+  <h2 class="part">Reference</h2>
+  <h2 class="sec" id="matrix">Coverage matrix</h2>
+  <p>Primitive → systems that exemplify it (use this to pick a case study per primitive page).</p>
+  <div class="tablewrap"><table>
+    <thead><tr><th>Primitive</th><th>Systems that exemplify it</th></tr></thead>
+    <tbody>
+      <tr><td><a href="primitives/p1.html">P1 Batching / buffering</a></td><td>Rate limiter, Kafka, Datadog, Notification, Crawler</td></tr>
+      <tr><td><a href="primitives/p2.html">P2 Partitioning (+ hot-key)</a></td><td>Kafka, KV, RDBMS, Search, Feed, Ride-share</td></tr>
+      <tr><td><a href="primitives/p3.html">P3 Replication + consistency</a></td><td>KV, RDBMS, Kafka, Object store</td></tr>
+      <tr><td><a href="primitives/p4.html">P4 Caching</a></td><td>URL shortener, Video, Feed, Chat, KV</td></tr>
+      <tr><td><a href="primitives/p5.html">P5 Write- vs read-time (fan-out)</a></td><td>Feed, Datadog, URL shortener, Notification</td></tr>
+      <tr><td><a href="primitives/p6.html">P6 Inverted index</a></td><td>Datadog, Search</td></tr>
+      <tr><td><a href="primitives/p7.html">P7 Scatter-gather</a></td><td>Datadog, Distributed SQL, Search, RDBMS</td></tr>
+      <tr><td><a href="primitives/p8.html">P8 Tiered / columnar</a></td><td>Datadog, Distributed SQL, Object store, Video</td></tr>
+      <tr><td><a href="primitives/p9.html">P9 Idempotency</a></td><td>Task scheduler, Notification, Payment</td></tr>
+      <tr><td><a href="primitives/p10.html">P10 Consensus / fencing</a></td><td>Distributed lock, Task scheduler, Kafka</td></tr>
+      <tr><td><a href="primitives/p11.html">P11 CDN / edge</a></td><td>URL shortener, Video</td></tr>
+      <tr><td><a href="primitives/p12.html">P12 Tail latency</a></td><td>Distributed SQL, Search, Chat</td></tr>
+      <tr><td><a href="primitives/p13.html">P13 Real-time / routing</a></td><td>Chat, Notification</td></tr>
+      <tr><td><a href="primitives/p14.html">P14 Saga / compensation</a></td><td>Payment</td></tr>
+      <tr><td><a href="primitives/p15.html">P15 Geospatial</a></td><td>Ride-sharing</td></tr>
+      <tr><td><a href="primitives/p16.html">P16 Backpressure</a></td><td>Kafka, Datadog, Rate limiter</td></tr>
+      <tr><td><a href="primitives/p17.html">P17 Storage internals</a></td><td>KV, RDBMS, Object store, Kafka</td></tr>
+    </tbody>
+  </table></div>
+
+  <h2 class="sec" id="sequence">Recommended study sequence</h2>
+  <p>Learn the primitives in the order that maximizes transfer; pull in each system
+  as the case study where that primitive is the star. After steps 1–9 you hold every
+  transferable primitive.</p>
+  <ol>
+    <li><a href="systems/s1.html">Rate limiter</a> → P16, P3: the gentle on-ramp.</li>
+    <li><a href="systems/s2.html">Kafka</a> → P1, P2, P16, P17: the decoupling buffer at the center of everything.</li>
+    <li><a href="systems/s3.html">Key-value store</a> → P17, P2, P3: storage internals.</li>
+    <li><a href="systems/s4.html">RDBMS scaling</a> → P17, P2, P3, P7: sharding, MVCC, replica lag.</li>
+    <li><a href="systems/s5.html">Object store</a> → P17, P3, P8: blob storage + erasure coding.</li>
+    <li><a href="systems/s6.html">Datadog</a> → P1, P6, P7, P8, P5, P16: the full ingestion pipeline + TSDB.</li>
+    <li><a href="systems/s9.html">Social feed</a> → P5, P2, P4: fan-out and the write/read cost dial.</li>
+    <li><a href="systems/s7.html">Search engine</a> → P6, P7, P12: inverted index + distributed ranking.</li>
+    <li><a href="systems/s8.html">Distributed SQL</a> → P8, P7, P12: MPP and shuffle minimization.</li>
+    <li><a href="systems/s10.html">Chat</a> → P13, P4: real-time connections and routing.</li>
+    <li><a href="systems/s11.html">Notification</a> → P9, P5, P13: multi-channel delivery + idempotency.</li>
+    <li><a href="systems/s12.html">Task scheduler</a> → P9, P10: at-least-once + distributed work.</li>
+    <li><a href="systems/s13.html">Distributed lock</a> → P10: consensus and fencing.</li>
+    <li><a href="systems/s14.html">URL shortener</a> → P4, P11: read-heavy caching.</li>
+    <li><a href="systems/s15.html">Ride-sharing</a> → P15, P2: geospatial indexing + hot cells.</li>
+    <li><a href="systems/s16.html">Video streaming</a> → P11, P8, P1: CDN + encoding pipeline.</li>
+    <li><a href="systems/s17.html">Payment</a> → P14, P9, P3: saga + distributed correctness.</li>
+    <li><a href="systems/s18.html">Web crawler</a> → P2, P1, P4: distributed graph traversal.</li>
+  </ol>
+
+</div></main>
+</div>
+<a href="#top" class="backtop" title="Back to top">&uarr;</a>
+<script>window.SITE_BASE="";</script>
+<script src="assets/site.js"></script>
+</body></html>

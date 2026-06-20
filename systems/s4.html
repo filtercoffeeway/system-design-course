@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>4 RDBMS scaling — System Design Curriculum</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head><body>
+<div class="wrap">
+<nav class="side" id="side"></nav>
+<main><div class="reading" id="top">
+<div class="crumb"><a href="../index.html">Curriculum</a> / Part III · Systems / Cluster A — Foundations</div><h1>4 · Relational Database Internals + Scaling</h1>
+<div class="summary"><div class="hard"><b>Hard constraint:</b> cross-shard joins are prohibitively expensive — denormalize to avoid them, or accept fan-out-to-all-shards + merge.</div><div class="prims"><b>Primitives exercised:</b> <a href="../primitives/p17.html">P17</a>, <a href="../primitives/p2.html">P2</a>, <a href="../primitives/p3.html">P3</a> (replica lag), <a href="../primitives/p7.html">P7</a>.</div><p>MVCC; index types (B-tree/hash/GIN/GiST) and why you can't index freely; read replicas + replication lag; sharding strategies + the cross-shard join problem; connection pooling as a DB resource; 2PC and why it's rarely right.</p></div>
+
+<hr>
+
+<h2 class="sec">1 &middot; Requirements &amp; scale</h2>
+<p><b>Functional:</b> structured data with ACID transactions, joins, secondary
+indexes. <b>Non-functional:</b> keep those guarantees as data and traffic outgrow a
+single node. The whole story is "how far can one box go, and what breaks first."</p>
+<div class="estimate">Scaling ladder
+1) one node, tuned                          -> vertical limit
+2) + read replicas                          -> read scale, write still single-node
+3) + caching / connection pooling           -> relieve read + connection pressure
+4) + functional partitioning (by table)     -> independent services
+5) + horizontal sharding (by key)           -> write scale, lose cross-shard joins
+</div>
+
+<h2 class="sec">2 &middot; High-level architecture</h2>
+<pre class="mermaid">
+graph TD
+  APP[app] --> PB[connection pooler]
+  PB --> P[(primary: writes)]
+  P --> R1[(replica: reads)]
+  P --> R2[(replica: reads)]
+  APP --> SH{shard router}
+  SH --> S1[(shard A)] & S2[(shard B)]
+</pre>
+
+<h2 class="sec">3 &middot; The hard constraint, in depth</h2>
+<div class="hard"><p>Once you shard, <b>joins across shards are prohibitively
+expensive</b> &mdash; a join that used to be local now fans out to every shard and
+merges over the network. You respond by <b>denormalizing</b> so related rows share a
+shard, choosing a shard key that co-locates what you read together, and accepting that
+some queries scatter-gather (<a href="../primitives/p7.html">P7</a>). Cross-shard transactions need
+2PC, which blocks and rarely scales.</p></div>
+
+<h2 class="sec">4 &middot; Component deep dives</h2>
+<h3>MVCC &amp; the WAL</h3>
+<p>Multi-Version Concurrency Control lets readers see a consistent snapshot without
+blocking writers (each write makes a new version). The WAL (<a href="../primitives/p17.html">P17</a>)
+gives durability and feeds replication.</p>
+<h3>Read replicas &amp; lag (P3)</h3>
+<p>Replicas scale reads but lag the primary; reading your own write from a replica can
+return stale data &mdash; route critical reads to the primary or wait for a position.</p>
+<h3>Sharding (P2)</h3>
+<p>Range, hash, or directory-based. The shard key is the most important decision; get
+it wrong and you get hot shards or unavoidable cross-shard queries.</p>
+<h3>Connection pooling</h3>
+<p>Each Postgres connection costs real memory/process; thousands of app workers can
+exhaust the DB. A pooler (PgBouncer) multiplexes many clients onto few server
+connections &mdash; connection count is a database resource, not just a network one.</p>
+
+<h2 class="sec">5 &middot; Real-world example</h2>
+<div class="example">
+<span class="tag">YouTube / Vitess</span>
+<p>YouTube outgrew a single MySQL and built <b>Vitess</b> (now a CNCF project, also
+used by Slack, GitHub, and others) to shard MySQL horizontally while keeping it
+looking like one database to the app. Vitess sits in front of many MySQL shards: a
+<b>VTGate</b> proxy parses SQL, routes each query to the right shard(s) by the sharding
+key, scatter-gathers when a query spans shards, and manages resharding online. It is
+the productized answer to "how do you keep relational semantics past one node" &mdash;
+and it leans on exactly the cross-shard-join constraint above, steering apps toward
+shard-local queries.</p>
+</div>
+
+<h2 class="sec">6 &middot; Tradeoffs &amp; alternatives</h2>
+<p>Replicas first (cheap read scale), shard only when writes force it. If you need
+horizontal writes <em>and</em> distributed transactions, a NewSQL store
+(CockroachDB/Spanner, Raft-replicated ranges) buys that at higher latency. If you need
+massive write scale and can drop joins/ACID, a <a href="../systems/s3.html">KV store</a> fits better.</p>
+
+<h2 class="sec">7 &middot; Key talking points</h2>
+<ul>
+<li>Climb the ladder: tune &rarr; replicas &rarr; cache/pool &rarr; partition &rarr; shard.</li>
+<li>Shard key co-locates data; cross-shard joins are the wall (<a href="../primitives/p2.html">P2</a>, <a href="../primitives/p7.html">P7</a>).</li>
+<li>Replica lag &rarr; read-after-write care (<a href="../primitives/p3.html">P3</a>).</li>
+<li>MVCC for concurrency; connection pooling as a finite resource.</li>
+<li>Avoid 2PC; denormalize instead.</li>
+</ul>
+
+<h2 class="sec">8 &middot; Further reading</h2>
+<ul>
+<li><a href="https://vitess.io/docs/">Vitess documentation</a></li>
+<li>Kleppmann, <i>DDIA</i> ch. 6 (partitioning), ch. 7 (transactions)</li>
+</ul>
+
+<div class="prevnext"><a href="s3.html">&larr; S3 &middot; Key-value store</a><a href="s5.html">S5 &middot; Object store &rarr;</a></div>
+</div></main>
+</div>
+<a href="#top" class="backtop" title="Back to top">&uarr;</a>
+<script type="module">
+  import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+  mermaid.initialize({ startOnLoad: true, theme: 'neutral' });
+</script>
+<script>window.SITE_BASE="../";</script>
+<script src="../assets/site.js"></script>
+</body></html>

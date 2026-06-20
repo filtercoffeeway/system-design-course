@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>6 Distributed Log + Metrics Platform (Datadog) — System Design Curriculum</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head><body>
+<div class="wrap">
+<nav class="side" id="side"></nav>
+<main><div class="reading" id="top">
+
+<div class="crumb"><a href="../index.html">Curriculum</a> / Part III · Systems / Cluster A — Foundations</div>
+<h1>6 · Distributed Log + Metrics Platform (Datadog)</h1>
+
+<div class="summary">
+<div class="hard"><b>Hard constraint:</b> cardinality — the number of unique tag combinations, not the point rate, drives cost and scalability.</div>
+<div class="prims"><b>Primitives exercised:</b> <a href="../primitives/p1.html">P1</a>, <a href="../primitives/p6.html">P6</a>, <a href="../primitives/p7.html">P7</a>, <a href="../primitives/p8.html">P8</a>, <a href="../primitives/p5.html">P5</a>, <a href="../primitives/p16.html">P16</a>.</div>
+<p>Agent-side batching + pre-aggregation; Gorilla compression; inverted index on tag space; write-time rollup vs read-time aggregation; index-everything vs archive-and-index-selectively; immutable time-partitioned blocks; scatter-gather MPP with pushdown.</p>
+</div>
+
+<hr>
+
+<h2 class="sec">1 · Requirements &amp; scale</h2>
+<p><b>Functional:</b> ingest metrics, logs, and traces from millions of hosts;
+let users query and aggregate them ad hoc ("p99 latency of <code>checkout</code>
+by region over the last 4 hours"), build dashboards, and fire alerts on
+thresholds. <b>Non-functional:</b> ingest must never block or drop under load
+more than gracefully; queries over recent data should feel interactive
+(sub-second to seconds); retention spans from high-resolution recent data to
+cheap long-term rollups.</p>
+
+<div class="estimate">Back-of-envelope (metrics path)
+2,000,000 hosts × 200 metrics/host        = 4×10^8 active series
+each series: 1 point / 10s                 = 4×10^7 points/sec ingested
+naive: 1 UDP packet per app metric call    = 10^9+ calls/sec at the source (!!)
+  -> source pre-aggregation collapses this to ~ points/sec, not calls/sec
+storage: 4×10^7 pts/s × 16 B/pt (naive)    ≈ 640 MB/s, ~55 TB/day raw
+  -> Gorilla compression ~ 1.3 bytes/point  => ~10× smaller on disk
+</div>
+<p>Two numbers decide the architecture. The first is that raw <em>event</em> rate
+at the source is ~1000× the <em>point</em> rate — so you must aggregate before the
+wire (<a href="../primitives/p1.html">P1</a>). The second is that what actually
+blows up cost is not points but <b>cardinality</b>: every distinct combination of
+tags is a separate series to index and store.</p>
+
+<h2 class="sec">2 · High-level architecture</h2>
+<pre class="mermaid">
+graph LR
+  subgraph Host
+    APP[App + DogStatsD client] -->|aggregate, ~2s| AG[Datadog Agent]
+  end
+  AG -->|aggregate 10s, compress, batch| INT[Intake / edge]
+  INT --> KQ[(Kafka: durable buffer)]
+  KQ --> RU[Rollup + index workers]
+  RU --> HOT[(Hot TSDB: recent, indexed)]
+  RU --> COLD[(Cold object store: rolled-up blocks)]
+  Q[Query service] --> HOT
+  Q --> COLD
+  U[User / dashboard / alert] --> Q
+</pre>
+<p>Data is aggregated twice at the source, buffered durably in a log, rolled up
+and indexed by tag, written to a hot time-series store for recent data and tiered
+to cheap object storage for history. Queries scatter across the storage shards,
+aggregate partials, and gather.</p>
+
+<h2 class="sec">3 · The hard constraint, in depth: cardinality</h2>
+<div class="hard">
+<p>A metric like <code>request.latency</code> isn't one series — it's one series
+<em>per unique tag combination</em>: <code>{service, host, endpoint, status,
+region, version, ...}</code>. Ten tags with ten values each is 10^10 potential
+series. The point rate might be modest, but each new series needs an index entry,
+its own compressed block, and memory in the write path. <b>High-cardinality tags
+(user_id, request_id, full URL) are the classic way to accidentally turn a cheap
+metric into a multi-million-series monster.</b></p>
+<p>This is why the design separates <em>metrics</em> (low-cardinality, indexed,
+pre-aggregated) from <em>logs/traces</em> (high-cardinality, archived, indexed
+selectively). It's also why naive "just put it in a SQL table with a tag column"
+fails: the index on the tag cross-product is the cost, and it grows
+combinatorially.</p>
+</div>
+
+<h2 class="sec">4 · Component deep dives</h2>
+
+<h3>Ingestion: aggregate at the source (P1)</h3>
+<p>The DogStatsD client aggregates in-process (counters summed, gauges last-write,
+distributions accumulated) and flushes every ~2&nbsp;s. The Agent's embedded
+DogStatsD server aggregates across all processes on the host over a 10&nbsp;s flush
+interval, then compresses and batches to intake. See
+<a href="../primitives/p1.html">P1</a> for the full mechanism — this is the layer
+that makes the 1000× event-to-point reduction real, and it's the part of the
+Datadog story you specifically wanted captured.</p>
+
+<h3>Percentiles you can merge: DDSketch</h3>
+<p>Averages merge trivially; percentiles don't. To compute a global p99 from
+per-host data you'd normally need the raw samples. Datadog builds a
+<a href="https://www.datadoghq.com/blog/engineering/computing-accurate-percentiles-with-ddsketch/">DDSketch</a>
+per series at the source — a fixed-size, fully mergeable quantile sketch with a
+relative-error guarantee (e.g. 1%). Per-host sketches merge on the backend into a
+global sketch, so distribution metrics cost a bounded amount regardless of sample
+count.</p>
+
+<h3>Compression: Gorilla for time series</h3>
+<p>Consecutive points in a series have near-identical timestamps and slowly-changing
+values. Gorilla-style compression (delta-of-delta on timestamps, XOR on float
+values) shrinks a 16-byte point to roughly 1–2 bytes amortized — an order of
+magnitude — which is what makes keeping months of data economical. This is the
+storage half of <a href="../primitives/p8.html">P8</a>.</p>
+
+<h3>Indexing the tag space: inverted index (P6)</h3>
+<p>To answer "all series where <code>service=checkout AND region=eu</code>", you keep
+an <a href="../primitives/p6.html">inverted index</a> from each tag value to the set
+of series IDs that carry it. A query intersects posting lists
+(<code>service=checkout</code> ∩ <code>region=eu</code>) to find matching series,
+then reads their compressed blocks. Cardinality is precisely the size of this
+index.</p>
+
+<h3>Write-time vs read-time rollup (P5)</h3>
+<p>You can roll up at write time (precompute 1-min, 1-hour aggregates as data
+arrives — fast reads, fixed granularities, more storage) or at read time (store
+fine points, aggregate on query — flexible, slower, cheaper to store). Real systems
+do both: hot recent data stays fine-grained for flexibility; older data is rolled
+up to coarser resolution and tiered to object storage. That's the
+<a href="../primitives/p5.html">P5</a> dial plus <a href="../primitives/p8.html">P8</a>
+tiering.</p>
+
+<h3>Query: scatter-gather MPP (P7)</h3>
+<p>A query like "p99 by region, last 4h" fans out to every storage shard holding
+relevant series, each shard decodes its blocks, applies the time filter and a
+<em>partial</em> aggregation (merging DDSketches, summing counters), and returns
+small partials that the coordinator merges. Pushing the aggregation down to the
+data — not shipping raw points to a central node — is the
+<a href="../primitives/p7.html">P7</a> pattern, and the slowest shard sets the
+latency (<a href="../primitives/p12.html">P12</a>).</p>
+
+<h3>Backpressure (P16)</h3>
+<p>When intake or downstream lags, the durable Kafka buffer absorbs the burst; if it
+keeps growing, the Agent must shed — sample, drop, or slow down — rather than fall
+over. The pipeline is built to degrade, not collapse. See
+<a href="../primitives/p16.html">P16</a>.</p>
+
+<h2 class="sec">5 · Real-world example</h2>
+<div class="example">
+<span class="tag">Datadog</span>
+<p>The two-tier source aggregation above (DogStatsD client → Agent, 10&nbsp;s flush,
+DDSketch for distributions) is exactly how Datadog keeps cost proportional to unique
+series instead of raw event volume. The deliberate split between <b>metrics</b>
+(pre-aggregated, low-cardinality, always indexed) and <b>logs</b> (high-cardinality,
+archived to object storage, with their
+<a href="https://www.datadoghq.com/blog/logging-without-limits/">"Logging without
+Limits"</a> model of decoupling ingestion from indexing so you choose what to index
+after the fact) is the productized form of the cardinality constraint: it lets
+customers send everything cheaply and pay the index cost only where they need
+search.</p>
+</div>
+<div class="note">Other telemetry stacks make the same moves under different names:
+Prometheus pulls and stores locally with its own TSDB and warns hard about
+high-cardinality labels; Facebook's original Gorilla paper is the source of the
+compression scheme; M3 (Uber) and Mimir/Thanos scale the Prometheus model with
+object-storage tiering.</div>
+
+<h2 class="sec">6 · Tradeoffs &amp; alternatives</h2>
+<p>If you needed arbitrary high-cardinality slicing (per-user metrics), you'd stop
+pre-aggregating and move toward a <a href="../systems/s8.html">columnar analytics
+engine</a> over raw events — far more flexible, far more expensive, slower queries.
+If you needed exact percentiles rather than 1%-relative, you'd ship more data or
+accept higher cost. If retention mattered more than query flexibility, you'd roll up
+harder at write time and tier sooner. The whole design is a set of dials between
+<em>cost</em>, <em>query flexibility</em>, and <em>resolution</em>.</p>
+
+<h2 class="sec">7 · Key talking points</h2>
+<ul>
+<li>Lead with the hard constraint: <i>"the cost driver is cardinality — unique tag
+combinations — not point rate."</i></li>
+<li>Aggregate at the source in two tiers; ship summaries, not events
+(<a href="../primitives/p1.html">P1</a>).</li>
+<li>Use mergeable sketches (DDSketch) so percentiles combine across hosts.</li>
+<li>Time-series compression (Gorilla) + immutable time-partitioned blocks
+(<a href="../primitives/p8.html">P8</a>).</li>
+<li>Inverted index on tags; intersect posting lists to resolve queries
+(<a href="../primitives/p6.html">P6</a>).</li>
+<li>Scatter-gather with pushdown aggregation; merge partials
+(<a href="../primitives/p7.html">P7</a>).</li>
+<li>Separate metrics from logs; index logs selectively to contain cardinality.</li>
+</ul>
+
+<h2 class="sec">8 · Further reading</h2>
+<ul>
+<li><a href="https://docs.datadoghq.com/developers/dogstatsd/">Datadog — DogStatsD</a> · <a href="https://docs.datadoghq.com/metrics/distributions/">Distributions</a></li>
+<li><a href="https://www.datadoghq.com/blog/engineering/computing-accurate-percentiles-with-ddsketch/">Datadog — Computing accurate percentiles with DDSketch</a></li>
+<li><a href="https://www.datadoghq.com/blog/logging-without-limits/">Datadog — Logging without Limits</a></li>
+<li><a href="https://www.vldb.org/pvldb/vol8/p1816-teller.pdf">Gorilla: A Fast, Scalable, In-Memory Time Series Database</a> (Facebook, VLDB 2015)</li>
+</ul>
+
+<div class="prevnext">
+<a href="s5.html">&larr; 5 · Object store</a>
+<a href="s7.html">7 · Search engine &rarr;</a>
+</div>
+
+</div></main>
+</div>
+<a href="#top" class="backtop" title="Back to top">&uarr;</a>
+<script type="module">
+  import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+  mermaid.initialize({ startOnLoad: true, theme: 'neutral' });
+</script>
+<script>window.SITE_BASE="../";</script>
+<script src="../assets/site.js"></script>
+</body></html>

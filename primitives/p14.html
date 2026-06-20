@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>P14 Saga / compensation — System Design Curriculum</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head><body>
+<div class="wrap">
+<nav class="side" id="side"></nav>
+<main><div class="reading" id="top">
+<div class="crumb"><a href="../index.html">Curriculum</a> / Part II · Primitives / P14</div><h1>P14 · Saga &amp; compensation</h1>
+<div class="summary"><div class="field"><b>What it is:</b> a multi-step workflow across services where each step has a compensating undo, used when a single distributed transaction is too expensive.</div>
+<div class="field"><b>Reach for it when:</b> a business operation spans systems you can't wrap in one ACID transaction (debit → credit → notify).</div>
+<div class="field"><b>The lever:</b> orchestrated or choreographed steps; each records progress; failure triggers compensating actions; combine with <a href="../primitives/p9.html">P9</a> for safe retries.</div>
+<div class="newprob"><b>New problem it hands you:</b> intermediate states are visible (no isolation); compensations may themselves fail; you need reconciliation as the final net (2PC is the alternative and rarely worth it).</div>
+<div class="prims"><b>Exemplified by:</b> <a href="../systems/s17.html">Payment</a>, order/checkout flows.</div></div>
+
+<hr>
+
+<h2 class="sec">1 &middot; The problem it solves</h2>
+<p>A business operation often spans several services &mdash; reserve inventory, charge
+the card, book the shipment &mdash; that you can&rsquo;t wrap in one ACID transaction
+(they&rsquo;re different databases, some external). A <b>saga</b> runs the steps as a
+sequence, and if a later step fails, runs <b>compensating</b> actions to undo the
+earlier ones.</p>
+
+<h2 class="sec">2 &middot; How it works</h2>
+<pre class="mermaid">
+graph LR
+  S1[reserve] --> S2[charge] --> S3[ship]
+  S3 -.->|fail| C2[refund]
+  C2 --> C1[release reservation]
+</pre>
+<p><b>Orchestration</b>: a central coordinator drives the steps and triggers
+compensations. <b>Choreography</b>: each service emits events the next reacts to. Each
+step records progress so a crashed saga can resume, and steps are made idempotent
+(<a href="../primitives/p9.html">P9</a>) so retries are safe.</p>
+
+<h2 class="sec">3 &middot; The new bottleneck it hands you</h2>
+<div class="newprob">
+<p>Sagas give up <b>isolation</b>: intermediate states are visible (a charge exists
+before the shipment is booked), so other readers can see partial results. Some actions
+have no clean undo (you can refund a charge, but you can&rsquo;t un-send an email).
+Compensations can <b>themselves fail</b>, so you still need <b>reconciliation</b> as
+the final safety net. The alternative, two-phase commit, blocks resources and rarely
+scales &mdash; which is why sagas exist.</p>
+</div>
+
+<h2 class="sec">4 &middot; Real-world example</h2>
+<div class="example">
+<span class="tag">Uber Cadence / Temporal</span>
+<p>The saga concept dates to Garcia-Molina &amp; Salem (1987), but its modern form is
+durable workflow engines. Uber built <b>Cadence</b> (now continued as
+<b>Temporal</b>) precisely to run long-lived, multi-step business workflows reliably:
+the engine persists every step&rsquo;s state so a process can crash and resume exactly
+where it left off, and developers write compensation logic for rollback. Trip booking,
+payments, and driver onboarding are modeled as orchestrated sagas on top of it. The
+engine turns "remember where we are and what to undo" into infrastructure. See
+<a href="../systems/s17.html">Payment</a> and <a href="../systems/s12.html">Task scheduler</a>.</p>
+</div>
+
+<h2 class="sec">5 &middot; Applying it in a design</h2>
+<p>For multi-service operations: <i>"orchestrated saga with a compensating action per
+step, idempotent steps, and nightly reconciliation &mdash; rather than a distributed
+transaction."</i></p>
+
+<h2 class="sec">6 &middot; Pitfalls</h2>
+<ul>
+<li>Designing only the happy path; the compensations are the hard part.</li>
+<li>Assuming compensations always succeed.</li>
+<li>Reaching for 2PC when a saga would do.</li>
+</ul>
+
+<h2 class="sec">7 &middot; Further reading</h2>
+<ul>
+<li><a href="https://www.cs.cornell.edu/andru/cs711/2002fa/reading/sagas.pdf">Garcia-Molina &amp; Salem &mdash; Sagas (1987)</a></li>
+<li><a href="https://temporal.io/">Temporal</a> (successor to Uber Cadence)</li>
+</ul>
+
+<div class="prevnext"><a href="p13.html">&larr; P13 &middot; Real-time / routing</a><a href="p15.html">P15 &middot; Geospatial &rarr;</a></div>
+</div></main>
+</div>
+<a href="#top" class="backtop" title="Back to top">&uarr;</a>
+<script type="module">
+  import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+  mermaid.initialize({ startOnLoad: true, theme: 'neutral' });
+</script>
+<script>window.SITE_BASE="../";</script>
+<script src="../assets/site.js"></script>
+</body></html>

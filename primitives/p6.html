@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>P6 Inverted index — System Design Curriculum</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head><body>
+<div class="wrap">
+<nav class="side" id="side"></nav>
+<main><div class="reading" id="top">
+<div class="crumb"><a href="../index.html">Curriculum</a> / Part II · Primitives / P6</div><h1>P6 · Inverted index</h1>
+<div class="summary"><div class="field"><b>What it is:</b> a map term → documents containing it, so you find matches without scanning the corpus.</div>
+<div class="field"><b>Reach for it when:</b> full-text or faceted search, or lookups over a high-cardinality attribute space (tags).</div>
+<div class="field"><b>The lever:</b> tokenize/stem → posting lists with term frequency + position; TF-IDF/BM25 for ranking; immutable segments merged in background rather than in-place updates.</div>
+<div class="newprob"><b>New problem it hands you: near-real-time gap</b> (newly written data isn't searchable until refreshed) and <b>distributed IDF</b> (each shard knows only local stats, so global relevance needs a stats pass or approximation). Plus index storage/cardinality cost.</div>
+<div class="prims"><b>Exemplified by:</b> <a href="../systems/s7.html">Search engine</a>, <a href="../systems/s6.html">Datadog</a>.</div></div>
+
+<hr>
+
+<h2 class="sec">1 &middot; The problem it solves</h2>
+<p>To find which documents contain "system design" you do not want to scan every
+document. An <b>inverted index</b> flips the data around: instead of document &rarr;
+words, it stores word &rarr; list of documents (a <em>posting list</em>). Lookups
+become a set intersection instead of a full scan.</p>
+
+<h2 class="sec">2 &middot; How it works</h2>
+<pre class="mermaid">
+graph LR
+  D[docs] --> T[tokenize + stem]
+  T --> I[("term -> posting list")]
+  Q[query: design] --> I
+  I --> R[doc ids + positions + tf]
+</pre>
+<p>Build: tokenize, normalize/stem, and for each term store a posting list of doc IDs
+with term frequency and positions (for phrase queries). Score with <b>TF-IDF</b> or
+<b>BM25</b> so rare, on-topic terms outweigh common ones. Crucially, indexes are
+written as <b>immutable segments</b> and merged in the background rather than updated
+in place &mdash; updating a posting list in place is too slow.</p>
+
+<h2 class="sec">3 &middot; The new bottleneck it hands you</h2>
+<div class="newprob">
+<p><b>Near-real-time gap:</b> a freshly written document isn&rsquo;t searchable until the
+next refresh creates a new segment (seconds, not milliseconds). <b>Distributed IDF:</b>
+when the index is sharded, each shard knows only its <em>local</em> term statistics, so
+a globally correct relevance score needs a separate stats pass or an approximation &mdash;
+which is why relevance can look wrong on small/skewed indexes. Plus the index itself
+costs storage proportional to vocabulary &times; postings.</p>
+</div>
+
+<h2 class="sec">4 &middot; Real-world example</h2>
+<div class="example">
+<span class="tag">Apache Lucene (Elasticsearch / Solr)</span>
+<p>Lucene &mdash; the engine inside Elasticsearch and Solr &mdash; stores the index as
+immutable <b>segments</b>. New documents go into an in-memory buffer and are flushed to
+a new small segment on a <b>refresh</b> (Elasticsearch defaults to ~1&nbsp;second,
+which is the near-real-time gap made concrete). Background <b>merges</b> combine small
+segments into bigger ones to keep query fan-out bounded and to actually purge deleted
+docs (deletes are just tombstones until a merge). This immutable-segment design is the
+direct ancestor of how <a href="../systems/s6.html">Datadog</a> indexes its tag space and how
+<a href="../systems/s7.html">Elasticsearch</a> scales search.</p>
+</div>
+
+<h2 class="sec">5 &middot; Applying it in a design</h2>
+<p>Reach for an inverted index for full-text, faceted search, or high-cardinality tag
+lookups. Mention the gap: <i>"writes are searchable after a ~1s refresh, and I&rsquo;ll
+account for distributed IDF when ranking across shards."</i></p>
+
+<h2 class="sec">6 &middot; Pitfalls</h2>
+<ul>
+<li>Expecting in-place updates / instant searchability.</li>
+<li>Ignoring merge cost (write amplification from constant merging).</li>
+<li>Assuming local shard scores are globally comparable.</li>
+</ul>
+
+<h2 class="sec">7 &middot; Further reading</h2>
+<ul>
+<li><a href="https://lucene.apache.org/core/">Apache Lucene</a> &middot; <a href="https://www.elastic.co/blog/found-elasticsearch-from-the-bottom-up">Elasticsearch from the bottom up</a></li>
+</ul>
+
+<div class="prevnext"><a href="p5.html">&larr; P5 &middot; Write- vs read-time</a><a href="p7.html">P7 &middot; Scatter-gather &rarr;</a></div>
+</div></main>
+</div>
+<a href="#top" class="backtop" title="Back to top">&uarr;</a>
+<script type="module">
+  import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+  mermaid.initialize({ startOnLoad: true, theme: 'neutral' });
+</script>
+<script>window.SITE_BASE="../";</script>
+<script src="../assets/site.js"></script>
+</body></html>

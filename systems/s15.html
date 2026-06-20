@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>15 Ride-sharing — System Design Curriculum</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head><body>
+<div class="wrap">
+<nav class="side" id="side"></nav>
+<main><div class="reading" id="top">
+<div class="crumb"><a href="../index.html">Curriculum</a> / Part III · Systems / Cluster E — Domain-specific</div><h1>15 · Ride-Sharing / Location System (Uber)</h1>
+<div class="summary"><div class="hard"><b>Hard constraint:</b> geo-search must be fast with a variable radius; geohash precision trades search radius against result-set size.</div><div class="prims"><b>Primitives exercised:</b> <a href="../primitives/p15.html">P15</a>, <a href="../primitives/p1.html">P1</a> (write-heavy), <a href="../primitives/p2.html">P2</a> (hot-cell).</div><p>Geohash/quad-tree partitioning; ~1M location updates/min (write-heavy); matching as supply-demand in a cell; surge as a real-time read on that ratio; routing vs ETA (static graph shortest-path + dynamic traffic).</p></div>
+
+<hr>
+
+<h2 class="sec">1 &middot; Requirements &amp; scale</h2>
+<p><b>Functional:</b> track driver locations in real time, match a rider to the nearest
+available driver, price by supply/demand, route and estimate ETA. <b>Non-functional:</b>
+absorb a huge write rate of location updates and answer proximity queries fast.</p>
+<div class="estimate">Back-of-envelope
+5,000,000 active drivers, update every ~4s    ~ 1,250,000 location writes/s
+matching: nearest available within radius     -> geo index lookup per request
+this is a WRITE-heavy + geo-query problem, not a storage problem
+</div>
+
+<h2 class="sec">2 &middot; High-level architecture</h2>
+<pre class="mermaid">
+graph LR
+  D[drivers] -->|location updates| LOC[location service]
+  LOC --> GEO[(geo index: H3 cells -> drivers)]
+  R[rider request] --> DISCO[matching / dispatch]
+  DISCO --> GEO
+  DISCO --> SURGE[surge: supply/demand per cell]
+</pre>
+
+<h2 class="sec">3 &middot; The hard constraint, in depth</h2>
+<div class="hard"><p>Geo-search must be fast and the radius is <b>variable</b> (expand
+until you find enough drivers). Indexing by geohash/H3 gives approximate range search,
+where the cell precision trades search radius against result-set size, and you must also
+search neighboring cells to catch drivers just across a boundary (<a href="../primitives/p15.html">P15</a>).
+Layer on a ~1M/s update rate and a <b>hot cell</b> downtown and it&rsquo;s a write-heavy,
+skew-prone problem.</p></div>
+
+<h2 class="sec">4 &middot; Component deep dives</h2>
+<h3>Geospatial index (P15)</h3>
+<p>Driver positions are bucketed into H3/geohash cells; a match queries the rider&rsquo;s
+cell plus its ring of neighbors &mdash; see <a href="../primitives/p15.html">P15</a>.</p>
+<h3>Location ingest (P1/P2)</h3>
+<p>High-frequency updates are batched and written to an in-memory geo store; partition by
+cell, but watch for hot downtown cells (<a href="../primitives/p2.html">P2</a>).</p>
+<h3>Matching / dispatch</h3>
+<p>A supply-demand problem within a cell: find nearby available drivers, rank by ETA, and
+offer. Uber&rsquo;s dispatch (DISCO) batches requests over short windows to make globally
+better matches rather than greedy nearest-first.</p>
+<h3>Surge &amp; routing</h3>
+<p>Surge is a real-time read of the supply:demand ratio per cell over the same location
+data. ETA/routing uses shortest-path (Dijkstra/A*) on a road graph adjusted by live
+traffic.</p>
+
+<h2 class="sec">5 &middot; Real-world example</h2>
+<div class="example">
+<span class="tag">Uber</span>
+<p>Uber indexes the world with <b>H3</b>, its open-source hexagonal hierarchical grid
+(<a href="../primitives/p15.html">P15</a>), and runs matching/surge per cell. Hexagons give uniform
+neighbor distances, which makes "expand the search ring" and smoothing supply/demand
+across adjacent cells clean. Its dispatch system batches ride requests over short time
+windows to optimize matches city-wide instead of greedily, and surge pricing is computed
+from real-time supply/demand per H3 cell. The defining trait is that it is a write-heavy
+real-time geospatial system, so the location index and its cells are the center of the
+design.</p>
+</div>
+
+<h2 class="sec">6 &middot; Tradeoffs &amp; alternatives</h2>
+<p>Bigger cells = fewer lookups but more candidates to filter; smaller cells = precise but
+more boundary handling and more hot-cell risk. Batched dispatch yields better matches at
+the cost of a little latency vs greedy nearest. In-memory geo store for speed vs durable
+store for safety.</p>
+
+<h2 class="sec">7 &middot; Key talking points</h2>
+<ul>
+<li>Write-heavy + geo-query, not storage-heavy.</li>
+<li>H3/geohash cells; search cell + neighbor ring (<a href="../primitives/p15.html">P15</a>).</li>
+<li>Hot downtown cells = hot partition (<a href="../primitives/p2.html">P2</a>).</li>
+<li>Batched dispatch for better global matching.</li>
+<li>Surge = real-time supply/demand read per cell.</li>
+</ul>
+
+<h2 class="sec">8 &middot; Further reading</h2>
+<ul>
+<li><a href="https://www.uber.com/blog/h3/">Uber H3</a> &middot; <a href="https://www.uber.com/blog/engineering/">Uber Engineering blog</a></li>
+</ul>
+
+<div class="prevnext"><a href="s14.html">&larr; S14 &middot; URL shortener</a><a href="s16.html">S16 &middot; Video streaming &rarr;</a></div>
+</div></main>
+</div>
+<a href="#top" class="backtop" title="Back to top">&uarr;</a>
+<script type="module">
+  import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+  mermaid.initialize({ startOnLoad: true, theme: 'neutral' });
+</script>
+<script>window.SITE_BASE="../";</script>
+<script src="../assets/site.js"></script>
+</body></html>

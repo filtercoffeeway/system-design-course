@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>P16 Backpressure — System Design Curriculum</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head><body>
+<div class="wrap">
+<nav class="side" id="side"></nav>
+<main><div class="reading" id="top">
+<div class="crumb"><a href="../index.html">Curriculum</a> / Part II · Primitives / P16</div><h1>P16 · Backpressure / flow control</h1>
+<div class="summary"><div class="field"><b>What it is:</b> letting a slow consumer tell a fast producer to slow down, rather than collapsing.</div>
+<div class="field"><b>Reach for it when:</b> any producer can outpace any consumer (ingestion, queues, streaming).</div>
+<div class="field"><b>The lever:</b> bounded buffers; credit/ack-based flow control; a durable queue as a shock absorber; explicit drop/sample policies when losing data beats falling over.</div>
+<div class="newprob"><b>New problem it hands you:</b> if you block, latency propagates upstream; if you drop/sample, you lose data; an unbounded buffer just defers the collapse and grows lag.</div>
+<div class="prims"><b>Exemplified by:</b> <a href="../systems/s2.html">Kafka</a>, <a href="../systems/s6.html">Datadog ingest</a>, <a href="../systems/s1.html">Rate limiter</a>.</div></div>
+
+<hr>
+
+<h2 class="sec">1 &middot; The problem it solves</h2>
+<p>A fast producer pointed at a slower consumer eventually overruns it: queues grow
+without bound, memory fills, and the system collapses &mdash; often catastrophically and
+all at once. <b>Backpressure</b> is the mechanism by which a consumer tells a producer
+"slow down" so the system degrades gracefully instead.</p>
+
+<h2 class="sec">2 &middot; How it works</h2>
+<pre class="mermaid">
+graph LR
+  P[producer] -->|bounded buffer| C[consumer]
+  C -.->|credits / acks: I can take N more| P
+  P -.->|buffer full: block / drop / sample| X[policy]
+</pre>
+<p>Options, from lossless to lossy: <b>block</b> the producer (propagates slowness
+upstream but loses nothing), <b>credit/ack-based flow control</b> (consumer grants the
+producer permission for N more items), a <b>durable queue</b> as a shock absorber
+(<a href="../systems/s2.html">Kafka</a>), or explicit <b>drop/sample</b> when losing data beats
+falling over (metrics, logs).</p>
+
+<h2 class="sec">3 &middot; The new bottleneck it hands you</h2>
+<div class="newprob">
+<p>Every choice has a cost: <b>blocking</b> pushes latency back up the chain (and can
+deadlock if it reaches the user); <b>dropping/sampling</b> loses data; an
+<b>unbounded buffer</b> just defers the collapse while growing lag until the data is
+useless. There is no free option &mdash; you are choosing <em>which</em> failure mode you
+prefer.</p>
+</div>
+
+<h2 class="sec">4 &middot; Real-world example</h2>
+<div class="example">
+<span class="tag">TCP &amp; Netflix concurrency-limits</span>
+<p>The oldest example is <b>TCP flow control</b>: the receiver advertises a window
+("I have room for N more bytes") and the sender must not exceed it &mdash; credit-based
+backpressure built into the internet. At the application layer, Netflix open-sourced
+<b>concurrency-limits</b>, an adaptive load-shedder that treats a service like TCP:
+it infers the right concurrency limit from observed latency (TCP-Vegas-style) and
+<em>sheds</em> excess requests rather than letting queues build and latency explode.
+The Reactive Streams standard (RxJava, Project Reactor) bakes credit-based
+backpressure into stream APIs for the same reason.</p>
+</div>
+
+<h2 class="sec">5 &middot; Applying it in a design</h2>
+<p>Any producer/consumer boundary: <i>"bounded buffer with explicit policy &mdash; block
+if we can&rsquo;t lose data, sample if we can; a durable log absorbs bursts; shed load
+past capacity."</i> It&rsquo;s the natural follow-on to batching (<a href="../primitives/p1.html">P1</a>).</p>
+
+<h2 class="sec">6 &middot; Pitfalls</h2>
+<ul>
+<li>Unbounded in-memory queues (OOM waiting to happen).</li>
+<li>No defined policy for "buffer full."</li>
+<li>Retry storms that ignore backpressure signals.</li>
+</ul>
+
+<h2 class="sec">7 &middot; Further reading</h2>
+<ul>
+<li><a href="https://github.com/Netflix/concurrency-limits">Netflix concurrency-limits</a></li>
+<li><a href="https://www.reactive-streams.org/">Reactive Streams</a></li>
+</ul>
+
+<div class="prevnext"><a href="p15.html">&larr; P15 &middot; Geospatial</a><a href="p17.html">P17 &middot; Storage internals &rarr;</a></div>
+</div></main>
+</div>
+<a href="#top" class="backtop" title="Back to top">&uarr;</a>
+<script type="module">
+  import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+  mermaid.initialize({ startOnLoad: true, theme: 'neutral' });
+</script>
+<script>window.SITE_BASE="../";</script>
+<script src="../assets/site.js"></script>
+</body></html>

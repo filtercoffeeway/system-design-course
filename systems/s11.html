@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>11 Notification — System Design Curriculum</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head><body>
+<div class="wrap">
+<nav class="side" id="side"></nav>
+<main><div class="reading" id="top">
+<div class="crumb"><a href="../index.html">Curriculum</a> / Part III · Systems / Cluster C — High fan-out</div><h1>11 · Notification System</h1>
+<div class="summary"><div class="hard"><b>Hard constraint:</b> at-least-once is easy; exactly-once is near-impossible — you can't see whether FCM/Twilio actually delivered. Design for idempotency.</div><div class="prims"><b>Primitives exercised:</b> <a href="../primitives/p9.html">P9</a>, <a href="../primitives/p5.html">P5</a>, <a href="../primitives/p1.html">P1</a>/priority, <a href="../primitives/p16.html">P16</a> (channel limits).</div><p>Priority queues (critical vs marketing); idempotency keys; channel-specific rate limits; scheduled/delayed delivery with a scanner; per-channel preference checks before send.</p></div>
+
+<hr>
+
+<h2 class="sec">1 &middot; Requirements &amp; scale</h2>
+<p><b>Functional:</b> deliver messages across channels (push, SMS, email, in-app) with
+priorities, scheduling, user preferences, and at-least-once delivery.
+<b>Non-functional:</b> high throughput, no double-sends, respect external provider
+limits, isolate slow/marketing traffic from urgent alerts.</p>
+<div class="estimate">Back-of-envelope
+500,000,000 notifications/day                ~ 6,000/s avg, large campaign spikes
+channels: FCM, APNs, Twilio (SMS), SES (email) -- each with its own rate limits
+preference + dedup state per user-channel
+</div>
+
+<h2 class="sec">2 &middot; High-level architecture</h2>
+<pre class="mermaid">
+graph LR
+  SRC[services] --> API[notification API]
+  API --> PQ[priority queues]
+  PQ --> W[workers]
+  W --> PREF{prefs + dedup}
+  PREF --> CH1[push: FCM/APNs]
+  PREF --> CH2[SMS: Twilio]
+  PREF --> CH3[email: SES]
+</pre>
+
+<h2 class="sec">3 &middot; The hard constraint, in depth</h2>
+<div class="hard"><p>At-least-once is easy; <b>exactly-once is effectively
+impossible</b> because the external channels (FCM, APNs, Twilio) are black boxes &mdash;
+you can&rsquo;t know whether a push truly reached the device. So you design for
+<b>idempotency</b> (<a href="../primitives/p9.html">P9</a>): a dedup key per (user, event) so retries
+don&rsquo;t double-send, plus tracking to reconcile. You also must honor each
+channel&rsquo;s rate limits or get throttled/banned.</p></div>
+
+<h2 class="sec">4 &middot; Component deep dives</h2>
+<h3>Priority &amp; isolation (P1/P16)</h3>
+<p>Separate queues so a 10M-recipient marketing blast can&rsquo;t starve a 2FA code or
+a "your driver arrived" alert. Workers drain high-priority first; per-channel buffers
+apply backpressure (<a href="../primitives/p16.html">P16</a>).</p>
+<h3>Idempotency &amp; retries (P9)</h3>
+<p>Dedup key written before send; retries on transient channel failures with backoff;
+dead-letter after N attempts &mdash; see <a href="../primitives/p9.html">P9</a>.</p>
+<h3>Channel rate limits</h3>
+<p>FCM/APNs/Twilio each have per-second/per-account ceilings; a per-channel rate
+limiter (<a href="../systems/s1.html">S1</a>) and token-bucket pacing keep you under them.</p>
+<h3>Scheduling &amp; preferences</h3>
+<p>Future-dated notifications go to a delayed store scanned by a timer (the same delayed
+-queue pattern as the <a href="../systems/s12.html">task scheduler</a>). Per-channel opt-outs and
+quiet-hours are checked at send time, per channel, not once globally.</p>
+
+<h2 class="sec">5 &middot; Real-world example</h2>
+<div class="example">
+<span class="tag">Uber</span>
+<p>Uber has described its push platform handling on the order of hundreds of millions
+of notifications a day across push/SMS/email, with the same shape as above: a unified
+API in front of channel-specific adapters (APNs, FCM, SMS providers), priority
+separation so operational messages (trip updates) beat promotional ones, idempotency to
+avoid duplicate trip alerts, and per-provider rate control. The defining reality is
+that the channels are third parties you must integrate with and pace, so the platform
+is mostly about reliability, dedup, and provider management rather than novel storage.</p>
+</div>
+
+<h2 class="sec">6 &middot; Tradeoffs &amp; alternatives</h2>
+<p>Push for speed vs SMS/email for reach and reliability. Aggressive retries improve
+delivery but risk duplicates and cost; idempotency lets you retry safely. Real-time vs
+batched/digest delivery trades immediacy for volume control.</p>
+
+<h2 class="sec">7 &middot; Key talking points</h2>
+<ul>
+<li>Design for at-least-once + idempotent dedup, not exactly-once (<a href="../primitives/p9.html">P9</a>).</li>
+<li>Priority queues isolate urgent from bulk (<a href="../primitives/p1.html">P1</a>, <a href="../primitives/p16.html">P16</a>).</li>
+<li>Respect per-channel provider rate limits (<a href="../systems/s1.html">S1</a>).</li>
+<li>Delayed queue + scanner for scheduling (<a href="../systems/s12.html">S12</a>).</li>
+<li>Check preferences per channel at send time.</li>
+</ul>
+
+<h2 class="sec">8 &middot; Further reading</h2>
+<ul>
+<li><a href="https://www.uber.com/blog/real-time-push-platform/">Uber &mdash; real-time push platform</a></li>
+</ul>
+
+<div class="prevnext"><a href="s10.html">&larr; S10 &middot; Chat</a><a href="s12.html">S12 &middot; Task scheduler &rarr;</a></div>
+</div></main>
+</div>
+<a href="#top" class="backtop" title="Back to top">&uarr;</a>
+<script type="module">
+  import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+  mermaid.initialize({ startOnLoad: true, theme: 'neutral' });
+</script>
+<script>window.SITE_BASE="../";</script>
+<script src="../assets/site.js"></script>
+</body></html>

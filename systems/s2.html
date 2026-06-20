@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>2 Message Queue / Kafka — System Design Curriculum</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head><body>
+<div class="wrap">
+<nav class="side" id="side"></nav>
+<main><div class="reading" id="top">
+
+<div class="crumb"><a href="../index.html">Curriculum</a> / Part III · Systems / Cluster A — Foundations</div>
+<h1>2 · Message Queue / Kafka</h1>
+
+<div class="summary">
+<div class="hard"><b>Hard constraint:</b> a partition is consumed sequentially by one consumer per group → throughput ceiling = partition count × consumer speed.</div>
+<div class="prims"><b>Primitives exercised:</b> <a href="../primitives/p1.html">P1</a>, <a href="../primitives/p2.html">P2</a>, <a href="../primitives/p3.html">P3</a> (ISR), <a href="../primitives/p16.html">P16</a>, <a href="../primitives/p17.html">P17</a> (log).</div>
+<p>Log-structured storage (append beats random write); partitioning strategies; consumer-group parallelism ceiling; offset management, at-least-once vs EOS; replication factor + ISR; compacted topics for changelogs; retention as a replay buffer.</p>
+</div>
+
+<hr>
+
+<h2 class="sec">1 · Requirements &amp; scale</h2>
+<p><b>Functional:</b> producers publish messages to topics; consumers read them,
+possibly much later, possibly re-reading; messages of a related key arrive in order;
+multiple independent consumers read the same stream. <b>Non-functional:</b> very high
+write throughput, durability (a committed message survives broker loss), horizontal
+scalability, and bounded, predictable latency.</p>
+
+<div class="estimate">Back-of-envelope
+1,000,000 messages/sec × 1 KB              = 1 GB/s ingest
+retention 7 days                            = 1 GB/s × 604,800 s ≈ 600 TB (× replication)
+replication factor 3                        => ~1.8 PB on disk
+parallelism: consumer group throughput      = (#partitions) × (per-consumer rate)
+  -> to consume 1 GB/s at 50 MB/s/consumer => need ≥ 20 partitions/consumers
+</div>
+<p>The estimate exposes the central design fact: <b>your consumer parallelism is
+capped by partition count</b>, so partition count is the most important upfront
+decision.</p>
+
+<h2 class="sec">2 · High-level architecture</h2>
+<pre class="mermaid">
+graph LR
+  PR[Producers] -->|append, batched| L1
+  subgraph Topic T  (partitioned)
+    L1[Partition 0 leader] --- R1[(replicas / ISR)]
+    L2[Partition 1 leader] --- R2[(replicas / ISR)]
+    L3[Partition 2 leader] --- R3[(replicas / ISR)]
+  end
+  L1 --> C1[Consumer A]
+  L2 --> C2[Consumer B]
+  L3 --> C3[Consumer C]
+  note[Consumer group: one consumer per partition]
+</pre>
+<p>A topic is split into partitions (<a href="../primitives/p2.html">P2</a>); each
+partition is an append-only log (<a href="../primitives/p17.html">P17</a>) replicated
+across brokers (<a href="../primitives/p3.html">P3</a>). Producers append (batched,
+<a href="../primitives/p1.html">P1</a>); each partition is consumed by exactly one
+consumer within a group, which is both the parallelism mechanism and the
+constraint.</p>
+
+<h2 class="sec">3 · The hard constraint, in depth</h2>
+<div class="hard">
+<p>Within a consumer group, <b>each partition is assigned to exactly one consumer</b>,
+and that consumer reads the partition strictly in offset order. This is what gives
+you per-key ordering — but it means you cannot have more active consumers in a group
+than partitions. If you provision 10 partitions and need more throughput, an 11th
+consumer sits idle. You cannot increase parallelism without
+<em>re-partitioning</em>, which is operationally painful (it changes key→partition
+mapping and breaks ordering during the transition).</p>
+<p>So partition count is a capacity decision you must make early and slightly
+over-provision. Too few = throughput ceiling. Too many = more metadata, more open
+files, longer leader elections, more end-to-end latency. The "right" number is
+"enough to hit peak consumer parallelism with headroom."</p>
+</div>
+
+<h2 class="sec">4 · Component deep dives</h2>
+
+<h3>The log: why append beats random write (P17)</h3>
+<p>Each partition is an immutable, append-only sequence of records addressed by a
+monotonic <b>offset</b>. Appends are sequential disk writes — the single fastest
+thing a disk does, HDD or SSD — so write throughput is enormous. Reads are also
+sequential scans from an offset. There is no in-place update and no read-modify-write,
+which is exactly why a log outruns a B-tree-backed queue. See
+<a href="../primitives/p17.html">P17</a>.</p>
+
+<h3>Zero-copy and the page cache</h3>
+<p>Kafka leans on the OS page cache rather than a user-space cache: written data sits
+in cache and is served to consumers from there. Crucially, broker→consumer reads use
+<b>zero-copy</b> (<code>sendfile</code>): bytes go from page cache straight to the
+network socket without being copied into the JVM heap and back. This is a large part
+of why a single broker can push gigabytes per second.</p>
+
+<h3>Partitioning strategy (P2)</h3>
+<p>The producer chooses a partition: by <b>key hash</b> (all records with the same
+key land on the same partition → per-key ordering), <b>round-robin</b> (max spread,
+no ordering), or custom. Key-hash partitioning is where the
+<a href="../primitives/p2.html">hot-partition problem</a> bites: a single hot key
+(one giant tenant) overloads one partition while others idle. Mitigations: a
+composite key, or splitting the hot key across sub-partitions and merging
+downstream.</p>
+
+<h3>Replication &amp; ISR (P3)</h3>
+<p>Each partition has a leader and N−1 followers. The leader tracks the <b>in-sync
+replica</b> set (ISR) — followers caught up within a bound. With
+<code>acks=all</code>, a write is acknowledged only once all ISR members have it, so
+it survives the loss of any in-sync broker. The dial: <code>acks=0/1/all</code> and
+<code>min.insync.replicas</code> trade latency for durability — the
+<a href="../primitives/p3.html">P3</a> consistency ladder in concrete form.</p>
+
+<h3>Offsets &amp; delivery semantics</h3>
+<p>Consumers track their position with a committed <b>offset</b>. Commit <em>after</em>
+processing → at-least-once (a crash before commit replays the message). Commit
+<em>before</em> → at-most-once. <b>Exactly-once (EOS)</b> needs idempotent producers
+(dedup by producer-id + sequence number) plus transactional writes that atomically
+commit messages and offsets — real but more expensive, so reach for it only when
+duplicates are unacceptable. Pair with idempotent consumers
+(<a href="../primitives/p9.html">P9</a>) and you usually don't need EOS at all.</p>
+
+<h3>Retention, replay &amp; compaction</h3>
+<p>Messages persist for a retention window (time or size) regardless of consumption,
+so a new or buggy consumer can <b>replay</b> from any offset — the log doubles as a
+recovery buffer after a bug. <b>Log-compacted</b> topics instead retain the latest
+value per key forever, which makes a topic a durable changelog/snapshot (the basis
+for event sourcing and for Kafka's own consumer-offset and Connect state).</p>
+
+<h3>Backpressure (P16)</h3>
+<p>Because storage is durable and consumers pull at their own pace, a slow consumer
+simply lags — it doesn't push back on producers. The log <em>is</em> the shock
+absorber. Your job is to monitor consumer lag and scale consumers (up to the
+partition ceiling). See <a href="../primitives/p16.html">P16</a>.</p>
+
+<h2 class="sec">5 · Real-world example</h2>
+<div class="example">
+<span class="tag">LinkedIn</span>
+<p>Kafka was built at LinkedIn (~2010) to unify a sprawl of point-to-point data
+pipelines into one central log: every event — page views, metrics, database changes
+— published once and consumed by many systems (search, analytics, monitoring,
+Hadoop). The log-as-backbone idea is laid out in Jay Kreps' essay
+<a href="https://engineering.linkedin.com/distributed-systems/log-what-every-software-engineer-should-know-about-real-time-datas-unifying-abstraction">"The Log"</a>. LinkedIn has reported running Kafka at the scale of
+<em>trillions</em> of messages per day across thousands of brokers, which is the
+existence proof that an append-only, partitioned, page-cache-served log scales
+far past what a traditional broker (RabbitMQ, ActiveMQ) reaches.</p>
+</div>
+<div class="note">Modern Kafka can replace ZooKeeper with the built-in
+<b>KRaft</b> consensus mode for metadata — the controller quorum uses Raft
+(<a href="../primitives/p10.html">P10</a>), folding leader election and metadata
+storage into Kafka itself.</div>
+
+<h2 class="sec">6 · Tradeoffs &amp; alternatives</h2>
+<p>If you need per-message acknowledgement, complex routing, or priority queues,
+a traditional broker (RabbitMQ) or a managed queue (<a href="../systems/s12.html">SQS</a>)
+fits better than a log — Kafka deliberately trades those for throughput and replay.
+If you need millions of independent low-throughput queues, the per-partition overhead
+hurts. If you need strict global ordering across all keys, you're forced to a single
+partition and lose all parallelism — a sign the requirement itself should be
+questioned.</p>
+
+<h2 class="sec">7 · Key talking points</h2>
+<ul>
+<li>Lead with the ceiling: <i>"parallelism = partition count, so I'll size partitions
+for peak consumer throughput with headroom."</i></li>
+<li>Append-only log = sequential writes; page cache + zero-copy reads
+(<a href="../primitives/p17.html">P17</a>).</li>
+<li>Key-hash partitioning for per-key order; call out the hot-partition risk
+(<a href="../primitives/p2.html">P2</a>).</li>
+<li>ISR + <code>acks=all</code> for durability; name the latency/durability dial
+(<a href="../primitives/p3.html">P3</a>).</li>
+<li>At-least-once + idempotent consumers by default; EOS only when required
+(<a href="../primitives/p9.html">P9</a>).</li>
+<li>Retention = replay buffer; compaction = changelog.</li>
+</ul>
+
+<h2 class="sec">8 · Further reading</h2>
+<ul>
+<li><a href="https://kafka.apache.org/documentation/">Apache Kafka documentation</a></li>
+<li><a href="https://engineering.linkedin.com/distributed-systems/log-what-every-software-engineer-should-know-about-real-time-datas-unifying-abstraction">Jay Kreps — The Log: What every software engineer should know about real-time data's unifying abstraction</a></li>
+<li><a href="https://kafka.apache.org/documentation/#design">Kafka design</a> (page cache, zero-copy, ISR) · <a href="https://kafka.apache.org/documentation/#producerconfigs">producer configs</a></li>
+</ul>
+
+<div class="prevnext">
+<a href="s1.html">&larr; 1 · Rate limiter</a>
+<a href="s3.html">3 · Key-value store &rarr;</a>
+</div>
+
+</div></main>
+</div>
+<a href="#top" class="backtop" title="Back to top">&uarr;</a>
+<script type="module">
+  import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+  mermaid.initialize({ startOnLoad: true, theme: 'neutral' });
+</script>
+<script>window.SITE_BASE="../";</script>
+<script src="../assets/site.js"></script>
+</body></html>

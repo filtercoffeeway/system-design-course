@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>P15 Geospatial — System Design Curriculum</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head><body>
+<div class="wrap">
+<nav class="side" id="side"></nav>
+<main><div class="reading" id="top">
+<div class="crumb"><a href="../index.html">Curriculum</a> / Part II · Primitives / P15</div><h1>P15 · Geospatial indexing</h1>
+<div class="summary"><div class="field"><b>What it is:</b> making "what's near me" fast over a 2D space.</div>
+<div class="field"><b>Reach for it when:</b> proximity matching or coordinate range queries under high update rates.</div>
+<div class="field"><b>The lever:</b> geohash or quad-tree bucketing turns 2D proximity into prefix/bucket lookups; precision level controls bucket size.</div>
+<div class="newprob"><b>New problem it hands you: radius vs result-set precision</b> — coarse cells over-return, fine cells miss neighbors across boundaries; high-frequency location updates make it write-heavy (<a href="../primitives/p1.html">P1</a>/<a href="../primitives/p2.html">P2</a> apply); hot cells (downtown at rush hour) recreate the hot-partition problem.</div>
+<div class="prims"><b>Exemplified by:</b> <a href="../systems/s15.html">Ride-sharing / location systems</a>.</div></div>
+
+<hr>
+
+<h2 class="sec">1 &middot; The problem it solves</h2>
+<p>"Find the drivers within 2&nbsp;km of this rider" is a 2-D range query. A B-tree on
+latitude alone is useless (it can&rsquo;t bound both dimensions). You need to turn 2-D
+proximity into something you can index and look up cheaply.</p>
+
+<h2 class="sec">2 &middot; How it works</h2>
+<p><b>Geohashing</b> interleaves latitude/longitude bits into a single string where a
+shared prefix means physical nearness, so a proximity search becomes a prefix scan.
+<b>Quad-trees</b> recursively subdivide space into four cells, splitting dense areas
+finer. Either way you bucket the world into cells and search the rider&rsquo;s cell plus
+its neighbors. Precision (prefix length / tree depth) controls cell size.</p>
+<pre class="mermaid">
+graph TD
+  W[world] --> Q1[NW] & Q2[NE] & Q3[SW] & Q4[SE]
+  Q2 --> A[dense -> subdivide further]
+</pre>
+
+<h2 class="sec">3 &middot; The new bottleneck it hands you</h2>
+<div class="newprob">
+<p><b>Radius vs result-set precision:</b> coarse cells over-return (you scan too many
+candidates), fine cells <b>miss neighbors across boundaries</b> (the nearest driver is
+just over the cell line), so you must search adjacent cells too. High-frequency
+location updates make this <b>write-heavy</b> (<a href="../primitives/p1.html">P1</a>/<a href="../primitives/p2.html">P2</a>
+apply), and a <b>hot cell</b> (downtown at rush hour) recreates the hot-partition
+problem.</p>
+</div>
+
+<h2 class="sec">4 &middot; Real-world example</h2>
+<div class="example">
+<span class="tag">Uber H3</span>
+<p>Uber built and open-sourced <b>H3</b>, a hierarchical <em>hexagonal</em> geospatial
+index. Hexagons are used because every neighbor is equidistant from the center
+(unlike squares, which have both edge and corner neighbors at different distances),
+which makes "expand the search ring" uniform and makes smoothing supply/demand across
+adjacent cells cleaner. Uber indexes driver locations and demand into H3 cells to run
+matching and to compute surge pricing per cell in real time. The hierarchy lets them
+zoom resolution up or down depending on density. See <a href="../systems/s15.html">Ride-sharing</a>.</p>
+</div>
+
+<h2 class="sec">5 &middot; Applying it in a design</h2>
+<p><i>"Index locations into geohash/H3 cells; search the target cell plus its ring of
+neighbors; tune cell size for the radius; shard by cell but watch for hot
+downtown cells."</i></p>
+
+<h2 class="sec">6 &middot; Pitfalls</h2>
+<ul>
+<li>Searching only the home cell and missing boundary neighbors.</li>
+<li>One global cell size for wildly different densities.</li>
+</ul>
+
+<h2 class="sec">7 &middot; Further reading</h2>
+<ul>
+<li><a href="https://www.uber.com/blog/h3/">Uber Engineering &mdash; H3 hexagonal hierarchical spatial index</a></li>
+</ul>
+
+<div class="prevnext"><a href="p14.html">&larr; P14 &middot; Saga / compensation</a><a href="p16.html">P16 &middot; Backpressure &rarr;</a></div>
+</div></main>
+</div>
+<a href="#top" class="backtop" title="Back to top">&uarr;</a>
+<script type="module">
+  import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+  mermaid.initialize({ startOnLoad: true, theme: 'neutral' });
+</script>
+<script>window.SITE_BASE="../";</script>
+<script src="../assets/site.js"></script>
+</body></html>

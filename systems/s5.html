@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>5 Object store — System Design Curriculum</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head><body>
+<div class="wrap">
+<nav class="side" id="side"></nav>
+<main><div class="reading" id="top">
+<div class="crumb"><a href="../index.html">Curriculum</a> / Part III · Systems / Cluster A — Foundations</div><h1>5 · Object Store (S3-style)</h1>
+<div class="summary"><div class="hard"><b>Hard constraint:</b> durability and scale almost free, but zero transactionality and no in-place mutation — every design that treats it like a database fails.</div><div class="prims"><b>Primitives exercised:</b> <a href="../primitives/p17.html">P17</a> (erasure coding), <a href="../primitives/p3.html">P3</a>, <a href="../primitives/p8.html">P8</a>.</div><p>Read-after-write consistency guarantees (and the gaps); multipart upload; erasure coding vs 3× replication; presigned URLs as scoped access without proxying; storage classes for access-frequency decay.</p></div>
+
+<hr>
+
+<h2 class="sec">1 &middot; Requirements &amp; scale</h2>
+<p><b>Functional:</b> store and retrieve arbitrarily large blobs by key
+(<code>PUT</code>/<code>GET</code>/<code>DELETE</code>), list, with access control.
+<b>Non-functional:</b> effectively infinite capacity, extreme durability, high
+throughput &mdash; but no in-place edits and no transactions.</p>
+<div class="estimate">Back-of-envelope
+trillions of objects, exabytes total
+durability target                           ~ 99.999999999% (11 nines)
+object sizes                                 bytes -> terabytes (need multipart)
+read/write                                   massively parallel, region-local
+</div>
+
+<h2 class="sec">2 &middot; High-level architecture</h2>
+<pre class="mermaid">
+graph LR
+  C[client] --> FE[API / front-end]
+  FE --> IDX[(metadata / index service)]
+  FE --> DATA[(storage nodes: erasure-coded chunks)]
+  IDX -->|object -> chunk locations| FE
+</pre>
+<p>A metadata service maps keys to chunk locations; data is split into chunks, encoded
+for durability, and spread across many nodes/racks. The API layer enforces auth and
+assembles objects.</p>
+
+<h2 class="sec">3 &middot; The hard constraint, in depth</h2>
+<div class="hard"><p>You get durability and scale almost free, but <b>zero
+transactionality and no in-place mutation</b>. An object is replaced whole, not edited;
+there are no multi-object transactions. Every design that tries to use an object store
+like a database (frequent small updates, read-modify-write loops) fails. You build
+<em>around</em> it: write new versions, keep an external index/DB for mutable metadata,
+and treat objects as immutable.</p></div>
+
+<h2 class="sec">4 &middot; Component deep dives</h2>
+<h3>Erasure coding vs replication (P17)</h3>
+<p>Instead of storing 3 full copies, split an object into <em>k</em> data + <em>m</em>
+parity chunks (e.g. 10+4): any 10 of 14 reconstruct it, surviving 4 losses while
+storing ~1.4&times; instead of 3&times;. The cost is CPU + latency to reconstruct on a
+degraded read.</p>
+<h3>Consistency</h3>
+<p>Historically eventually-consistent listings; modern S3 offers read-after-write
+consistency for new objects. Know what your store guarantees &mdash; it shapes
+correctness.</p>
+<h3>Large objects &amp; access</h3>
+<p><b>Multipart upload</b> splits a huge object into parts uploaded in parallel and
+assembled server-side (you can&rsquo;t stream 5&nbsp;TB in one request).
+<b>Presigned URLs</b> grant temporary, scoped access so clients upload/download
+directly without proxying bytes through your service.</p>
+
+<h2 class="sec">5 &middot; Real-world example</h2>
+<div class="example">
+<span class="tag">Amazon S3</span>
+<p>S3 is designed for <b>11 nines</b> of durability, achieved by redundantly storing
+each object across multiple devices and facilities (Availability Zones) using
+<b>erasure coding</b> rather than naive triple replication &mdash; less stored bytes for
+the same or better durability. It exposes <b>multipart upload</b> for large objects,
+<b>presigned URLs</b> for scoped direct access, storage classes for tiering
+(<a href="../primitives/p8.html">P8</a>), and an explicit, immutable object model (versioning rather than
+edits). It is the canonical "durable, scalable, but not a database" service that other
+systems (<a href="../systems/s16.html">video</a>, <a href="../systems/s6.html">Datadog</a> cold tier) build upon.</p>
+</div>
+
+<h2 class="sec">6 &middot; Tradeoffs &amp; alternatives</h2>
+<p>Erasure coding saves storage but slows degraded reads vs replication; pick by
+read-latency sensitivity. For mutable, transactional, small-record data use a
+<a href="../systems/s3.html">KV store</a> or <a href="../systems/s4.html">RDBMS</a>; use the object store for the big
+immutable blobs and keep pointers in the DB.</p>
+
+<h2 class="sec">7 &middot; Key talking points</h2>
+<ul>
+<li>Lead with: <i>"durable + infinite, but immutable and non-transactional."</i></li>
+<li>Erasure coding for durability at lower storage cost (<a href="../primitives/p17.html">P17</a>).</li>
+<li>Multipart upload + presigned URLs (don&rsquo;t proxy big bytes).</li>
+<li>Separate mutable metadata into an index/DB.</li>
+<li>Tiering via storage classes (<a href="../primitives/p8.html">P8</a>).</li>
+</ul>
+
+<h2 class="sec">8 &middot; Further reading</h2>
+<ul>
+<li><a href="https://aws.amazon.com/s3/">Amazon S3</a> &middot; <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/Welcome.html">S3 developer guide</a></li>
+</ul>
+
+<div class="prevnext"><a href="s4.html">&larr; S4 &middot; RDBMS scaling</a><a href="s6.html">S6 &middot; Datadog &rarr;</a></div>
+</div></main>
+</div>
+<a href="#top" class="backtop" title="Back to top">&uarr;</a>
+<script type="module">
+  import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+  mermaid.initialize({ startOnLoad: true, theme: 'neutral' });
+</script>
+<script>window.SITE_BASE="../";</script>
+<script src="../assets/site.js"></script>
+</body></html>

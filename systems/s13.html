@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>13 Distributed lock — System Design Curriculum</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head><body>
+<div class="wrap">
+<nav class="side" id="side"></nav>
+<main><div class="reading" id="top">
+<div class="crumb"><a href="../index.html">Curriculum</a> / Part III · Systems / Cluster D — Coordination</div><h1>13 · Distributed Lock / Leader Election (ZooKeeper / etcd)</h1>
+<div class="summary"><div class="hard"><b>Hard constraint:</b> the slow-but-alive holder (GC pause, network blip) — TTL tuning can't make this correct; fencing tokens can.</div><div class="prims"><b>Primitives exercised:</b> <a href="../primitives/p10.html">P10</a> (consensus/fencing).</div><p>Raft/Paxos + majority quorum; fencing tokens (monotonic, reject stale); session/heartbeat TTL for death detection; leader election as a lock with metadata; watch/notify instead of polling.</p></div>
+
+<hr>
+
+<h2 class="sec">1 &middot; Requirements &amp; scale</h2>
+<p><b>Functional:</b> let distributed processes coordinate &mdash; acquire a mutual-
+exclusion lock, or elect a single leader &mdash; correctly despite crashes and network
+faults. <b>Non-functional:</b> safety (never two holders) over liveness, low-ish churn,
+small data.</p>
+
+<h2 class="sec">2 &middot; High-level architecture</h2>
+<pre class="mermaid">
+graph TD
+  C1[client 1] --> Q[(coordination service: Raft/Paxos quorum)]
+  C2[client 2] --> Q
+  Q -->|grants lock + fencing token N| C1
+  C2 -->|blocked / watch for release| Q
+</pre>
+<p>A small, consensus-backed service (ZooKeeper/etcd/Chubby) holds the lock state on a
+quorum so it survives node loss. Clients acquire via ephemeral keys with sessions, and
+<b>watch</b> for release instead of polling.</p>
+
+<h2 class="sec">3 &middot; The hard constraint, in depth</h2>
+<div class="hard"><p>A lock holder can be <b>slow but not dead</b> &mdash; a GC pause or
+network blip makes it look dead, its lease expires, another client acquires the lock,
+and then the original wakes up <em>still believing it holds the lock</em>. Two holders
+act at once and corrupt state. No TTL value fixes this. The correct fix is a
+<b>fencing token</b>: the lock service hands out a monotonically increasing number with
+each grant, and the protected resource rejects any operation carrying a token lower
+than the highest it has seen (<a href="../primitives/p10.html">P10</a>).</p></div>
+
+<h2 class="sec">4 &middot; Component deep dives</h2>
+<h3>Consensus core (P10)</h3>
+<p>Raft/Paxos majority quorum makes the lock state itself fault tolerant; leader
+election is "a lock with the leader&rsquo;s identity as the value."</p>
+<h3>Sessions, ephemeral nodes &amp; watches</h3>
+<p>A client holds a session with a heartbeat; its lock is an ephemeral node that
+auto-releases if the session dies (death detection via TTL). Other clients set a
+<b>watch</b> to be notified the instant the lock frees &mdash; no polling.</p>
+<h3>Fencing</h3>
+<p>Monotonic tokens enforce correctness that TTL tuning cannot.</p>
+
+<h2 class="sec">5 &middot; Real-world example</h2>
+<div class="example">
+<span class="tag">Google Chubby, ZooKeeper, etcd</span>
+<p>Google&rsquo;s <b>Chubby</b> (Paxos) is the original coarse-grained lock + naming
+service much of Google coordinates through &mdash; e.g. electing a master for GFS/Bigtable.
+<b>ZooKeeper</b> brought the model to the open-source world (Kafka used it for controller
+election; HBase/Hadoop for coordination), and <b>etcd</b> (Raft) is the coordination
+store and leader-election backbone of Kubernetes. The cautionary tale is the
+<b>Redlock</b> debate: Martin Kleppmann showed that a lock without a fencing token
+isn&rsquo;t safe under GC pauses &mdash; cementing fencing as the non-negotiable piece.</p>
+</div>
+
+<h2 class="sec">6 &middot; Tradeoffs &amp; alternatives</h2>
+<p>A consensus service is the safe choice but adds a dependency and quorum latency; a
+Redis lock is fast but needs fencing to be correct. Coarse locks (one leader) are
+simpler and usually better than many fine-grained locks. Prefer leader-election +
+single-writer over distributed mutual exclusion when you can.</p>
+
+<h2 class="sec">7 &middot; Key talking points</h2>
+<ul>
+<li>Use a consensus service (etcd/ZooKeeper/Chubby), don&rsquo;t DIY (<a href="../primitives/p10.html">P10</a>).</li>
+<li>Slow-but-alive holder is the core hazard.</li>
+<li>Fencing tokens, not TTL tuning, give correctness.</li>
+<li>Sessions + ephemeral nodes for death detection; watches over polling.</li>
+<li>Prefer coarse leader election to fine-grained locks.</li>
+</ul>
+
+<h2 class="sec">8 &middot; Further reading</h2>
+<ul>
+<li><a href="https://research.google/pubs/pub27897/">The Chubby lock service</a> &middot; <a href="https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html">Kleppmann on distributed locking</a></li>
+</ul>
+
+<div class="prevnext"><a href="s12.html">&larr; S12 &middot; Task scheduler</a><a href="s14.html">S14 &middot; URL shortener &rarr;</a></div>
+</div></main>
+</div>
+<a href="#top" class="backtop" title="Back to top">&uarr;</a>
+<script type="module">
+  import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+  mermaid.initialize({ startOnLoad: true, theme: 'neutral' });
+</script>
+<script>window.SITE_BASE="../";</script>
+<script src="../assets/site.js"></script>
+</body></html>

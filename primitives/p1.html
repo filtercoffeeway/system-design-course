@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>P1 Batching / async buffering — System Design Curriculum</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head><body>
+<div class="wrap">
+<nav class="side" id="side"></nav>
+<main><div class="reading" id="top">
+
+<div class="crumb"><a href="../index.html">Curriculum</a> / Part II · Primitives / P1</div>
+<h1>P1 · Batching / async buffering</h1>
+
+<div class="summary">
+<div class="field"><b>What it is:</b> absorbing bursts and amortizing per-item overhead by grouping work and decoupling producer from consumer in time.</div>
+<div class="field"><b>Reach for it when:</b> write throughput is too high, or a downstream is slower or less available than the upstream.</div>
+<div class="field"><b>The lever:</b> client/agent-side batching; an in-memory or durable buffer (queue/log) between stages; pre-aggregation at the source before the wire.</div>
+<div class="newprob"><b>New problem it hands you:</b> added latency (a batch waits to fill); lost or weakened ordering; the buffer becomes state you must size, persist, and back-pressure (see <a href="../primitives/p16.html">P16</a>).</div>
+<div class="prims"><b>Exemplified by:</b> <a href="../systems/s1.html">Rate limiter</a>, <a href="../systems/s2.html">Kafka</a>, <a href="../systems/s6.html">Datadog</a>, <a href="../systems/s11.html">Notification</a>.</div>
+</div>
+
+<hr>
+
+<h2 class="sec">1 · The problem it solves</h2>
+<p>Every unit of work carries fixed overhead that has nothing to do with the work
+itself: a network round trip, TLS amortization, a syscall, a disk seek, a lock
+acquisition, an index update. When you do work one item at a time, that fixed cost
+dominates and throughput collapses long before CPU or disk is saturated. A service
+that can write 1&nbsp;MB in a single request might manage only a few thousand
+100-byte writes per second if each is its own request — the bottleneck is the
+<em>per-operation</em> tax, not the bytes.</p>
+<p>Batching attacks the fixed cost directly: pay it once for many items. Async
+buffering attacks a second, related problem — a fast producer pointed at a slow or
+flaky consumer. Put a buffer between them and the producer no longer waits; the
+buffer absorbs bursts and smooths the rate the consumer actually sees. The two ideas
+almost always travel together: you buffer items, then flush them in batches.</p>
+
+<h2 class="sec">2 · How it works</h2>
+<p>A batching writer accumulates items in memory and flushes when one of two
+triggers fires: a <b>size trigger</b> (the batch reaches N items or B bytes) or a
+<b>time trigger</b> (the oldest item has waited T milliseconds). The time trigger is
+what bounds latency — without it, a low-traffic key could sit in the buffer forever
+waiting for the batch to fill.</p>
+
+<pre class="mermaid">
+graph LR
+  P1[Producer] -->|append| B[(In-memory buffer)]
+  P2[Producer] -->|append| B
+  P3[Producer] -->|append| B
+  B -->|"flush on size OR time"| F[Batch flusher]
+  F -->|one request / N items| C[Slow downstream]
+</pre>
+
+<p>Three increasingly powerful forms, in order of how much they reduce load:</p>
+<ol>
+<li><b>Batching</b> — group N items into one request. Reduces request count N&times;.</li>
+<li><b>Buffering / decoupling</b> — add a durable queue or log so producer and
+consumer run at independent rates and the consumer can fail without backing up the
+producer (the whole reason <a href="../systems/s2.html">Kafka</a> exists).</li>
+<li><b>Pre-aggregation at the source</b> — don't just group the items, <em>collapse</em>
+them. If you're shipping a counter, increment locally and send the sum; if you're
+shipping latencies, build a histogram/sketch locally and send the sketch. This turns
+O(events) network traffic into O(unique series), often a 100–1000&times; reduction.
+Aggregation is the highest-leverage form and the one to reach for on
+any high-write ingestion path.</li>
+</ol>
+
+<h2 class="sec">3 · Variants &amp; when to use each</h2>
+<div class="tablewrap"><table>
+<thead><tr><th>Variant</th><th>What it reduces</th><th>Use when</th><th>Cost</th></tr></thead>
+<tbody>
+<tr><td>Size-triggered batch</td><td>Per-request overhead</td><td>Steady high volume</td><td>Latency unbounded at low volume</td></tr>
+<tr><td>Time-triggered batch</td><td>Per-request overhead, bounded latency</td><td>Bursty / uneven volume</td><td>Small batches when slow</td></tr>
+<tr><td>Size <i>or</i> time (both)</td><td>Both, with a latency ceiling</td><td>Almost always — the default</td><td>Two params to tune</td></tr>
+<tr><td>Durable buffer (log/queue)</td><td>Coupling; absorbs outages</td><td>Consumer can fail or lag</td><td>Storage + ordering complexity</td></tr>
+<tr><td>Source pre-aggregation</td><td>Total data volume (collapse)</td><td>Metrics, counters, dedupable events</td><td>Lose per-event detail; need mergeable structures</td></tr>
+</tbody></table></div>
+<p>The tuning knobs always express the same tension: bigger batch / longer timer =
+higher throughput and efficiency but higher latency and more data at risk in memory
+on a crash; smaller / shorter = lower latency, lower throughput, more overhead.</p>
+
+<h2 class="sec">4 · The new bottleneck it hands you</h2>
+<div class="newprob">
+<p><b>Latency floor.</b> Items now wait for the batch. A 200&nbsp;ms flush timer adds
+up to 200&nbsp;ms before data even leaves the producer. Fine for metrics; maybe not
+for a synchronous user request.</p>
+<p><b>Durability gap.</b> Anything in an in-memory buffer is lost if the process
+crashes before flush. You either accept the loss (metrics, logs — usually fine) or
+make the buffer durable (a WAL or a log like Kafka), which reintroduces disk cost —
+see <a href="../primitives/p17.html">P17</a>.</p>
+<p><b>Ordering.</b> Batching across keys, retries, and parallel flushers weakens
+global ordering. You usually recover only <em>per-key</em> ordering (the model
+<a href="../systems/s2.html">Kafka</a> commits to).</p>
+<p><b>The buffer is now state you must bound.</b> If the consumer stalls, an
+unbounded buffer grows until it OOMs or the lag is useless. This is exactly where
+batching forces you into <a href="../primitives/p16.html">P16 backpressure</a>:
+block, drop, or sample once the buffer is full.</p>
+</div>
+
+<h2 class="sec">5 · Real-world example</h2>
+
+<div class="example">
+<span class="tag">Datadog</span>
+<p>Datadog's metrics pipeline is the textbook case of <b>pre-aggregation at the
+source</b>, applied at two layers before a single point ever reaches the backend.</p>
+<p><b>Layer 1 — in the client (DogStatsD client-side aggregation).</b> Your app emits
+metrics like <code>statsd.increment("checkout.success")</code> thousands of times a
+second. Rather than send a UDP packet per call, the DogStatsD client aggregates
+locally: counters are summed, gauges keep the last value, histograms/distributions
+are accumulated — then flushed on a short interval (the Go client defaults to ~2s,
+chosen to evenly divide the Agent's interval and avoid aliasing). A million
+<code>increment</code> calls become one number on the wire.</p>
+<p><b>Layer 2 — in the Agent.</b> The DogStatsD server embedded in the Datadog Agent
+receives those partial aggregates from every process on the host and aggregates again
+over a <b>10-second flush interval</b>. All points for a unique (metric, tag-set) seen
+between 10:00:00 and 10:00:10 collapse into one datapoint timestamped 10:00:00, then
+get submitted to intake.</p>
+<p><b>The clever bit — mergeable percentiles with DDSketch.</b> Percentiles (p95, p99)
+can't be averaged across hosts, so historically you had to ship raw samples. Datadog
+instead builds a <a href="https://www.datadoghq.com/blog/engineering/computing-accurate-percentiles-with-ddsketch/">DDSketch</a>
+at the source — a quantile sketch with a relative-error guarantee (e.g. 1%: a true
+p99 of 1000&nbsp;ms returns within 990–1010&nbsp;ms) that is <em>fully mergeable</em>.
+Per-host sketches combine on the backend into a global sketch without ever shipping
+the underlying samples. That is pre-aggregation taken to its logical end: you ship a
+fixed-size summary, not the data.</p>
+<p>The payoff lands on the system's real hard constraint — <a href="../systems/s6.html">cardinality</a>.
+Aggregating at the source means network and backend cost scale with the number of
+<em>unique series</em>, not the raw event rate.</p>
+</div>
+
+<div class="example">
+<span class="tag">Kafka producer</span>
+<p>The Kafka producer batches records per partition in memory and flushes on
+<code>batch.size</code> (bytes) <i>or</i> <code>linger.ms</code> (time) — the
+canonical size-or-time pattern. Setting <code>linger.ms=5</code> tells the producer
+"wait up to 5&nbsp;ms to let a batch fill before sending," trading a few ms of latency
+for far fewer, larger requests and much higher throughput. Combined with compression
+(which compresses the whole batch, not per record) this is how a single producer
+sustains hundreds of thousands of messages per second.</p>
+</div>
+
+<h2 class="sec">6 · Applying it in a design</h2>
+<p>Reach for batching the moment you see a high-write path: telemetry, logs,
+clickstream, analytics events, notifications. The sentence that signals you
+understand the tradeoff: <i>"I'll aggregate at the source so cost scales with unique
+series, not event volume — accepting a flush-interval latency and the loss of any
+in-memory buffer on crash, which is fine for metrics."</i> Then immediately name the
+follow-on: a durable buffer (<a href="../systems/s2.html">Kafka</a>) if you can't lose
+data, and <a href="../primitives/p16.html">backpressure</a> for when the consumer
+falls behind.</p>
+
+<h2 class="sec">7 · Pitfalls</h2>
+<ul>
+<li><b>No time trigger.</b> Size-only batching starves low-traffic keys — they wait
+indefinitely. Always pair size with a timer.</li>
+<li><b>Unbounded buffer.</b> A buffer with no max size just converts a throughput
+problem into an OOM. Bound it and decide the drop/block policy up front.</li>
+<li><b>Batching non-mergeable data.</b> Pre-aggregation only works if your data has a
+combine operator (sum, max, last, or a mergeable sketch). Raw percentiles don't —
+that's why DDSketch exists.</li>
+<li><b>Hiding partial failure.</b> When one record in a batch fails, what happens to
+the other 999? Define whether a batch is all-or-nothing or partially committable.</li>
+</ul>
+
+<h2 class="sec">8 · Further reading</h2>
+<ul>
+<li><a href="https://docs.datadoghq.com/developers/dogstatsd/">Datadog — DogStatsD</a>
+and <a href="https://docs.datadoghq.com/developers/faq/data-aggregation-with-dogstatsd-threadstats/">data aggregation with DogStatsD</a></li>
+<li><a href="https://www.datadoghq.com/blog/engineering/computing-accurate-percentiles-with-ddsketch/">Datadog — Computing accurate percentiles with DDSketch</a> (and the <a href="https://www.vldb.org/pvldb/vol12/p2195-masson.pdf">VLDB paper</a>)</li>
+<li><a href="https://kafka.apache.org/documentation/#producerconfigs">Kafka producer configs</a> — <code>batch.size</code>, <code>linger.ms</code></li>
+</ul>
+
+<div class="prevnext">
+<span></span>
+<a href="p2.html">P2 · Partitioning / hot-key &rarr;</a>
+</div>
+
+</div></main>
+</div>
+<a href="#top" class="backtop" title="Back to top">&uarr;</a>
+<script type="module">
+  import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+  mermaid.initialize({ startOnLoad: true, theme: 'neutral' });
+</script>
+<script>window.SITE_BASE="../";</script>
+<script src="../assets/site.js"></script>
+</body></html>

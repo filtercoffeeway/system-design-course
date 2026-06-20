@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>P9 Idempotency — System Design Curriculum</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head><body>
+<div class="wrap">
+<nav class="side" id="side"></nav>
+<main><div class="reading" id="top">
+<div class="crumb"><a href="../index.html">Curriculum</a> / Part II · Primitives / P9</div><h1>P9 · Idempotency &amp; "exactly-once-ish"</h1>
+<div class="summary"><div class="field"><b>What it is:</b> making a repeated operation safe so retries don't double-apply.</div>
+<div class="field"><b>Reach for it when:</b> any at-least-once delivery, retry, or external side effect (charge a card, send a push).</div>
+<div class="field"><b>The lever:</b> idempotency key carried by the client; a dedup table written <b>transactionally</b> with the effect <code>(key, result)</code>; idempotent worker logic so re-execution converges.</div>
+<div class="newprob"><b>New problem it hands you:</b> no true exactly-once across systems you don't control (FCM, Stripe, the bank) — settle for at-least-once + idempotent + <b>reconciliation</b>. The dedup table is itself state to scale and expire.</div>
+<div class="prims"><b>Exemplified by:</b> <a href="../systems/s12.html">Task scheduler</a>, <a href="../systems/s11.html">Notification</a>, <a href="../systems/s17.html">Payment</a>.</div></div>
+
+<hr>
+
+<h2 class="sec">1 &middot; The problem it solves</h2>
+<p>Networks retry. A client times out and resends; a queue redelivers; a worker
+restarts mid-task. If the operation has a side effect (charge a card, send a push,
+decrement inventory), a retry must not apply it twice. <b>Idempotency</b> makes
+"do it again" safe.</p>
+
+<h2 class="sec">2 &middot; How it works</h2>
+<pre class="mermaid">
+graph TD
+  C[client sends op + idempotency key] --> S{key seen?}
+  S -->|no| E[execute + store key,result in same txn]
+  S -->|yes| R[return stored result, do not re-execute]
+  E --> R
+</pre>
+<p>The client supplies an <b>idempotency key</b>. The server records
+<code>(key &rarr; result)</code> in a dedup table, written <em>transactionally with the
+effect</em> so the record and the side effect commit together. A repeat of the same
+key returns the stored result instead of re-running. Workers are written so that
+re-execution converges to the same state.</p>
+
+<h2 class="sec">3 &middot; The new bottleneck it hands you</h2>
+<div class="newprob">
+<p>You cannot get <b>true</b> exactly-once across systems you don&rsquo;t control (a
+payment processor, FCM, a bank) &mdash; you can&rsquo;t know if their side committed.
+The honest target is <b>at-least-once + idempotent + reconciliation</b> (a later batch
+compares your records with theirs). The dedup table is itself state you must scale and
+expire, and the key must be chosen so genuinely-distinct requests don&rsquo;t collide
+nor genuine retries diverge.</p>
+</div>
+
+<h2 class="sec">4 &middot; Real-world example</h2>
+<div class="example">
+<span class="tag">Stripe</span>
+<p>Stripe&rsquo;s API takes an <code>Idempotency-Key</code> header on every mutating
+request. Stripe stores the first response keyed by it and replays that exact response
+for any retry with the same key, so a network blip during a charge can be retried
+safely without double-charging. Keys are scoped and expire after 24 hours. Stripe&rsquo;s
+own engineering writing frames idempotency keys as the foundation of "robust and
+predictable APIs," and it&rsquo;s the same mechanism that underpins their
+<a href="../systems/s17.html">payment</a> correctness.</p>
+</div>
+
+<h2 class="sec">5 &middot; Applying it in a design</h2>
+<p>Anywhere you have retries or external effects: <i>"client-supplied idempotency key,
+dedup record written in the same transaction as the effect, at-least-once delivery,
+reconcile against the provider."</i> Pair it with at-least-once queues
+(<a href="../systems/s2.html">Kafka</a>, <a href="../systems/s12.html">task scheduler</a>) so you never need true EOS.</p>
+
+<h2 class="sec">6 &middot; Pitfalls</h2>
+<ul>
+<li>Storing the dedup record in a separate transaction from the effect (race window).</li>
+<li>Keys that are too broad (collisions) or too narrow (retries treated as new).</li>
+<li>Assuming a downstream "succeeded" because your call returned &mdash; reconcile.</li>
+</ul>
+
+<h2 class="sec">7 &middot; Further reading</h2>
+<ul>
+<li><a href="https://stripe.com/blog/idempotency">Stripe &mdash; Designing robust and predictable APIs with idempotency</a></li>
+<li><a href="https://docs.stripe.com/api/idempotent_requests">Stripe API &mdash; idempotent requests</a></li>
+</ul>
+
+<div class="prevnext"><a href="p8.html">&larr; P8 &middot; Tiered / columnar</a><a href="p10.html">P10 &middot; Consensus / fencing &rarr;</a></div>
+</div></main>
+</div>
+<a href="#top" class="backtop" title="Back to top">&uarr;</a>
+<script type="module">
+  import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+  mermaid.initialize({ startOnLoad: true, theme: 'neutral' });
+</script>
+<script>window.SITE_BASE="../";</script>
+<script src="../assets/site.js"></script>
+</body></html>

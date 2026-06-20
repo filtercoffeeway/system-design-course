@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>P17 Storage internals — System Design Curriculum</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head><body>
+<div class="wrap">
+<nav class="side" id="side"></nav>
+<main><div class="reading" id="top">
+<div class="crumb"><a href="../index.html">Curriculum</a> / Part II · Primitives / P17</div><h1>P17 · Storage durability &amp; write internals</h1>
+<div class="summary"><div class="field"><b>What it is:</b> how a single storage node doesn't lose data on crash, and the fundamental read-vs-write structure tradeoff.</div>
+<div class="field"><b>Reach for it when:</b> designing or reasoning about <em>inside</em> any database or durable store.</div>
+<div class="field"><b>The lever: WAL (write-ahead log)</b> — append intent before the mutation, replay on recovery (universal crash recovery). <b>LSM-tree</b> (writes sequential/fast, reads merge levels, compaction is the hidden cost) vs <b>B-tree</b> (predictable reads, random-I/O writes at scale). <b>Erasure coding vs replication</b> (erasure stores less for the same durability, costs reconstruction). Bloom filters to skip disk for absent keys.</div>
+<div class="newprob"><b>New problem it hands you:</b> LSM → read amplification + compaction load; B-tree → write amplification; WAL → fsync cost on the hot path; erasure coding → CPU + latency to reconstruct on read.</div>
+<div class="prims"><b>Exemplified by:</b> <a href="../systems/s3.html">KV store</a>, <a href="../systems/s4.html">RDBMS</a>, <a href="../systems/s5.html">Object store</a>, <a href="../systems/s2.html">Kafka (the log)</a>.</div></div>
+
+<hr>
+
+<h2 class="sec">1 &middot; The problem it solves</h2>
+<p>Underneath every database is the same pair of questions: how do you not lose data
+when the process crashes mid-write, and do you optimize the on-disk structure for
+writes or for reads? Getting this right is what separates a toy store from a durable
+one.</p>
+
+<h2 class="sec">2 &middot; How it works</h2>
+<p><b>WAL (write-ahead log):</b> before mutating the main structure, append the intent
+to a sequential log and fsync it. On crash you replay the log &mdash; the universal
+recovery primitive. <b>LSM-tree:</b> buffer writes in memory (memtable), flush sorted
+runs (SSTables) to disk, and merge them in the background (compaction). Writes are
+sequential and fast; reads may touch several levels. <b>B-tree:</b> update pages in
+place &mdash; predictable reads, but random-I/O writes at scale. <b>Bloom filters</b>
+let a read skip an SSTable that definitely doesn&rsquo;t contain a key.</p>
+<pre class="mermaid">
+graph TD
+  W[write] --> WAL[(WAL: sequential)]
+  W --> MT[memtable]
+  MT -->|flush| L0[SSTable L0]
+  L0 -->|compaction| L1[SSTable L1]
+  R[read] --> BF{bloom filter} --> L0 & L1
+</pre>
+
+<h2 class="sec">3 &middot; The new bottleneck it hands you</h2>
+<div class="newprob">
+<p><b>LSM &rarr; read amplification + compaction load</b> (a read may check memtable +
+several SSTables; compaction competes for I/O). <b>B-tree &rarr; write amplification</b>
+(in-place page updates cause random I/O). <b>WAL &rarr; fsync cost</b> on the hot path
+(group-commit amortizes it). <b>Erasure coding</b> (for object stores) stores less than
+3&times; replication for the same durability but costs CPU + latency to reconstruct on
+read.</p>
+</div>
+
+<h2 class="sec">4 &middot; Real-world example</h2>
+<div class="example">
+<span class="tag">RocksDB / LevelDB</span>
+<p>Google&rsquo;s LevelDB and Facebook&rsquo;s <b>RocksDB</b> are the LSM engines under a
+huge swath of modern infrastructure (it&rsquo;s the storage engine inside CockroachDB,
+TiKV, Kafka Streams state stores, and many others). They embody the pattern exactly:
+a WAL for durability, a memtable for fast writes, leveled SSTable compaction, and
+bloom filters to avoid disk reads for absent keys. The recurring operational theme is
+the LSM tradeoff &mdash; tuning compaction to balance write throughput, read latency,
+and space amplification. Contrast with Postgres/MySQL-InnoDB, which use B-trees + WAL
+for read-predictable OLTP. See <a href="../systems/s3.html">KV store</a> and <a href="../systems/s4.html">RDBMS</a>.</p>
+</div>
+
+<h2 class="sec">5 &middot; Applying it in a design</h2>
+<p>Pick the structure from the workload: <i>"write-heavy ingest &rarr; LSM
+(sequential writes, accept compaction); read-heavy with range scans &rarr; B-tree;
+WAL either way for crash recovery."</i></p>
+
+<h2 class="sec">6 &middot; Pitfalls</h2>
+<ul>
+<li>Choosing a B-tree store for a write-saturated workload.</li>
+<li>Ignoring compaction&rsquo;s I/O cost when sizing an LSM store.</li>
+<li>Skipping fsync and calling it "durable."</li>
+</ul>
+
+<h2 class="sec">7 &middot; Further reading</h2>
+<ul>
+<li><a href="https://rocksdb.org/">RocksDB</a> &middot; <a href="https://www.cs.umb.edu/~poneil/lsmtree.pdf">The Log-Structured Merge-Tree (O&rsquo;Neil et al.)</a></li>
+</ul>
+
+<div class="prevnext"><a href="p16.html">&larr; P16 &middot; Backpressure</a><span></span></div>
+</div></main>
+</div>
+<a href="#top" class="backtop" title="Back to top">&uarr;</a>
+<script type="module">
+  import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+  mermaid.initialize({ startOnLoad: true, theme: 'neutral' });
+</script>
+<script>window.SITE_BASE="../";</script>
+<script src="../assets/site.js"></script>
+</body></html>

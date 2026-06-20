@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>P2 Partitioning / hot-key — System Design Curriculum</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head><body>
+<div class="wrap">
+<nav class="side" id="side"></nav>
+<main><div class="reading" id="top">
+<div class="crumb"><a href="../index.html">Curriculum</a> / Part II · Primitives / P2</div><h1>P2 · Partitioning / sharding (and the hot-partition problem)</h1>
+<div class="summary"><div class="field"><b>What it is:</b> splitting data or load across nodes so no single node is the ceiling.</div>
+<div class="field"><b>Reach for it when:</b> a dataset or write rate exceeds one node; or you need parallelism.</div>
+<div class="field"><b>The lever:</b> partition by key (co-locates related data, ordering per key), hash (even spread), range (range scans), or directory. Consistent hashing minimizes redistribution on topology change.</div>
+<div class="newprob"><b>New problem it hands you: skew — the hot partition/hot key.</b> Even average spread says nothing about the worst key. A celebrity, viral URL, hot geo-cell, or high-traffic tenant lands on one partition and recreates the single-node bottleneck. Mitigate: split the hot key, coalesce requests, dedicated cache, or go hybrid. Detecting hot keys in real time is its own problem. Cross-partition joins also get expensive (see <a href="../primitives/p7.html">P7</a>).</div>
+<div class="prims"><b>Exemplified by:</b> <a href="../systems/s2.html">Kafka</a>, <a href="../systems/s3.html">KV store</a>, <a href="../systems/s4.html">RDBMS</a>, <a href="../systems/s7.html">Search</a>, <a href="../systems/s9.html">Social feed</a>, <a href="../systems/s15.html">Ride-sharing</a>.</div></div>
+
+<hr>
+
+<h2 class="sec">1 &middot; The problem it solves</h2>
+<p>One machine has a ceiling: finite disk, RAM, CPU, and network. When your data or
+your request rate exceeds what one node can hold or serve, you must spread it across
+many nodes. Partitioning (a.k.a. sharding) is how: split the keyspace so each node
+owns a slice, and route every request to the node that owns its key.</p>
+
+<h2 class="sec">2 &middot; How it works</h2>
+<p>You pick a <b>partition key</b> and a function that maps key &rarr; node. The three
+mapping strategies have very different properties.</p>
+<pre class="mermaid">
+graph TD
+  K[key] --> H{partitioner}
+  H -->|hash(key) % N| N1[Node A]
+  H -->|hash(key) % N| N2[Node B]
+  H -->|range a-m / n-z| N3[Node C]
+</pre>
+<p>Naive <code>hash(key) % N</code> spreads load evenly but reshuffles almost
+everything when N changes. <b>Consistent hashing</b> fixes that: place nodes and keys
+on a ring; a key belongs to the next node clockwise, so adding/removing a node only
+moves the keys in one arc. <b>Virtual nodes</b> (each physical node owns many small
+ring segments) smooth out imbalance and make rebalancing incremental.</p>
+
+<h2 class="sec">3 &middot; Variants &amp; when to use each</h2>
+<div class="tablewrap"><table>
+<thead><tr><th>Strategy</th><th>Good for</th><th>Weakness</th></tr></thead>
+<tbody>
+<tr><td>Hash</td><td>Even spread, point lookups</td><td>No range scans; reshuffle on resize</td></tr>
+<tr><td>Consistent hash + vnodes</td><td>Elastic clusters, minimal movement</td><td>Still no range scans</td></tr>
+<tr><td>Range</td><td>Range/scan queries, ordered keys</td><td>Hotspots on sequential keys</td></tr>
+<tr><td>Directory / lookup table</td><td>Full control, custom placement</td><td>The directory is a dependency + SPOF risk</td></tr>
+</tbody></table></div>
+
+<h2 class="sec">4 &middot; The new bottleneck it hands you</h2>
+<div class="newprob">
+<p><b>Skew &mdash; the hot partition.</b> Even spread on <em>average</em> says nothing
+about the worst key. A single celebrity, a viral video, a giant tenant, or a
+monotonically increasing key (timestamp, auto-increment ID) lands disproportionate
+load on one partition, recreating the single-node bottleneck you tried to escape.
+Mitigations: salt/split the hot key across sub-partitions and merge on read; give the
+hot key its own dedicated capacity; or detect-and-rebalance. <b>Cross-partition
+queries</b> are the other tax &mdash; anything spanning keys now fans out to all
+partitions and merges (<a href="../primitives/p7.html">P7</a>), and joins across shards get expensive
+(<a href="../systems/s4.html">RDBMS scaling</a>).</p>
+</div>
+
+<h2 class="sec">5 &middot; Real-world example</h2>
+<div class="example">
+<span class="tag">Amazon Dynamo / Cassandra</span>
+<p>Amazon's Dynamo paper (2007) popularized <b>consistent hashing with virtual
+nodes</b> for partitioning, and Cassandra and Riak adopted it directly. Each node is
+assigned many tokens (vnodes) around a ring; a key is hashed to a point and stored on
+the next N nodes clockwise (N = replication factor). Adding a node steals a fair
+slice of tokens from existing nodes rather than triggering a global reshuffle, which
+is what makes these clusters elastic. The classic operational footgun is exactly the
+hot-partition problem: a <em>wide partition</em> (e.g. a partition key like
+<code>country</code> with billions of rows under <code>US</code>) overwhelms one
+node &mdash; Cassandra docs explicitly warn to choose a high-cardinality, evenly
+distributed partition key.</p>
+</div>
+
+<h2 class="sec">6 &middot; Applying it in a design</h2>
+<p>Choose the partition key for two things at once: even distribution <em>and</em>
+query locality (data you read together should live together). Say the tradeoff out
+loud: <i>"I'll hash on user_id for spread, accept that cross-user queries fan out,
+and watch for hot tenants &mdash; which I'd handle by sub-sharding the hot key."</i></p>
+
+<h2 class="sec">7 &middot; Pitfalls</h2>
+<ul>
+<li>Low-cardinality or skewed partition keys (status, country, boolean).</li>
+<li>Monotonic keys (timestamps, sequential IDs) &rarr; all writes hit the last partition.</li>
+<li>Forgetting that resharding changes key&rarr;node mapping and breaks ordering mid-move.</li>
+</ul>
+
+<h2 class="sec">8 &middot; Further reading</h2>
+<ul>
+<li><a href="https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf">Dynamo: Amazon&rsquo;s Highly Available Key-value Store (SOSP 2007)</a></li>
+<li><a href="https://cassandra.apache.org/doc/latest/cassandra/architecture/dynamo.html">Cassandra &mdash; partitioning &amp; the ring</a></li>
+</ul>
+
+<div class="prevnext"><a href="p1.html">&larr; P1 &middot; Batching / buffering</a><a href="p3.html">P3 &middot; Replication / consistency &rarr;</a></div>
+</div></main>
+</div>
+<a href="#top" class="backtop" title="Back to top">&uarr;</a>
+<script type="module">
+  import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+  mermaid.initialize({ startOnLoad: true, theme: 'neutral' });
+</script>
+<script>window.SITE_BASE="../";</script>
+<script src="../assets/site.js"></script>
+</body></html>
