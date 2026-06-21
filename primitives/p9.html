@@ -20,33 +20,98 @@
 <p>Networks retry. A client times out and resends; a queue redelivers; a worker
 restarts mid-task. If the operation has a side effect (charge a card, send a push,
 decrement inventory), a retry must not apply it twice. <b>Idempotency</b> makes
-"do it again" safe.</p>
+&ldquo;do it again&rdquo; safe &mdash; and as usual the right design is reached by ruling out the
+cheaper answers.</p>
 
-<h2 class="sec">2 &middot; How it works</h2>
+<h2 class="sec">2 &middot; The ladder to safe retries</h2>
+<h4>Rung 0 — at-least-once, no dedup</h4>
+<p>Just retry on timeout. Guarantees the effect happens at least once &mdash; and
+<b>double-charges</b> when the first attempt actually succeeded but its ack was lost.</p>
+<div class="newprob"><b>Bottleneck:</b> duplicate side effects.</div>
+<h4>Rung 1 — at-most-once (fire and forget)</h4>
+<p>Never retry. No duplicates &mdash; but now a lost request means the charge silently
+<b>never happens</b>. You&rsquo;ve traded a double-apply for a drop.</p>
+<div class="newprob"><b>Bottleneck:</b> lost operations; unacceptable for money.</div>
+<h4>Rung 2 — client-supplied idempotency key + dedup table ← the answer</h4>
+<p>The client generates a unique <b>idempotency key</b> per logical operation and sends
+it on every retry. The server records <code>(key &rarr; result)</code> and, on a repeat,
+returns the stored result instead of re-running. The make-or-break detail is <b>how</b>
+the record is written &mdash; do it wrong and you reintroduce duplicates under
+concurrency (next section).</p>
+<div class="tablewrap"><table>
+<tr><th>Rung</th><th>Guarantee</th><th>Breaks on</th></tr>
+<tr><td>At-least-once, no dedup</td><td>effect happens ≥ once</td><td>double-applies on retry</td></tr>
+<tr><td>At-most-once</td><td>never duplicates</td><td>silently drops on loss</td></tr>
+<tr><td>Key + dedup table (← pick)</td><td>effect applied exactly once <em>here</em></td><td>cross-system EOS still impossible → reconcile</td></tr>
+</table></div>
+
+<h2 class="sec">3 &middot; Getting the dedup write right (the race)</h2>
+<p>The naive version &mdash; &ldquo;check if key seen; if not, execute; then record it&rdquo; &mdash;
+has a fatal gap under concurrent retries:</p>
+<div class="estimate">two retries of the SAME key arrive together:
+  req A: SELECT key -> not found
+  req B: SELECT key -> not found      (A hasn't recorded yet)
+  req A: charge card                  $$$
+  req B: charge card                  $$$  <-- double charge</div>
+<p>The fix is to make the key&rsquo;s first write <b>atomic</b> via a <b>unique constraint</b>,
+and to commit the dedup record <b>in the same transaction as the effect</b>. A small
+state machine on the key row makes it precise:</p>
+<div class="estimate">idempotency_keys
+  key         VARCHAR  PRIMARY KEY     -- UNIQUE is the whole trick
+  status      ENUM(in_progress, done)
+  response    JSON                     -- the stored result
+  created_at  TIMESTAMP                -- for expiry
+
+per request:
+  BEGIN
+    INSERT (key, in_progress)         -- if key exists -> unique violation
+       on violation: read row;
+         status=done       -> return stored response (true duplicate)
+         status=in_progress -> 409, "retry shortly" (original still running)
+    &lt;perform the side effect&gt;
+    UPDATE key SET status=done, response=...
+  COMMIT                              -- record + effect commit together</div>
 <pre class="mermaid">
 graph TD
-  C[client sends op + idempotency key] --> S{key seen?}
-  S -->|no| E[execute + store key,result in same txn]
-  S -->|yes| R[return stored result, do not re-execute]
-  E --> R
+  C[request + idempotency key] --> I{INSERT key in_progress}
+  I -->|unique violation, done| D[return stored response]
+  I -->|unique violation, in_progress| W[409 retry shortly]
+  I -->|inserted| E[do effect, same txn]
+  E --> U[UPDATE status=done, store response] --> COMMIT[commit together]
 </pre>
-<p>The client supplies an <b>idempotency key</b>. The server records
-<code>(key &rarr; result)</code> in a dedup table, written <em>transactionally with the
-effect</em> so the record and the side effect commit together. A repeat of the same
-key returns the stored result instead of re-running. Workers are written so that
-re-execution converges to the same state.</p>
+<p>Now exactly one of two concurrent retries wins the <code>INSERT</code>; the other is
+deflected to the stored result or told to wait. The unique constraint, not the
+<code>SELECT</code>, is what makes it correct.</p>
+<h3>Choosing the key &mdash; and idempotent-by-construction</h3>
+<p>The key must be <b>stable across retries of the same logical request but unique across
+different ones</b>. Two sources: (1) <b>client-generated</b> &mdash; a UUID minted once per
+user action and reused on every retry (Stripe&rsquo;s model); a fresh UUID per network attempt
+would defeat the whole scheme. (2) <b>content-derived</b> &mdash; a hash of the meaningful
+fields (<code>user, amount, order_id</code>), which also dedups two <em>independently</em>
+submitted identical requests, sometimes wanted, sometimes not.</p>
+<p>Better still, make the operation <b>idempotent by construction</b> so no dedup table is
+needed: a <code>PUT</code> that sets a value is naturally repeat-safe where a
+<code>POST</code> that appends is not; a conditional update (<code>UPDATE ... WHERE
+status='pending'</code>) applies once even if run twice; using a natural unique id
+(<code>order_id</code>) as the primary key turns a duplicate insert into a harmless
+constraint violation. Reach for the dedup table only when the effect can&rsquo;t be made
+naturally idempotent.</p>
 
-<h2 class="sec">3 &middot; The new bottleneck it hands you</h2>
+<h2 class="sec">4 &middot; The new bottleneck it hands you</h2>
 <div class="newprob">
 <p>You cannot get <b>true</b> exactly-once across systems you don&rsquo;t control (a
-payment processor, FCM, a bank) &mdash; you can&rsquo;t know if their side committed.
-The honest target is <b>at-least-once + idempotent + reconciliation</b> (a later batch
-compares your records with theirs). The dedup table is itself state you must scale and
-expire, and the key must be chosen so genuinely-distinct requests don&rsquo;t collide
-nor genuine retries diverge.</p>
+payment processor, FCM, a bank) &mdash; if your call to them times out, you genuinely
+don&rsquo;t know whether their side committed. The honest target is <b>at-least-once +
+idempotent + reconciliation</b>: retry safely using <em>their</em> idempotency key too,
+and run a later batch that compares your records against theirs to catch any divergence.
+The dedup table is itself state to scale and <b>expire</b> (Stripe keeps keys ~24h), and
+the key must be scoped so genuinely-distinct requests don&rsquo;t collide nor genuine retries
+diverge. Idempotency also pairs with <a href="p10.html">fencing tokens (P10)</a>: a
+fencing token stops a <em>stale</em> writer, an idempotency key stops a <em>duplicate</em>
+one &mdash; different failures, both needed for an exactly-once-ish effect.</p>
 </div>
 
-<h2 class="sec">4 &middot; Real-world example</h2>
+<h2 class="sec">5 &middot; Real-world example</h2>
 <div class="example">
 <span class="tag">Stripe</span>
 <p>Stripe&rsquo;s API takes an <code>Idempotency-Key</code> header on every mutating
@@ -58,20 +123,22 @@ predictable APIs," and it&rsquo;s the same mechanism that underpins their
 <a href="../systems/s17.html">payment</a> correctness.</p>
 </div>
 
-<h2 class="sec">5 &middot; Applying it in a design</h2>
+<h2 class="sec">6 &middot; Applying it in a design</h2>
 <p>Anywhere you have retries or external effects: <i>"client-supplied idempotency key,
-dedup record written in the same transaction as the effect, at-least-once delivery,
-reconcile against the provider."</i> Pair it with at-least-once queues
-(<a href="../systems/s2.html">Kafka</a>, <a href="../systems/s12.html">task scheduler</a>) so you never need true EOS.</p>
+dedup record written in the same transaction as the effect via a unique constraint,
+at-least-once delivery, reconcile against the provider."</i> Pair it with at-least-once
+queues (<a href="../systems/s2.html">Kafka</a>, <a href="../systems/s12.html">task scheduler</a>)
+so you never need true EOS.</p>
 
-<h2 class="sec">6 &middot; Pitfalls</h2>
+<h2 class="sec">7 &middot; Pitfalls</h2>
 <ul>
 <li>Storing the dedup record in a separate transaction from the effect (race window).</li>
 <li>Keys that are too broad (collisions) or too narrow (retries treated as new).</li>
 <li>Assuming a downstream "succeeded" because your call returned &mdash; reconcile.</li>
+<li>Relying on <code>SELECT</code>-then-<code>INSERT</code> instead of a unique constraint &mdash; it races under concurrent retries.</li>
 </ul>
 
-<h2 class="sec">7 &middot; Further reading</h2>
+<h2 class="sec">8 &middot; Further reading</h2>
 <ul>
 <li><a href="https://stripe.com/blog/idempotency">Stripe &mdash; Designing robust and predictable APIs with idempotency</a></li>
 <li><a href="https://docs.stripe.com/api/idempotent_requests">Stripe API &mdash; idempotent requests</a></li>

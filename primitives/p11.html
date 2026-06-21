@@ -30,10 +30,20 @@ graph LR
   O --> E
 </pre>
 <p>The user hits the nearest point of presence; on a hit it&rsquo;s served from the
-edge, on a miss the edge pulls from origin once and caches it. The design question
-becomes "what populates the edge, and how is it invalidated?" &mdash; not "how do I
-serve the bytes?" For redirects, <code>301</code> is cached by browsers (cheap, but you
-lose click analytics) while <code>302</code> always returns to you (countable, pricier).</p>
+edge, on a miss the edge pulls from origin once and caches it. The reason this is
+non-negotiable at scale is the <b>origin-offload math</b> &mdash; the edge hit ratio
+directly sets how much bandwidth the origin must serve:</p>
+<div class="estimate">global demand 1 Tbps:
+  CDN hit 90%  -> origin serves 10% = 100 Gbps
+  CDN hit 99%  -> origin serves  1% =  10 Gbps   (10x less origin capacity)</div>
+<p>So the design question becomes <b>&ldquo;what populates the edge, and how is it
+invalidated?&rdquo;</b> &mdash; not &ldquo;how do I serve the bytes?&rdquo; Two fill strategies form a
+small ladder: <b>on-demand pull</b> (edge fills on the first miss &mdash; simple, but the
+first user in each region pays a slow miss and the long tail never amortizes its fill)
+&rarr; <b>pre-positioning / push</b> (proactively push predicted-popular content to edges
+off-peak, so even the first request is a hit). For redirects, <code>301</code> is cached
+by browsers (cheap, but you lose click analytics) while <code>302</code> always returns to
+you (countable, pricier).</p>
 
 <h2 class="sec">3 &middot; The new bottleneck it hands you</h2>
 <div class="newprob">

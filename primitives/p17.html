@@ -18,38 +18,125 @@
 
 <h2 class="sec">1 &middot; The problem it solves</h2>
 <p>Underneath every database is the same pair of questions: how do you not lose data
-when the process crashes mid-write, and do you optimize the on-disk structure for
+when the process crashes mid-write, and do you optimise the on-disk structure for
 writes or for reads? Getting this right is what separates a toy store from a durable
-one.</p>
+one. This page is the <b>write half</b> of storage; <a href="p8.html">P8</a> is the
+read/layout half &mdash; together they are how a real storage engine (and a TSDB) is
+built.</p>
 
-<h2 class="sec">2 &middot; How it works</h2>
-<p><b>WAL (write-ahead log):</b> before mutating the main structure, append the intent
-to a sequential log and fsync it. On crash you replay the log &mdash; the universal
-recovery primitive. <b>LSM-tree:</b> buffer writes in memory (memtable), flush sorted
-runs (SSTables) to disk, and merge them in the background (compaction). Writes are
-sequential and fast; reads may touch several levels. <b>B-tree:</b> update pages in
-place &mdash; predictable reads, but random-I/O writes at scale. <b>Bloom filters</b>
-let a read skip an SSTable that definitely doesn&rsquo;t contain a key.</p>
+<h2 class="sec">2 &middot; Durability: the write-ahead log</h2>
+<p>A mutation isn&rsquo;t durable until it survives a crash. The <b>WAL</b> makes it so:
+before touching the main data structure, append a record of the <em>intent</em> to a
+sequential log file and <code>fsync</code> it. Only then acknowledge the write. If the
+process dies mid-operation, recovery replays the log from the last checkpoint and
+re-applies anything that hadn&rsquo;t been persisted to the main structure. Because the log
+is append-only it&rsquo;s the fastest possible disk pattern &mdash; sequential writes, no
+seeks.</p>
+<p>The cost is the <code>fsync</code> on the hot path: a durable write can&rsquo;t return
+until the disk confirms. <b>Group commit</b> amortises this &mdash; the engine batches
+the WAL records of, say, 100 concurrent writes into one <code>fsync</code>, turning 100
+disk syncs into 1. That is the same batching lever as <a href="p1.html">P1</a>, applied
+to durability.</p>
+
+<h2 class="sec">3 &middot; The structure tradeoff: LSM vs B-tree</h2>
+<p>Every engine then picks an on-disk structure, and the choice is fundamentally
+<b>writes-optimised (LSM)</b> vs <b>reads-optimised (B-tree)</b>.</p>
+
+<h3>LSM-tree, traced step by step</h3>
+<p>An LSM buffers writes in a sorted in-memory structure (the <b>memtable</b>), and only
+ever writes to disk in large sequential <b>SSTable</b> files &mdash; never in place.
+Trace a few operations on keys:</p>
+<div class="estimate">1. PUT k=42 v=A   &rarr; append to WAL, insert into memtable {42:A}
+2. PUT k=17 v=B   &rarr; WAL, memtable {17:B, 42:A}   (kept sorted)
+3. PUT k=42 v=C   &rarr; WAL, memtable {17:B, 42:C}   (overwrites in memory)
+4. DELETE k=17    &rarr; WAL, memtable {17:&lt;tombstone&gt;, 42:C}  (delete = a marker)
+   ... memtable fills (e.g. 64 MB) ...
+5. FLUSH          &rarr; write memtable out as immutable SSTable L0-a (sorted), start fresh memtable
+
+On disk now:  L0-a = [17:tombstone, 42:C]
+Later writes build L0-b, L0-c ... then compaction merges them into L1.</div>
+<p>Two things make this work. Writes are <b>always sequential</b> (memtable flush + WAL
+append), so an LSM ingests far faster than random in-place updates. And updates/deletes
+don&rsquo;t modify old files &mdash; a new value <em>shadows</em> the old, and a delete writes
+a <b>tombstone</b>; the dead data is reclaimed later by compaction.</p>
+
+<h3>Compaction</h3>
+<p>The catch: a key can now live in the memtable <em>and</em> several SSTables. Left
+alone, reads slow down and dead/overwritten data piles up. <b>Compaction</b> merges
+SSTables in the background, keeping only the newest value per key and dropping
+tombstoned keys. <b>Leveled</b> compaction (RocksDB default) keeps each level ~10&times;
+the previous and merges a file up into the next level; <b>tiered</b> compaction merges
+same-size runs together. They sit at different points of the amplification triangle:</p>
 <pre class="mermaid">
 graph TD
-  W[write] --> WAL[(WAL: sequential)]
-  W --> MT[memtable]
-  MT -->|flush| L0[SSTable L0]
-  L0 -->|compaction| L1[SSTable L1]
-  R[read] --> BF{bloom filter} --> L0 & L1
+  W[write] --> WAL[(WAL: sequential, fsync)]
+  W --> MT[memtable in RAM, sorted]
+  MT -->|flush when full| L0[SSTables L0]
+  L0 -->|compaction| L1["L1 (~10x L0)"]
+  L1 -->|compaction| L2["L2 (~10x L1)"]
+  R[read] --> BF{bloom filter per SSTable}
+  BF -->|maybe present| L0
+  BF -->|definitely absent| SKIP[skip file, no disk I/O]
 </pre>
 
-<h2 class="sec">3 &middot; The new bottleneck it hands you</h2>
+<h3>B-tree, for contrast</h3>
+<p>A B-tree updates pages <b>in place</b>: a write finds the leaf page and rewrites it.
+Reads are predictable (a key is in exactly one place, ~log&#8323; pages deep) and range
+scans are excellent &mdash; which is why OLTP databases (Postgres, MySQL/InnoDB) use
+B-trees + WAL. But in-place updates are <b>random I/O</b>, and a small change dirties a
+whole page (often 8&ndash;16&nbsp;KB), so under a write-saturated load a B-tree pays in
+random writes where an LSM pays in background compaction.</p>
+
+<h2 class="sec">4 &middot; The three amplifications (the numbers)</h2>
+<p>Every storage structure trades along three axes; you can&rsquo;t minimise all three.</p>
+<div class="tablewrap"><table>
+<tr><th>Amplification</th><th>Means</th><th>LSM (leveled)</th><th>B-tree</th></tr>
+<tr><td><b>Write</b></td><td>bytes written to disk per byte of data</td><td>High: a byte is rewritten once per level &mdash; ~<b>10&times;&nbsp;fanout &times; levels</b>, e.g. ~40&ndash;50&times; for 4&ndash;5 levels</td><td>~2&ndash;3&times; (page rewrite + WAL)</td></tr>
+<tr><td><b>Read</b></td><td>disk reads per lookup</td><td>Up to one per level &mdash; but bloom filters cut it to ~1</td><td>~1 (one root-to-leaf path)</td></tr>
+<tr><td><b>Space</b></td><td>disk used per byte of live data</td><td>Leveled ~1.1&times;; tiered up to ~fanout&times; mid-merge</td><td>Fragmentation (~1.3&times;) from partly-full pages</td></tr>
+</table></div>
+<p>This is the whole tuning story of an LSM: leveled compaction buys low space and read
+amplification by paying high write amplification; tiered does the reverse. You pick the
+corner that matches the workload.</p>
+
+<h3>Bloom filters: skipping disk for absent keys</h3>
+<p>Without help, a point lookup for a key that isn&rsquo;t in level <i>i</i> still costs a
+disk read to find that out &mdash; once per level. A <b>bloom filter</b> per SSTable
+answers &ldquo;is this key <em>definitely not</em> here?&rdquo; from memory, so absent keys skip
+the file entirely. The cost is a small false-positive rate (it never says &ldquo;absent&rdquo;
+wrongly, only &ldquo;maybe present&rdquo;), tunable by bits-per-key:</p>
+<div class="estimate">bits/key   hashes   false-positive rate
+   8         6        ~2.2%
+  10         7        ~0.8%     &larr; RocksDB default
+  16        11        ~0.05%</div>
+<p>At 10 bits/key (~0.8% FP), &gt;99% of reads for absent keys are answered without
+touching disk &mdash; which is what collapses LSM read amplification from &ldquo;one I/O per
+level&rdquo; back to ~1.</p>
+
+<h2 class="sec">5 &middot; Durability across nodes: replication vs erasure coding</h2>
+<p>A single node&rsquo;s WAL survives a crash; surviving disk loss needs redundancy across
+nodes. <b>Replication</b> keeps N full copies (3&times; replication tolerates 2 losses,
+costs 200% overhead). <b>Erasure coding</b> splits an object into <i>k</i> data shards
+and computes <i>m</i> parity shards; any <i>k</i> of the <i>k+m</i> reconstruct the
+object. A <b>(10,4)</b> code tolerates 4 losses at only <b>40% overhead</b> instead of
+300% for the equivalent-durability 4&times; replication &mdash; the same reason object
+stores (<a href="../systems/s5.html">S5</a>) use it. The cost: a read of a missing shard
+must fetch <i>k</i> shards and recompute (CPU + cross-node latency), so erasure coding
+suits cold/large objects, replication suits hot small ones.</p>
+
+<h2 class="sec">6 &middot; The new bottleneck it hands you</h2>
 <div class="newprob">
-<p><b>LSM &rarr; read amplification + compaction load</b> (a read may check memtable +
-several SSTables; compaction competes for I/O). <b>B-tree &rarr; write amplification</b>
-(in-place page updates cause random I/O). <b>WAL &rarr; fsync cost</b> on the hot path
-(group-commit amortizes it). <b>Erasure coding</b> (for object stores) stores less than
-3&times; replication for the same durability but costs CPU + latency to reconstruct on
-read.</p>
+<p><b>LSM &rarr; read amplification + compaction load</b>: a read may check memtable +
+several SSTables (bloom filters fix the absent-key case, not the present-key merge), and
+compaction competes with foreground traffic for I/O &mdash; a write burst that outruns
+compaction causes <b>write stalls</b>. <b>B-tree &rarr; write amplification</b> from
+in-place random-I/O page updates. <b>WAL &rarr; fsync cost</b> on the hot path
+(group-commit amortises it, at the cost of a few ms of batching latency). <b>Erasure
+coding &rarr; reconstruction cost</b> on every degraded read. There is no free
+structure; you are always picking which amplification to pay.</p>
 </div>
 
-<h2 class="sec">4 &middot; Real-world example</h2>
+<h2 class="sec">7 &middot; Real-world example</h2>
 <div class="example">
 <span class="tag">RocksDB / LevelDB</span>
 <p>Google&rsquo;s LevelDB and Facebook&rsquo;s <b>RocksDB</b> are the LSM engines under a
@@ -62,19 +149,23 @@ and space amplification. Contrast with Postgres/MySQL-InnoDB, which use B-trees 
 for read-predictable OLTP. See <a href="../systems/s3.html">KV store</a> and <a href="../systems/s4.html">RDBMS</a>.</p>
 </div>
 
-<h2 class="sec">5 &middot; Applying it in a design</h2>
+<h2 class="sec">8 &middot; Applying it in a design</h2>
 <p>Pick the structure from the workload: <i>"write-heavy ingest &rarr; LSM
-(sequential writes, accept compaction); read-heavy with range scans &rarr; B-tree;
-WAL either way for crash recovery."</i></p>
+(sequential writes, accept compaction and write amplification); read-heavy with range
+scans &rarr; B-tree; WAL either way for crash recovery."</i> The sentence that shows you
+understand it: <i>"I&rsquo;ll take an LSM here because ingest dominates &mdash; I&rsquo;m trading
+write amplification and compaction I/O for sequential writes, and leaning on bloom
+filters to keep reads near one I/O."</i></p>
 
-<h2 class="sec">6 &middot; Pitfalls</h2>
+<h2 class="sec">9 &middot; Pitfalls</h2>
 <ul>
 <li>Choosing a B-tree store for a write-saturated workload.</li>
-<li>Ignoring compaction&rsquo;s I/O cost when sizing an LSM store.</li>
-<li>Skipping fsync and calling it "durable."</li>
+<li>Ignoring compaction&rsquo;s I/O cost when sizing an LSM store &mdash; a write burst that outruns compaction causes write stalls.</li>
+<li>Skipping fsync (or trusting an OS buffer) and calling it &ldquo;durable.&rdquo;</li>
+<li>Under-sizing bloom filters, so absent-key reads still hit disk once per level.</li>
 </ul>
 
-<h2 class="sec">7 &middot; Further reading</h2>
+<h2 class="sec">10 &middot; Further reading</h2>
 <ul>
 <li><a href="https://rocksdb.org/">RocksDB</a> &middot; <a href="https://www.cs.umb.edu/~poneil/lsmtree.pdf">The Log-Structured Merge-Tree (O&rsquo;Neil et al.)</a></li>
 </ul>

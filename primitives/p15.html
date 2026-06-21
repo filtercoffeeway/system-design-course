@@ -24,9 +24,17 @@ proximity into something you can index and look up cheaply.</p>
 <h2 class="sec">2 &middot; How it works</h2>
 <p><b>Geohashing</b> interleaves latitude/longitude bits into a single string where a
 shared prefix means physical nearness, so a proximity search becomes a prefix scan.
-<b>Quad-trees</b> recursively subdivide space into four cells, splitting dense areas
-finer. Either way you bucket the world into cells and search the rider&rsquo;s cell plus
-its neighbors. Precision (prefix length / tree depth) controls cell size.</p>
+Worked, for San Francisco:</p>
+<div class="estimate">(lat 37.7749, lon -122.4194)
+  interleave lon/lat bits: 0 1 0 0 1 1 0 1 1 0 ...  -> base32 -> "9q8yyk8"
+  prefix length = cell size:  "9q8" ~ 156 km   "9q8yy" ~ 5 km
+                              "9q8yyk" ~ 1.2 km  "9q8yyk8" ~ 150 m
+  two points sharing a longer prefix are physically closer</div>
+<p>A &ldquo;within 2&nbsp;km&rdquo; query picks the prefix length whose cell &asymp; 2&nbsp;km and
+scans that prefix. <b>Quad-trees</b> instead recursively subdivide space into four cells,
+splitting dense areas finer (adaptive to density, where geohash is a fixed grid). Either
+way you must also search the <b>neighboring cells</b>, because the nearest driver may be
+just across a cell boundary &mdash; a single-cell scan silently misses them.</p>
 <pre class="mermaid">
 graph TD
   W[world] --> Q1[NW] & Q2[NE] & Q3[SW] & Q4[SE]

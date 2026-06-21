@@ -22,7 +22,17 @@ updates, and presence you need the server to send to the client the instant some
 happens, over a <b>persistent connection</b> &mdash; and then you need to find the
 right connection among millions.</p>
 
-<h2 class="sec">2 &middot; How it works</h2>
+<h2 class="sec">2 &middot; The delivery ladder</h2>
+<h4>Rung 0 — short polling</h4>
+<p>Client asks &ldquo;anything new?&rdquo; every few seconds. Trivial, works over plain HTTP &mdash;
+but it&rsquo;s nearly all wasted requests, and updates lag by the poll interval.</p>
+<div class="newprob"><b>Bottleneck:</b> at scale the empty polls dwarf real traffic; latency = poll interval.</div>
+<h4>Rung 1 — long polling / SSE</h4>
+<p>The server holds the request open until it has something (long-poll), or pushes a
+one-way event stream (SSE). Lower latency, fewer empty round-trips &mdash; but still
+one-directional and connection-churny.</p>
+<div class="newprob"><b>Bottleneck:</b> no efficient client→server push; reconnect overhead.</div>
+<h4>Rung 2 — WebSocket on a stateful gateway ← the answer</h4>
 <pre class="mermaid">
 graph LR
   A[user A] <-->|WebSocket| GA[gateway 3]
@@ -31,11 +41,15 @@ graph LR
   GA -->|forward| GB
   GB --> B
 </pre>
-<p><b>WebSocket</b> (or SSE for one-way) holds an open, stateful connection on a
-<b>connection/gateway server</b>. To deliver A&rarr;B, A&rsquo;s gateway must learn
-which gateway holds B&rsquo;s socket via a fast registry
-(<code>user_id &rarr; server_id</code>, e.g. in Redis), updated on every connect and
-disconnect. Per-conversation sequence numbers give ordering.</p>
+<p>A <b>WebSocket</b> holds an open, bidirectional, stateful connection on a
+<b>gateway server</b>. To deliver A&rarr;B, A&rsquo;s gateway looks up which gateway holds
+B&rsquo;s socket via a fast registry (<code>user_id &rarr; server_id</code> in Redis), updated
+on every connect/disconnect; per-conversation sequence numbers give ordering. The cost
+this exposes is <b>holding millions of live connections</b>:</p>
+<div class="estimate">1,000,000 conns x ~10 KB socket buffers  = ~10 GB RAM just for sockets
+10,000,000 conns                         = ~100 GB  -> spread over many gateway nodes
+  => connections are state; the gateway tier scales horizontally, and a dead
+     gateway forces all its clients to reconnect + re-register (the failover cost)</div>
 
 <h2 class="sec">3 &middot; The new bottleneck it hands you</h2>
 <div class="newprob">

@@ -34,20 +34,32 @@ graph TD
   M --> R[result]
 </pre>
 <p>The art is pushing computation <em>to</em> the data: each shard returns a small
-partial (a top-K, a partial sum, a merged sketch) instead of raw rows, so the network
-and the coordinator stay cheap. Aggregations that are associative/commutative (sum,
-count, max, mergeable sketches) parallelize cleanly; ones that aren&rsquo;t (exact
-median, distinct-count) need approximations.</p>
+partial instead of raw rows. <b>Worked &mdash; global top-3</b> across 3 shards: each shard
+sends only its own top-3, the coordinator merges:</p>
+<div class="estimate">S1 top-3: a(90) b(70) c(30)
+S2 top-3: d(85) e(60) f(20)      -> coordinator merges 9 candidates ->
+S3 top-3: g(95) h(50) i(10)         global top-3 = g(95), a(90), d(85)</div>
+<p>This is correct because <b>a global top-K member must be top-K on its own shard</b> &mdash;
+so each shard need only ship K rows, not all of them. Aggregations that are
+associative/commutative (<code>sum, count, max</code>, mergeable sketches) parallelize the
+same way; ones that aren&rsquo;t &mdash; exact median, exact distinct-count &mdash; can&rsquo;t merge
+from local partials and need approximations (e.g. a HyperLogLog or t-digest sketch per
+shard, merged centrally).</p>
 
 <h2 class="sec">3 &middot; The new bottleneck it hands you</h2>
 <div class="newprob">
-<p><b>The slowest shard sets the latency</b> &mdash; a query that touches 100 shards is
-as slow as the worst of 100, so tail latency dominates (<a href="../primitives/p12.html">P12</a>; hedge
-or set per-shard timeouts). <b>Shuffle</b> &mdash; when a join or group-by needs to
-redistribute data <em>between</em> shards &mdash; becomes the dominant cost in
-analytics (<a href="../systems/s8.html">distributed SQL</a>). And partials computed from local-only
-stats can be approximate (e.g. distributed IDF, <a href="../primitives/p6.html">P6</a>).</p>
+<p><b>The slowest shard sets the latency.</b> A query is as slow as the worst shard it
+touches, and that compounds brutally with fan-out width:</p>
 </div>
+<div class="estimate">each shard is "fast" (under its p99) 99% of the time:
+   1 shard   -> 99.0% of queries fast
+  10 shards  -> 90.4% fast   (9.6% hit a slow shard)
+ 100 shards  -> 36.6% fast   -> 63% of queries hit at least one slow shard!</div>
+<p>So a wide scatter turns a rare per-shard slowdown into the <em>common</em> case &mdash;
+which is why fan-out systems lean on hedging and per-shard timeouts (<a href="../primitives/p12.html">P12</a>).
+<b>Shuffle</b> &mdash; redistributing data <em>between</em> shards for a join or group-by &mdash;
+becomes the dominant cost in analytics (<a href="../systems/s8.html">distributed SQL</a>), and
+partials from local-only stats can be approximate (distributed IDF, <a href="../primitives/p6.html">P6</a>).</p>
 
 <h2 class="sec">4 &middot; Real-world example</h2>
 <div class="example">

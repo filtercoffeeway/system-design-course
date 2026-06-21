@@ -22,7 +22,8 @@
 inputs and compute on demand). This is the deepest tension in feeds, notifications,
 and analytics: write amplification vs read amplification.</p>
 
-<h2 class="sec">2 &middot; How it works (fan-out)</h2>
+<h2 class="sec">2 &middot; The fan-out ladder</h2>
+<p>Take a social feed (reads &gg; writes). Derive the strategy from the cost of each.</p>
 <pre class="mermaid">
 graph TD
   POST[user posts] -->|fan-out on write| F1[follower feed]
@@ -30,18 +31,45 @@ graph TD
   POST --> F3[follower feed]
   RP[reader opens feed] -->|fan-out on read| M[merge followees on the fly]
 </pre>
-<p><b>Fan-out on write</b> pushes a new item into every consumer&rsquo;s precomputed
-view: reads are O(1), but a write costs O(audience) and storage grows with audience.
-<b>Fan-out on read</b> stores the item once and merges at query time: writes are
-cheap, reads are expensive. <b>Hybrid</b> picks per node based on degree.</p>
+<h4>Rung 0 — fan-out on read (compute on demand)</h4>
+<p>Store each post once; when a user opens their feed, fetch the recent posts of everyone
+they follow and merge. <b>Writes are O(1)</b> &mdash; dead simple.</p>
+<div class="estimate">post -> 1 write
+read feed (following K=500) -> merge ~500 authors' recent posts, every open
+system: 5B feed-reads/day x 500 = 2.5T lookups/day   <-- read amplification</div>
+<div class="newprob"><b>Bottleneck:</b> reads dominate this workload, and you just made the
+common operation the expensive one &mdash; every feed open re-does a 500-way merge.</div>
+<h4>Rung 1 — fan-out on write (precompute)</h4>
+<p>Flip <em>when</em> you pay: on each post, push the item into every follower&rsquo;s
+precomputed timeline (in Redis). Now a feed read is a single O(1) cache lookup &mdash; the
+right trade when reads &gg; writes.</p>
+<div class="estimate">avg post -> 200 feed writes (one per follower)
+read feed -> 1 precomputed lookup (O(1))   <-- the common op is now cheap</div>
+<div class="newprob"><b>Bottleneck:</b> the <b>hot producer</b>. A celebrity with 100M
+followers turns <em>one</em> post into <b>100M</b> synchronous writes &mdash; a single
+action that can stall the whole fan-out pipeline, plus storage grows with total audience.</div>
+<h4>Rung 2 — hybrid by follower count ← the answer</h4>
+<p>Push for the ordinary majority; for accounts above a follower threshold, <b>don&rsquo;t</b>
+push &mdash; their posts are <b>pulled at read time</b> and merged into the requesting
+user&rsquo;s timeline. You pay O(audience) only where it&rsquo;s small, and O(merge) only for the
+handful of celebrities a user follows.</p>
+<div class="estimate">push  if followers &lt; ~100,000     (avg user 200 -> push)
+pull  if followers &ge; ~100,000     (celebrity 100M -> pull, merge a few at read)</div>
+<div class="tablewrap"><table>
+<tr><th>Rung</th><th>Good until</th><th>Breaks on</th></tr>
+<tr><td>Fan-out on read</td><td>write-heavy / small fan-in</td><td>read-heavy: every open re-merges</td></tr>
+<tr><td>Fan-out on write</td><td>reads ≫ writes, modest fan-out</td><td>celebrity = 100M writes per post</td></tr>
+<tr><td>Hybrid (← pick)</td><td>real feeds</td><td>two code paths + a hot-account classifier</td></tr>
+</table></div>
 
 <h2 class="sec">3 &middot; The new bottleneck it hands you</h2>
 <div class="newprob">
-<p>Push gives you <b>storage blow-up</b> and the <b>hot producer</b>: one write from an
-account with 100M followers triggers 100M synchronous fan-out operations &mdash; the
-naive push model collapses on celebrities (<a href="../systems/s9.html">social feed</a>). Pull gives
-you <b>slow reads</b> and repeated recomputation. Hybrid gives you two code paths plus
-a classifier deciding who is "hot."</p>
+<p>Push gives you <b>storage blow-up</b> and the <b>hot producer</b> (the celebrity write
+amplification above). Pull gives you <b>slow reads</b> and repeated recomputation. Hybrid
+&mdash; the practical answer &mdash; gives you <b>two code paths</b> plus a classifier
+deciding who is &ldquo;hot,&rdquo; and a merge step that must blend pushed and pulled items in
+rank order. The same dial appears in metrics as <b>write-time rollup vs read-time
+aggregation</b> (<a href="../systems/s6.html">Datadog</a>).</p>
 </div>
 
 <h2 class="sec">4 &middot; Real-world example</h2>

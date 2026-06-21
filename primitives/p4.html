@@ -23,7 +23,19 @@ exploits locality: a small set of hot items serves most reads. The
 <a href="../systems/s14.html">URL shortener</a> is 1000:1 reads:writes &mdash; it is a caching problem
 wearing a storage costume.</p>
 
-<h2 class="sec">2 &middot; How it works (cache-aside)</h2>
+<h2 class="sec">2 &middot; Why it pays — the hit-ratio math</h2>
+<p>A cache only helps if a small hot set serves most reads. The payoff is non-linear in
+hit ratio, and the <em>misses</em> dominate the average (cache 0.5&nbsp;ms, DB 20&nbsp;ms):</p>
+<div class="estimate">effective latency = hit x 0.5ms + miss x 20.5ms
+  90.0% hit -> 2.50 ms
+  95.0% hit -> 1.50 ms
+  99.0% hit -> 0.70 ms
+  99.9% hit -> 0.52 ms        a few % of misses set the average — why the last 9s matter</div>
+<p>Size the cache to the <b>working set</b>, not the dataset: with a Zipfian access
+pattern ~0.1% of a billion keys serve most reads, so a ~1M-entry cache captures the
+bulk &mdash; you don&rsquo;t cache everything, just the hot tail.</p>
+
+<h2 class="sec">3 &middot; Read &amp; write policies</h2>
 <pre class="mermaid">
 graph LR
   A[app] -->|1 get| C[(cache)]
@@ -32,22 +44,33 @@ graph LR
   DB --> A
   A -->|3 set| C
 </pre>
-<p>The dominant pattern is <b>cache-aside</b>: app checks cache, on miss reads the DB
-and populates the cache. <b>Write-through</b> writes cache and DB together
-(consistent, slower writes). <b>Write-back</b> writes cache now and DB later (fast,
-risky on crash). Eviction is LRU/LFU/TTL.</p>
+<p>The dominant read pattern is <b>cache-aside</b>: app checks cache, on miss reads the DB
+and populates it. For writes you pick where consistency vs speed lands:</p>
+<div class="tablewrap"><table>
+<tr><th>Write policy</th><th>How</th><th>Trade</th></tr>
+<tr><td>Cache-aside (lazy)</td><td>write DB, invalidate/leave cache</td><td>simple; first read after a write misses</td></tr>
+<tr><td>Write-through</td><td>write cache + DB together</td><td>cache always fresh; slower writes</td></tr>
+<tr><td>Write-back</td><td>write cache now, DB later</td><td>fast writes; data loss on crash</td></tr>
+</table></div>
+<p>Eviction is LRU/LFU/TTL. None of this is the hard part &mdash; the next section is.</p>
 
-<h2 class="sec">3 &middot; The new bottleneck it hands you</h2>
+<h2 class="sec">4 &middot; The new bottleneck it hands you</h2>
 <div class="newprob">
 <p><b>Invalidation</b> &mdash; one of the two hard problems in CS &mdash; is keeping the
 cache honest when the source changes; a stale entry serves wrong data until it expires
 or is purged. <b>Stampede / thundering herd</b>: a hot key expires and thousands of
-requests miss simultaneously and crush the origin. Defenses: request coalescing (one
-miss fills, others wait), probabilistic early expiration, and <b>leases</b>. Plus
-cold-start misses and the memory cost of the cache itself.</p>
+requests miss simultaneously and crush the origin.</p>
 </div>
+<div class="estimate">hot key at 50,000 rps, recompute (DB read) takes 20 ms:
+  TTL expires -> during the 20ms refill window ~1,000 requests all miss
+             -> all 1,000 hit the DB at once  (the stampede)
+  request coalescing: 1 request fills, 999 wait on it -> DB sees 1</div>
+<p>Defenses: <b>request coalescing</b> (one miss fills, others wait), probabilistic
+<b>early expiration</b> (refresh a hot key slightly before TTL so it never hard-expires
+under load), and <b>leases</b> (next section). Plus cold-start misses and the memory cost
+of the cache itself.</p>
 
-<h2 class="sec">4 &middot; Real-world example</h2>
+<h2 class="sec">5 &middot; Real-world example</h2>
 <div class="example">
 <span class="tag">Facebook (Memcache)</span>
 <p>Facebook&rsquo;s "Scaling Memcache at Facebook" (NSDI 2013) is the canonical caching
@@ -61,20 +84,20 @@ pipeline driven off the database commit log. The lesson: at scale, the cache&rsq
 hard problems are invalidation and stampede, not hit rate.</p>
 </div>
 
-<h2 class="sec">5 &middot; Applying it in a design</h2>
+<h2 class="sec">6 &middot; Applying it in a design</h2>
 <p>Reach for a cache the moment reads dominate and a hot set exists. Name the tradeoff:
 <i>"cache-aside with a short TTL; I&rsquo;ll coalesce misses to prevent stampede and
 accept bounded staleness."</i> If you can&rsquo;t tolerate staleness, move to
 write-through and invalidate on write.</p>
 
-<h2 class="sec">6 &middot; Pitfalls</h2>
+<h2 class="sec">7 &middot; Pitfalls</h2>
 <ul>
 <li>No stampede protection on hot keys.</li>
 <li>Caching with no invalidation plan ("we&rsquo;ll just TTL it" hides bugs).</li>
 <li>Caching user-specific data with a shared key (leaks across users).</li>
 </ul>
 
-<h2 class="sec">7 &middot; Further reading</h2>
+<h2 class="sec">8 &middot; Further reading</h2>
 <ul>
 <li><a href="https://www.usenix.org/system/files/conference/nsdi13/nsdi13-final170_update.pdf">Scaling Memcache at Facebook (NSDI 2013)</a></li>
 <li><a href="https://redis.io/docs/latest/develop/use/patterns/">Redis caching patterns</a></li>

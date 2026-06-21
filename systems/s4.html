@@ -12,19 +12,56 @@
 
 <hr>
 
-<h2 class="sec">1 &middot; Requirements &amp; scale</h2>
-<p><b>Functional:</b> structured data with ACID transactions, joins, secondary
+<h2 class="sec">1 &middot; Requirements</h2>
+<p><b>Functional:</b> structured data with ACID transactions, joins, and secondary
 indexes. <b>Non-functional:</b> keep those guarantees as data and traffic outgrow a
-single node. The whole story is "how far can one box go, and what breaks first."</p>
-<div class="estimate">Scaling ladder
-1) one node, tuned                          -> vertical limit
-2) + read replicas                          -> read scale, write still single-node
-3) + caching / connection pooling           -> relieve read + connection pressure
-4) + functional partitioning (by table)     -> independent services
-5) + horizontal sharding (by key)           -> write scale, lose cross-shard joins
-</div>
+single node. The whole story is &ldquo;how far does one box go, and what breaks first.&rdquo;</p>
+<div class="estimate">say: 50,000 writes/s and 500,000 reads/s, 10 TB, growing
+  one tuned primary: ~tens of k writes/s, low-TB working set -> we're past it
+  -> the question is which scaling lever, in which order, and what each costs</div>
 
-<h2 class="sec">2 &middot; High-level architecture</h2>
+<h2 class="sec">2 &middot; Internals you scale: MVCC, indexes, the WAL</h2>
+<p>Before scaling <em>out</em>, know what a single node is doing. <b>MVCC</b>
+(multi-version concurrency control) lets readers see a consistent snapshot without
+blocking writers: each update writes a <em>new</em> row version stamped with a transaction
+id, and a reader sees the newest version committed before its snapshot.</p>
+<div class="estimate">row "balance" updated by txns 100, 105:
+  v1 (xmin=100) balance=50    <- a txn with snapshot &lt;105 still reads this
+  v2 (xmin=105) balance=70    <- a txn with snapshot &ge;105 reads this
+  old versions kept until no snapshot needs them, then VACUUM reclaims them</div>
+<p>The <b>WAL</b> (<a href="../primitives/p17.html">P17</a>) gives crash durability and feeds
+replication. <b>Indexes</b> (B-tree for ranges, hash for equality, GIN/GiST for text/geo)
+speed reads but each one is a structure every write must also update &mdash; so you can&rsquo;t
+index every column; indexes trade write throughput and space for read speed.</p>
+
+<h2 class="sec">3 &middot; The scaling ladder</h2>
+<h4>Rung 0 — one tuned primary</h4>
+<p>Right indexes, enough RAM for the working set. Goes a long way &mdash; tens of thousands
+of writes/s. Always start here.</p>
+<div class="newprob"><b>Bottleneck:</b> reads and writes share one node; the box has a ceiling.</div>
+<h4>Rung 1 — read replicas</h4>
+<p>Stream the WAL to replicas and send reads there. Reads scale out; the 10:1 read:write
+ratio means this buys a lot. <b>But writes still go to the one primary</b>, and replicas
+<b>lag</b> &mdash; a read-your-write off a replica can miss your own update
+(<a href="../primitives/p3.html">P3</a>); route critical reads to the primary or wait for a WAL
+position.</p>
+<div class="newprob"><b>Bottleneck:</b> write throughput and dataset still bound by one primary.</div>
+<h4>Rung 2 — connection pooling &amp; caching</h4>
+<p>Each Postgres connection is a real process (~MBs); thousands of app workers exhaust the
+DB before CPU does. A pooler (PgBouncer) multiplexes many clients onto few server
+connections &mdash; connection count is a DB resource. A cache (<a href="../primitives/p4.html">P4</a>)
+absorbs hot reads. Relieves pressure, but still one primary for writes.</p>
+<div class="newprob"><b>Bottleneck:</b> write ceiling unmoved.</div>
+<h4>Rung 3 — functional partitioning (split by table/domain)</h4>
+<p>Move whole tables (e.g. <code>events</code>, <code>users</code>) to separate DB
+instances. Each gets its own write capacity &mdash; but a single table that&rsquo;s too big
+still can&rsquo;t fit, and cross-domain joins now cross a network.</p>
+<div class="newprob"><b>Bottleneck:</b> one hot table can still exceed a node.</div>
+<h4>Rung 4 — horizontal sharding (split rows by key) ← the wall</h4>
+<p>Partition a table&rsquo;s rows across N shards by a shard key (<a href="../primitives/p2.html">P2</a>).
+Write throughput finally scales linearly &mdash; at the cost of the hard constraint below.</p>
+
+<h2 class="sec">4 &middot; High-level architecture</h2>
 <pre class="mermaid">
 graph TD
   APP[app] --> PB[connection pooler]
@@ -35,31 +72,21 @@ graph TD
   SH --> S1[(shard A)] & S2[(shard B)]
 </pre>
 
-<h2 class="sec">3 &middot; The hard constraint, in depth</h2>
-<div class="hard"><p>Once you shard, <b>joins across shards are prohibitively
-expensive</b> &mdash; a join that used to be local now fans out to every shard and
-merges over the network. You respond by <b>denormalizing</b> so related rows share a
-shard, choosing a shard key that co-locates what you read together, and accepting that
-some queries scatter-gather (<a href="../primitives/p7.html">P7</a>). Cross-shard transactions need
-2PC, which blocks and rarely scales.</p></div>
+<h2 class="sec">5 &middot; The hard constraint: cross-shard joins</h2>
+<div class="hard"><p>Once you shard, <b>a join across shards is prohibitively expensive</b>.
+A join that was a local index lookup now fans out to every shard and merges over the
+network (<a href="../primitives/p7.html">P7</a>), and is bounded by the slowest shard:</p></div>
+<div class="estimate">SELECT * FROM orders JOIN users ON ... , sharded by different keys:
+  local join (1 node):     1 index lookup
+  cross-shard over 50 shards: scatter to 50, gather + merge -> 50x the work,
+                              latency = slowest of 50 shards (P7 tail math)</div>
+<p>You respond by <b>denormalizing</b> so related rows share a shard, and by choosing a
+shard key that co-locates what you read together (orders sharded by <code>user_id</code> so
+a user&rsquo;s orders + profile live together). Some queries still scatter-gather; accept it.
+Cross-shard <b>transactions</b> need 2PC, which holds locks across shards and rarely scales
+&mdash; another reason to keep a transaction inside one shard.</p>
 
-<h2 class="sec">4 &middot; Component deep dives</h2>
-<h3>MVCC &amp; the WAL</h3>
-<p>Multi-Version Concurrency Control lets readers see a consistent snapshot without
-blocking writers (each write makes a new version). The WAL (<a href="../primitives/p17.html">P17</a>)
-gives durability and feeds replication.</p>
-<h3>Read replicas &amp; lag (P3)</h3>
-<p>Replicas scale reads but lag the primary; reading your own write from a replica can
-return stale data &mdash; route critical reads to the primary or wait for a position.</p>
-<h3>Sharding (P2)</h3>
-<p>Range, hash, or directory-based. The shard key is the most important decision; get
-it wrong and you get hot shards or unavoidable cross-shard queries.</p>
-<h3>Connection pooling</h3>
-<p>Each Postgres connection costs real memory/process; thousands of app workers can
-exhaust the DB. A pooler (PgBouncer) multiplexes many clients onto few server
-connections &mdash; connection count is a database resource, not just a network one.</p>
-
-<h2 class="sec">5 &middot; Real-world example</h2>
+<h2 class="sec">6 &middot; Real-world example</h2>
 <div class="example">
 <span class="tag">YouTube / Vitess</span>
 <p>YouTube outgrew a single MySQL and built <b>Vitess</b> (now a CNCF project, also
@@ -72,13 +99,13 @@ and it leans on exactly the cross-shard-join constraint above, steering apps tow
 shard-local queries.</p>
 </div>
 
-<h2 class="sec">6 &middot; Tradeoffs &amp; alternatives</h2>
+<h2 class="sec">7 &middot; Tradeoffs &amp; alternatives</h2>
 <p>Replicas first (cheap read scale), shard only when writes force it. If you need
 horizontal writes <em>and</em> distributed transactions, a NewSQL store
 (CockroachDB/Spanner, Raft-replicated ranges) buys that at higher latency. If you need
 massive write scale and can drop joins/ACID, a <a href="../systems/s3.html">KV store</a> fits better.</p>
 
-<h2 class="sec">7 &middot; Key talking points</h2>
+<h2 class="sec">8 &middot; Key talking points</h2>
 <ul>
 <li>Climb the ladder: tune &rarr; replicas &rarr; cache/pool &rarr; partition &rarr; shard.</li>
 <li>Shard key co-locates data; cross-shard joins are the wall (<a href="../primitives/p2.html">P2</a>, <a href="../primitives/p7.html">P7</a>).</li>
@@ -87,7 +114,7 @@ massive write scale and can drop joins/ACID, a <a href="../systems/s3.html">KV s
 <li>Avoid 2PC; denormalize instead.</li>
 </ul>
 
-<h2 class="sec">8 &middot; Further reading</h2>
+<h2 class="sec">9 &middot; Further reading</h2>
 <ul>
 <li><a href="https://vitess.io/docs/">Vitess documentation</a></li>
 <li>Kleppmann, <i>DDIA</i> ch. 6 (partitioning), ch. 7 (transactions)</li>

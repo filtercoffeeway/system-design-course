@@ -102,3 +102,26 @@ blockquote{margin:14px 0; padding:8px 16px; border-left:3px solid var(--line);
 .toc li{margin:3px 0}
 .statusbar{font-size:13px; color:var(--muted); background:var(--accent-soft);
   border-radius:8px; padding:6px 12px; display:inline-block; margin-bottom:10px}
+
+/* ---- completion status (driven by site.js) ---- */
+/* per-page banner */
+.pagestatus{font-size:14px; font-weight:600; border-radius:10px;
+  padding:10px 16px; margin:0 0 18px; border:1px solid transparent}
+.pagestatus small{display:block; font-weight:400; font-size:12.5px; margin-top:2px; opacity:.85}
+.is-done{background:#e7f6ec; border-color:#bfe6cd; color:#1a7f3c}
+.is-wip{background:#fdf3e3; border-color:#f0dcb6; color:#9a6700}
+/* small inline pill on tiles + sidebar */
+.st{display:inline-block; font-size:10.5px; font-weight:700; letter-spacing:.02em;
+  line-height:1; padding:3px 6px; border-radius:999px; vertical-align:middle}
+.st-done{background:#e7f6ec; color:#1a7f3c; border:1px solid #bfe6cd}
+.st-wip{background:#f1f1ef; color:#8a8f98; border:1px solid #e0e1e4}
+.tile .st{position:absolute; top:8px; right:8px}
+.tile{position:relative}
+/* sidebar dot */
+.side .dot{display:inline-block; width:7px; height:7px; border-radius:50%;
+  margin-right:7px; vertical-align:middle; background:#d4d6da}
+.side .dot.done{background:#2a9d54}
+/* index legend */
+.statuslegend{font-size:13px; color:var(--muted); background:var(--panel);
+  border:1px solid var(--line); border-radius:10px; padding:8px 14px; margin:6px 0 18px}
+.statuslegend .st{margin:0 4px}

@@ -20,35 +20,104 @@
 <p>Sometimes many nodes must agree on one thing &mdash; who is the leader, who holds
 the lock, what the current config is &mdash; even though nodes crash and networks drop
 messages. <b>Consensus</b> gets a group to agree on a value despite failures;
-<b>leader election</b> is consensus on "who&rsquo;s in charge."</p>
+<b>leader election</b> is consensus on &ldquo;who&rsquo;s in charge.&rdquo; The trap is that the
+obvious cheap answers are subtly wrong, so the right way in is a ladder.</p>
 
-<h2 class="sec">2 &middot; How it works</h2>
+<h2 class="sec">2 &middot; How to elect one leader safely &mdash; the ladder</h2>
+<h4>Rung 0 — a static/hardcoded leader</h4>
+<p>Designate one node the leader in config. Trivial &mdash; and fine until that node
+dies, at which point there is no automatic failover and the system stalls.</p>
+<div class="newprob"><b>Bottleneck:</b> no failover; a SPOF by construction.</div>
+<h4>Rung 1 — a lease in a single store (e.g. Redis <code>SET key val NX PX 10000</code>)</h4>
+<p>Candidates race to set a key with a TTL; whoever wins is leader and renews the lease
+by heartbeat. If it dies, the TTL expires and someone else wins. This <em>looks</em>
+done.</p>
+<div class="newprob"><b>Two bottlenecks:</b> (1) the store is itself a single point of
+failure, and you can&rsquo;t naively replicate a lock (an async replica could grant the same
+lock twice on failover &mdash; <b>split brain</b>). (2) the <b>slow-but-alive holder</b>:
+a leader that GC-pauses past its TTL is presumed dead and replaced, then wakes up still
+believing it leads. TTL tuning cannot fix this &mdash; shorten it and a hiccup causes
+spurious failovers; lengthen it and recovery is slow.</div>
+<h4>Rung 2 — consensus-backed lease (etcd / ZooKeeper, Raft/Paxos) ← the answer</h4>
+<p>Put the lease in a replicated state machine that commits via majority <b>quorum</b>,
+so the &ldquo;who is leader&rdquo; decision survives a minority of node losses and can never be
+granted twice (any two majorities overlap). This is what etcd/ZK/Chubby exist to
+provide, so you never implement Paxos yourself.</p>
+<div class="newprob"><b>Residual costs (accepted):</b> every commit pays a majority
+round-trip (<b>latency</b>), a minority partition <b>can&rsquo;t make progress</b> (CP by
+construction), and the slow-but-alive holder is still possible &mdash; consensus picks
+<em>one</em> leader but can&rsquo;t stop a paused old one from acting. That last gap is closed
+by fencing tokens (&sect;4), not by consensus.</div>
+<div class="tablewrap"><table>
+<tr><th>Rung</th><th>Good until</th><th>Breaks on</th></tr>
+<tr><td>Static leader</td><td>demos</td><td>no failover; SPOF</td></tr>
+<tr><td>Lease in one store</td><td>single-node, low stakes</td><td>store SPOF; split brain on failover; slow-holder</td></tr>
+<tr><td>Consensus lease (← pick)</td><td>real systems</td><td>quorum latency; CP; still needs fencing for correctness</td></tr>
+</table></div>
+
+<h2 class="sec">3 &middot; How consensus works — a Raft walkthrough</h2>
 <pre class="mermaid">
 graph TD
-  C[client] --> L[Leader]
-  L -->|replicate entry| F1[Follower]
-  L -->|replicate entry| F2[Follower]
+  C[client] --> L["Leader (term 4)"]
+  L -->|"append (4, idx7, x=9)"| F1[Follower A]
+  L -->|"append (4, idx7, x=9)"| F2[Follower B]
   F1 -->|ack| L
   F2 -->|ack| L
-  L -->|committed once majority ack| C
+  L -->|"committed once majority (3/5) ack"| C
 </pre>
-<p><b>Raft</b> and <b>Paxos</b> work by majority <b>quorum</b>: a value is committed
-once a majority of nodes have it, so any future majority overlaps and sees it. A
-leader is elected for a term; if it fails, followers time out and elect a new one.
-This tolerates a minority of failures (a 5-node cluster survives 2 losses).</p>
+<p>Raft replicates an ordered <b>log</b>. Each entry is <code>(term, index, command)</code>;
+the leader appends and ships entries to followers, and an entry <b>commits</b> the moment
+a majority has it &mdash; so any future majority overlaps the commit and can never lose it.
+Trace a 5-node cluster (majority = 3, tolerates 2 losses):</p>
+<div class="estimate">term 4, leader = N1
+  log:  (4,5,set a)  (4,6,set b)  (4,7,set c)
+  N1 replicates (4,7) to N2,N3  -> 3/5 have it -> COMMIT (4,7), reply to client
+  N4,N5 lagging, only up to (4,6)  -> fine, they catch up
 
-<h2 class="sec">3 &middot; The new bottleneck it hands you</h2>
+N1 crashes. Election for term 5:
+  N2 has log through (4,7); N4 has only (4,6)
+  Raft elects the candidate with the MOST up-to-date log -> N2 wins (not N4)
+  -> committed entry (4,7) is preserved; N2 leads term 5</div>
+<p>The election rule (most-up-to-date log wins) is what guarantees a committed entry is
+never dropped on failover &mdash; the key property the naive single-store lease lacks.</p>
+
+<h2 class="sec">4 &middot; The slow-but-alive holder &amp; fencing tokens</h2>
 <div class="newprob">
-<p>Quorum costs <b>latency</b> (every commit waits for a majority round trip) and a
-minority partition <b>can&rsquo;t make progress</b> (CP by construction). The subtler
-killer is the <b>slow-but-alive holder</b>: a leader/lock-holder that pauses (GC,
-network blip) is presumed dead, a new one takes over, then the old one wakes up still
-believing it holds the lock. TTL tuning cannot make this correct. <b>Fencing
-tokens</b> do: hand out a monotonically increasing token with the lock and have the
-protected resource reject any token older than the highest it has seen.</p>
+<p>Consensus elects exactly one leader, but it cannot stop a <em>previously</em> elected
+leader that paused (GC, VM migration, network blip) from waking up and acting as though
+it still leads. Trace it:</p>
 </div>
+<div class="estimate">t0  Leader A holds lease, fencing token = 33
+t1  A stalls (long GC pause) ...
+t2  lease TTL expires; cluster elects B, fencing token = 34
+t3  B writes to the DB with token 34  -> DB records "highest seen = 34"
+t4  A wakes, still thinks it leads, writes with token 33
+t5  DB sees 33 < 34  -> REJECTS the stale write   <-- correctness saved</div>
+<p>The <b>fencing token</b> is a monotonically increasing number handed out with the lock;
+the protected resource remembers the highest token it has accepted and rejects anything
+lower. TTL tuning can never make the lease alone safe &mdash; <b>only the token does</b>,
+because it makes a stale writer detectable at the resource regardless of timing.</p>
 
-<h2 class="sec">4 &middot; Real-world example</h2>
+<h2 class="sec">5 &middot; Applied — safe ID allocation &amp; worker-ID leasing</h2>
+<p>This is what an <a href="../systems/s14.html">id-generation service</a> (and any
+coordinator) leans on for <b>failover correctness</b>:</p>
+<ul>
+<li><b>Durable range allocation.</b> A key-gen coordinator hands out counter ranges by a
+<b>compare-and-swap on a consensus store</b> (etcd/ZK) &mdash; <code>CAS(next, 9_000_000
+&rarr; 9_001_000)</code>. Because the new high-water mark is committed to a majority before
+the range is returned, a coordinator <b>failover can never re-hand the same range</b> to
+two servers. Contrast a counter on an async-replicated store: promoting a lagging replica
+re-issues already-used ids (collisions). Consensus is precisely the fix.</li>
+<li><b>Worker-ID leasing.</b> Snowflake-style ids embed a machine id; two nodes with the
+same id silently collide. Assign ids as <b>ephemeral nodes</b> (a ZK ephemeral znode or an
+etcd lease): a node leases worker id 7, heartbeats to keep it, and on death the lease
+lapses and id 7 is freed for reuse &mdash; no static config to get wrong.</li>
+<li><b>Graceful degradation.</b> Because servers hold a <em>local</em> leased range, they
+keep minting ids while the coordinator is briefly unavailable &mdash; coordination is
+needed only once per range, not per id (<a href="p16.html">P16</a>).</li>
+</ul>
+
+<h2 class="sec">6 &middot; Real-world example</h2>
 <div class="example">
 <span class="tag">Google Chubby / etcd</span>
 <p>Google&rsquo;s <b>Chubby</b> lock service (built on Paxos) is how much of Google does
@@ -60,19 +129,19 @@ polling. The fencing-token lesson comes from Martin Kleppmann&rsquo;s well-known
 critique of naive Redis locks: a lock alone is not safe without a fencing token.</p>
 </div>
 
-<h2 class="sec">5 &middot; Applying it in a design</h2>
+<h2 class="sec">7 &middot; Applying it in a design</h2>
 <p>Don&rsquo;t roll your own consensus &mdash; delegate to ZooKeeper/etcd/Chubby. Say:
 <i>"single leader elected via etcd lease; the leader carries a fencing token so a
 stale leader can&rsquo;t corrupt state."</i> See <a href="../systems/s13.html">Distributed lock</a>.</p>
 
-<h2 class="sec">6 &middot; Pitfalls</h2>
+<h2 class="sec">8 &middot; Pitfalls</h2>
 <ul>
 <li>Believing a lock TTL alone guarantees mutual exclusion (it doesn&rsquo;t &mdash; fence).</li>
 <li>Even-sized clusters (no clean majority); use odd numbers.</li>
 <li>Putting high-throughput data through a consensus store (it&rsquo;s for coordination, not bulk).</li>
 </ul>
 
-<h2 class="sec">7 &middot; Further reading</h2>
+<h2 class="sec">9 &middot; Further reading</h2>
 <ul>
 <li><a href="https://raft.github.io/">The Raft consensus algorithm</a> &middot; <a href="https://research.google/pubs/pub27897/">The Chubby lock service</a></li>
 <li><a href="https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html">Kleppmann &mdash; How to do distributed locking (fencing tokens)</a></li>

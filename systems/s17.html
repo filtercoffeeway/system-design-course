@@ -12,18 +12,34 @@
 
 <hr>
 
-<h2 class="sec">1 &middot; Requirements &amp; scale</h2>
+<h2 class="sec">1 &middot; Requirements</h2>
 <p><b>Functional:</b> move money correctly &mdash; charge, transfer, refund &mdash;
 integrating external processors/banks. <b>Non-functional:</b> correctness above all (no
-lost or double money), auditability, and the one domain where eventual consistency is
-unacceptable.</p>
-<div class="estimate">Back-of-envelope
-correctness target: zero money created/destroyed (must reconcile to the cent)
-external dependencies: card networks, banks, Stripe -- you control only your side
-throughput secondary to correctness + auditability
-</div>
+money created or destroyed), full auditability, and the one domain where eventual
+consistency is unacceptable. Throughput is secondary to being right.</p>
+<div class="estimate">correctness: reconcile to the cent — zero money created/destroyed
+external deps: card networks, banks, Stripe — you control ONLY your side
+every state change auditable & immutable (regulators, disputes)</div>
 
-<h2 class="sec">2 &middot; High-level architecture</h2>
+<h2 class="sec">2 &middot; API &amp; data model</h2>
+<div class="estimate">POST /charges
+  Idempotency-Key: &lt;uuid&gt;                       (retry-safe — P9)
+  body: { amount: 5000, currency: usd, source, merchant }
+  -> { id, status: succeeded|pending|failed }</div>
+<p>The source of truth is a <b>double-entry ledger</b>: every money movement is recorded as
+balanced entries that <b>sum to zero</b>. Append-only and immutable &mdash; a correction is a
+new compensating entry, never an edit. A $50 charge with a $2 fee:</p>
+<div class="estimate">txn T1 "charge $50, $2 platform fee":
+  account                 amount
+  customer_funds         -50.00     (money leaves customer)
+  merchant_balance       +48.00
+  platform_revenue        +2.00
+  ----------------------------------
+  SUM                      0.00   <-- the invariant: if it isn't 0, you have a bug</div>
+<p>The zero-sum rule isn&rsquo;t accounting nostalgia &mdash; it&rsquo;s a continuous self-check
+that makes a whole class of bugs (lost or duplicated money) impossible to commit silently.</p>
+
+<h2 class="sec">3 &middot; High-level architecture</h2>
 <pre class="mermaid">
 graph LR
   API[payment API + idempotency] --> LEDGER[(double-entry ledger)]
@@ -33,32 +49,40 @@ graph LR
   RECON --> EXT
 </pre>
 
-<h2 class="sec">3 &middot; The hard constraint, in depth</h2>
+<h2 class="sec">4 &middot; The charge write path</h2>
+<div class="estimate">POST /charges (Idempotency-Key K):
+  1. INSERT idempotency key K (in_progress) — unique constraint (P9)
+     if K already done -> return stored result (no double charge)
+  2. authorize with processor (saga step 1)               [external]
+  3. on auth OK: write balanced ledger entries + mark K done  IN ONE TXN
+  4. capture (saga step 2); notify (step 3)
+  if capture fails -> compensation: void/refund the authorization (P14)</div>
+<p>The two correctness primitives carry the load: <b>idempotency</b> (<a href="../primitives/p9.html">P9</a>)
+so a retried <code>POST /charges</code> can never double-charge (the key + ledger write commit
+together), and the <b>saga</b> (<a href="../primitives/p14.html">P14</a>) so a multi-step flow that
+fails midway is unwound by compensations rather than left half-done.</p>
+<h3>How to keep money consistent across steps &mdash; the ladder</h3>
+<p>Why a saga and not something stronger? Derive it:</p>
+<div class="tablewrap"><table>
+<tr><th>Rung</th><th>Mechanism</th><th>Breaks on</th></tr>
+<tr><td>One ACID transaction</td><td>wrap all steps in one DB txn</td><td>steps span <em>different</em> services + an external bank — no shared txn</td></tr>
+<tr><td>Two-phase commit (2PC)</td><td>coordinator prepares then commits all</td><td>holds locks across services; the bank won&rsquo;t join your 2PC; blocks on coordinator failure</td></tr>
+<tr><td>Saga + idempotency (← pick)</td><td>steps with compensations, each idempotent</td><td>intermediate states visible; some actions hard to undo → needs reconciliation</td></tr>
+</table></div>
+<p>You can&rsquo;t escape the external boundary, so you land on the saga and add
+<b>reconciliation</b> as the net under it.</p>
+
+<h2 class="sec">5 &middot; The hard constraint, in depth</h2>
 <div class="hard"><p>You <b>cannot wrap a distributed transaction</b> across your database
-and an external processor (Stripe, a bank) &mdash; you only control your side and
-can&rsquo;t two-phase-commit with VISA. So the standard answer is <b>saga + idempotency +
-reconciliation</b>: drive the steps with compensations (<a href="../primitives/p14.html">P14</a>), make
-every call idempotent (<a href="../primitives/p9.html">P9</a>), and run a batch that compares your ledger
-to the processor&rsquo;s statement to catch and fix any drift.</p></div>
+and an external processor (Stripe, a bank) &mdash; you only control your side and can&rsquo;t
+two-phase-commit with VISA. So the standard answer is <b>saga + idempotency +
+reconciliation</b>: drive the steps with compensations (<a href="../primitives/p14.html">P14</a>),
+make every call idempotent (<a href="../primitives/p9.html">P9</a>), and run a batch that compares
+your ledger to the processor&rsquo;s statement line by line to catch and fix any drift.
+<b>Reconciliation is the real correctness guarantee &mdash; an after-the-fact net, not a
+real-time one</b>, because real-time agreement with an external party is impossible.</p></div>
 
-<h2 class="sec">4 &middot; Component deep dives</h2>
-<h3>Double-entry ledger</h3>
-<p>Every transaction is two entries (a debit and a credit) that must sum to zero. This
-isn&rsquo;t accounting nostalgia &mdash; it&rsquo;s a built-in invariant: if the books
-don&rsquo;t balance, you have a bug. The ledger is append-only and immutable (corrections
-are new entries, never edits).</p>
-<h3>Idempotency (P9)</h3>
-<p>Idempotency keys on payment APIs so a retried charge doesn&rsquo;t double-charge; the
-result is stored transactionally with the ledger write &mdash; see <a href="../primitives/p9.html">P9</a>.</p>
-<h3>Saga / compensation (P14)</h3>
-<p>A payment is multi-step (authorize &rarr; capture &rarr; notify); each step has a
-compensating action (void/refund) if a later step fails (<a href="../primitives/p14.html">P14</a>).</p>
-<h3>Reconciliation</h3>
-<p>A nightly job matches your ledger against the processor/bank statement line by line;
-mismatches are flagged and resolved. This is the real correctness guarantee &mdash; not a
-real-time one.</p>
-
-<h2 class="sec">5 &middot; Real-world example</h2>
+<h2 class="sec">6 &middot; Real-world example</h2>
 <div class="example">
 <span class="tag">Stripe / Uber ledger</span>
 <p>Stripe&rsquo;s API is built on <b>idempotency keys</b> (<a href="../primitives/p9.html">P9</a>) precisely
@@ -70,13 +94,13 @@ auditability. Both show the pattern: idempotent APIs, an append-only double-entr
 as the source of truth, sagas for multi-step flows, and reconciliation as the final net.</p>
 </div>
 
-<h2 class="sec">6 &middot; Tradeoffs &amp; alternatives</h2>
+<h2 class="sec">7 &middot; Tradeoffs &amp; alternatives</h2>
 <p>Strong consistency and auditability are non-negotiable, so you accept lower throughput
-and more process than other domains. 2PC across your services is possible but blocks; a
-saga is preferred. Real-time guarantees are impossible against external parties &mdash;
-reconciliation is how you make it right after the fact.</p>
+and more process than other domains. 2PC across your <em>own</em> services is possible but
+blocks resources; a saga is preferred. Real-time guarantees are impossible against external
+parties &mdash; reconciliation is how you make it right after the fact.</p>
 
-<h2 class="sec">7 &middot; Key talking points</h2>
+<h2 class="sec">8 &middot; Key talking points</h2>
 <ul>
 <li>Double-entry ledger: entries sum to zero = built-in bug detector.</li>
 <li>Idempotency keys to prevent double-charge (<a href="../primitives/p9.html">P9</a>).</li>
@@ -85,7 +109,7 @@ reconciliation is how you make it right after the fact.</p>
 <li>You only control your side; no distributed txn with the bank.</li>
 </ul>
 
-<h2 class="sec">8 &middot; Further reading</h2>
+<h2 class="sec">9 &middot; Further reading</h2>
 <ul>
 <li><a href="https://stripe.com/blog/idempotency">Stripe &mdash; idempotency</a> &middot; <a href="https://www.uber.com/blog/how-ledgerstore-supports-trillions-of-indexes/">Uber LedgerStore</a></li>
 </ul>

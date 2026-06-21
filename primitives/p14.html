@@ -23,17 +23,35 @@ the card, book the shipment &mdash; that you can&rsquo;t wrap in one ACID transa
 sequence, and if a later step fails, runs <b>compensating</b> actions to undo the
 earlier ones.</p>
 
-<h2 class="sec">2 &middot; How it works</h2>
+<h2 class="sec">2 &middot; The ladder to a multi-service transaction</h2>
+<h4>Rung 0 — one ACID transaction</h4>
+<p>If all the data lives in one database, wrap the steps in a single transaction and
+you&rsquo;re done &mdash; atomicity for free. <b>Always prefer this when it&rsquo;s possible.</b></p>
+<div class="newprob"><b>Bottleneck:</b> the steps span <em>different</em> services/DBs (and external APIs), so no single transaction can cover them.</div>
+<h4>Rung 1 — two-phase commit (2PC)</h4>
+<p>A coordinator asks every participant to <em>prepare</em>, then <em>commit</em> only if
+all voted yes. Gives atomicity across services &mdash; but every participant must <b>hold
+locks</b> through the whole round trip, and if the coordinator dies after prepare,
+participants are <b>blocked</b> indefinitely.</p>
+<div class="newprob"><b>Bottleneck:</b> locks held across services kill throughput; coordinator failure blocks resources. Rarely scales.</div>
+<h4>Rung 2 — saga (compensations) ← the answer</h4>
 <pre class="mermaid">
 graph LR
   S1[reserve] --> S2[charge] --> S3[ship]
   S3 -.->|fail| C2[refund]
   C2 --> C1[release reservation]
 </pre>
-<p><b>Orchestration</b>: a central coordinator drives the steps and triggers
-compensations. <b>Choreography</b>: each service emits events the next reacts to. Each
-step records progress so a crashed saga can resume, and steps are made idempotent
-(<a href="../primitives/p9.html">P9</a>) so retries are safe.</p>
+<p>Run the steps as a sequence with <b>no global lock</b>; if a later step fails, run a
+<b>compensating</b> action to undo each completed step. <b>Orchestration</b> uses a central
+coordinator; <b>choreography</b> has each service emit events the next reacts to. Each step
+records progress (so a crashed saga resumes) and is idempotent (<a href="../primitives/p9.html">P9</a>).
+Worked, an order that fails at shipping:</p>
+<div class="estimate">reserve inventory   OK   (compensation ready: release)
+charge card         OK   (compensation ready: refund)
+book shipment       FAIL ->  run compensations in reverse:
+  refund card          OK
+  release inventory    OK
+  -> system back to a consistent state, no locks ever held across services</div>
 
 <h2 class="sec">3 &middot; The new bottleneck it hands you</h2>
 <div class="newprob">

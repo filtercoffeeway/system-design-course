@@ -22,21 +22,58 @@ document. An <b>inverted index</b> flips the data around: instead of document &r
 words, it stores word &rarr; list of documents (a <em>posting list</em>). Lookups
 become a set intersection instead of a full scan.</p>
 
-<h2 class="sec">2 &middot; How it works</h2>
+<h2 class="sec">2 &middot; Building the index — worked</h2>
+<p>Tokenize each document, normalize/stem, and for every term store a <b>posting list</b>
+of <code>(doc id, term frequency, positions)</code>. Three tiny docs:</p>
+<div class="estimate">d1: "the quick brown fox"
+d2: "the lazy brown dog sleeps all day in the brown grass"
+d3: "quick brown fox jumps"
+
+inverted index (term -> postings with positions):
+  brown -> [ (d1, tf1, @2), (d2, tf2, @2,9), (d3, tf1, @1) ]
+  fox   -> [ (d1, tf1, @3),                  (d3, tf1, @2) ]
+  quick -> [ (d1, tf1, @1),                  (d3, tf1, @0) ]</div>
 <pre class="mermaid">
 graph LR
   D[docs] --> T[tokenize + stem]
-  T --> I[("term -> posting list")]
-  Q[query: design] --> I
+  T --> I[("term → posting list")]
+  Q["query: brown fox"] --> I
   I --> R[doc ids + positions + tf]
+  R --> S[score &amp; rank]
 </pre>
-<p>Build: tokenize, normalize/stem, and for each term store a posting list of doc IDs
-with term frequency and positions (for phrase queries). Score with <b>TF-IDF</b> or
-<b>BM25</b> so rare, on-topic terms outweigh common ones. Crucially, indexes are
-written as <b>immutable segments</b> and merged in the background rather than updated
-in place &mdash; updating a posting list in place is too slow.</p>
+<p>A query <code>brown fox</code> is now an <b>intersection</b> of two short posting lists
+(<code>{d1,d2,d3}</code> ∩ <code>{d1,d3}</code> = <code>{d1,d3}</code>) plus a position
+check for the phrase &mdash; never a corpus scan. <b>Positions</b> are what let you answer
+&ldquo;<code>brown</code> immediately before <code>fox</code>&rdquo; (a phrase query).</p>
 
-<h2 class="sec">3 &middot; The new bottleneck it hands you</h2>
+<h2 class="sec">3 &middot; Ranking with BM25 — worked</h2>
+<p>Boolean match isn&rsquo;t enough; you need the <em>best</em> docs first. <b>BM25</b> scores
+each match by three intuitions: a term is worth more if it&rsquo;s <b>rare</b> across the
+corpus (IDF), more if it appears <b>often</b> in the doc (TF, with diminishing returns),
+and <b>less</b> if the doc is long (length normalization). For <code>brown fox</code> over
+the corpus above (k1=1.2, b=0.75, avgdl=6.33):</p>
+<div class="estimate">idf(brown)=0.134  (in all 3 docs → common → low)
+idf(fox)  =0.470  (in 2 of 3 → rarer → higher)
+
+  doc1 "the quick brown fox"          (len 4)  -> BM25 = 0.711
+  doc3 "quick brown fox jumps"        (len 4)  -> BM25 = 0.711
+  doc2 "...brown...brown grass"       (len 11) -> BM25 = 0.152</div>
+<p>Notice the mechanics fall out: d1 and d3 win because they contain the <em>rare</em>
+term <code>fox</code>; d2 has <code>brown</code> twice but no <code>fox</code> and is long,
+so length normalization pushes it far down. The rare term dominates the ranking &mdash;
+exactly what you want.</p>
+
+<h2 class="sec">4 &middot; Compression &amp; immutable segments</h2>
+<p>Posting lists are huge (every term &rarr; every doc that has it), so they&rsquo;re
+compressed. Doc ids in a posting list are sorted, so store <b>gaps (delta) + varint</b>:</p>
+<div class="estimate">doc ids:  3, 7, 8, 9, 40, 41, 200
+deltas:   3, 4, 1, 1, 31,  1, 159    -> small ints -> ~1 byte each (varint) vs 4-byte ids</div>
+<p>And the index is written as <b>immutable segments</b>, merged in the background, never
+updated in place &mdash; rewriting a posting list on every doc would be far too slow. This
+is the same LSM-style write pattern as <a href="p17.html">P17</a>: append small segments,
+compact later.</p>
+
+<h2 class="sec">5 &middot; The new bottleneck it hands you</h2>
 <div class="newprob">
 <p><b>Near-real-time gap:</b> a freshly written document isn&rsquo;t searchable until the
 next refresh creates a new segment (seconds, not milliseconds). <b>Distributed IDF:</b>
@@ -46,7 +83,7 @@ which is why relevance can look wrong on small/skewed indexes. Plus the index it
 costs storage proportional to vocabulary &times; postings.</p>
 </div>
 
-<h2 class="sec">4 &middot; Real-world example</h2>
+<h2 class="sec">6 &middot; Real-world example</h2>
 <div class="example">
 <span class="tag">Apache Lucene (Elasticsearch / Solr)</span>
 <p>Lucene &mdash; the engine inside Elasticsearch and Solr &mdash; stores the index as
@@ -59,19 +96,19 @@ direct ancestor of how <a href="../systems/s6.html">Datadog</a> indexes its tag 
 <a href="../systems/s7.html">Elasticsearch</a> scales search.</p>
 </div>
 
-<h2 class="sec">5 &middot; Applying it in a design</h2>
+<h2 class="sec">7 &middot; Applying it in a design</h2>
 <p>Reach for an inverted index for full-text, faceted search, or high-cardinality tag
 lookups. Mention the gap: <i>"writes are searchable after a ~1s refresh, and I&rsquo;ll
 account for distributed IDF when ranking across shards."</i></p>
 
-<h2 class="sec">6 &middot; Pitfalls</h2>
+<h2 class="sec">8 &middot; Pitfalls</h2>
 <ul>
 <li>Expecting in-place updates / instant searchability.</li>
 <li>Ignoring merge cost (write amplification from constant merging).</li>
 <li>Assuming local shard scores are globally comparable.</li>
 </ul>
 
-<h2 class="sec">7 &middot; Further reading</h2>
+<h2 class="sec">9 &middot; Further reading</h2>
 <ul>
 <li><a href="https://lucene.apache.org/core/">Apache Lucene</a> &middot; <a href="https://www.elastic.co/blog/found-elasticsearch-from-the-bottom-up">Elasticsearch from the bottom up</a></li>
 </ul>

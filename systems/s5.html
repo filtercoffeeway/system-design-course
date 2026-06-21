@@ -12,19 +12,27 @@
 
 <hr>
 
-<h2 class="sec">1 &middot; Requirements &amp; scale</h2>
-<p><b>Functional:</b> store and retrieve arbitrarily large blobs by key
-(<code>PUT</code>/<code>GET</code>/<code>DELETE</code>), list, with access control.
-<b>Non-functional:</b> effectively infinite capacity, extreme durability, high
-throughput &mdash; but no in-place edits and no transactions.</p>
-<div class="estimate">Back-of-envelope
-trillions of objects, exabytes total
-durability target                           ~ 99.999999999% (11 nines)
-object sizes                                 bytes -> terabytes (need multipart)
-read/write                                   massively parallel, region-local
-</div>
+<h2 class="sec">1 &middot; Requirements</h2>
+<p><b>Functional:</b> <code>PUT</code>/<code>GET</code>/<code>DELETE</code>/<code>LIST</code>
+arbitrarily large blobs by key, with access control. <b>Non-functional:</b> effectively
+infinite capacity, extreme durability (11 nines), high throughput &mdash; and explicitly
+<b>no in-place edits, no transactions</b>.</p>
+<div class="estimate">trillions of objects, exabytes total
+durability target  ~ 99.999999999% (11 nines) = lose ~1 object per 10^11 per year
+object sizes       bytes -> terabytes  (need multipart upload)
+access             massively parallel, region-local, read-heavy + immutable</div>
 
-<h2 class="sec">2 &middot; High-level architecture</h2>
+<h2 class="sec">2 &middot; API &amp; data model</h2>
+<div class="estimate">PUT  /bucket/key      (body = bytes)            -> 200, version-id
+GET  /bucket/key                                  -> bytes
+DELETE /bucket/key ; LIST /bucket?prefix=...
+multipart: InitiateMultipartUpload -> UploadPart(n) x N -> Complete</div>
+<p>Two planes: a <b>metadata/index service</b> (key &rarr; chunk locations, size, version,
+ACL &mdash; small, mutable, transactional, lives in a KV/DB) and a <b>data plane</b> (the
+immutable bytes, erasure-coded across nodes). Keeping mutable metadata out of the data
+plane is the central design move.</p>
+
+<h2 class="sec">3 &middot; High-level architecture</h2>
 <pre class="mermaid">
 graph LR
   C[client] --> FE[API / front-end]
@@ -32,35 +40,65 @@ graph LR
   FE --> DATA[(storage nodes: erasure-coded chunks)]
   IDX -->|object -> chunk locations| FE
 </pre>
-<p>A metadata service maps keys to chunk locations; data is split into chunks, encoded
-for durability, and spread across many nodes/racks. The API layer enforces auth and
-assembles objects.</p>
 
-<h2 class="sec">3 &middot; The hard constraint, in depth</h2>
-<div class="hard"><p>You get durability and scale almost free, but <b>zero
-transactionality and no in-place mutation</b>. An object is replaced whole, not edited;
-there are no multi-object transactions. Every design that tries to use an object store
-like a database (frequent small updates, read-modify-write loops) fails. You build
-<em>around</em> it: write new versions, keep an external index/DB for mutable metadata,
-and treat objects as immutable.</p></div>
+<h2 class="sec">4 &middot; Durability — the ladder</h2>
+<h4>Rung 0 — one copy</h4>
+<p>Store the object once. A single disk failure loses it. Disks fail constantly at fleet
+scale, so this is a non-starter.</p>
+<div class="newprob"><b>Bottleneck:</b> no fault tolerance.</div>
+<h4>Rung 1 — N&times; replication</h4>
+<p>Keep 3 full copies on different nodes/AZs. Survives 2 losses, dead simple, and a read
+just grabs any copy. But it <b>triples storage</b> &mdash; at exabyte scale, 200% overhead
+is enormous money.</p>
+<div class="newprob"><b>Bottleneck:</b> 3&times; storage cost; you&rsquo;re paying for whole duplicate copies.</div>
+<h4>Rung 2 — erasure coding ← the answer</h4>
+<p>Split the object into <b>k</b> data + <b>m</b> parity chunks; <b>any k of the k+m</b>
+reconstruct it (Reed-Solomon). The math beats replication on <em>both</em> axes:</p>
+<div class="estimate">                overhead   survives   to store 1 PB
+  3x replication   3.0x       2 losses    3 PB
+  (10,4) erasure   1.4x       4 losses    1.4 PB
+  -> erasure coding survives MORE failures at LESS than half the storage</div>
+<div class="newprob"><b>Bottleneck (accepted):</b> a read of a missing chunk must fetch k
+chunks and recompute (CPU + cross-node latency) &mdash; a <b>degraded read</b>. So small
+hot objects sometimes still use replication; big cold blobs use erasure coding.</div>
 
-<h2 class="sec">4 &middot; Component deep dives</h2>
-<h3>Erasure coding vs replication (P17)</h3>
-<p>Instead of storing 3 full copies, split an object into <em>k</em> data + <em>m</em>
-parity chunks (e.g. 10+4): any 10 of 14 reconstruct it, surviving 4 losses while
-storing ~1.4&times; instead of 3&times;. The cost is CPU + latency to reconstruct on a
-degraded read.</p>
-<h3>Consistency</h3>
-<p>Historically eventually-consistent listings; modern S3 offers read-after-write
-consistency for new objects. Know what your store guarantees &mdash; it shapes
-correctness.</p>
-<h3>Large objects &amp; access</h3>
+<h2 class="sec">5 &middot; The write &amp; read paths</h2>
+<div class="estimate">PUT object (10,4):
+  front-end auth -> split into 10 data chunks -> compute 4 parity (Reed-Solomon)
+  scatter the 14 chunks across 14 nodes in different racks/AZs
+  record chunk locations in the metadata service -> ACK
+GET object:
+  metadata -> chunk locations; fetch any 10 of 14 in parallel -> assemble
+  if a node is down: fetch 10 of the surviving 13, recompute the missing chunk (degraded read)</div>
 <p><b>Multipart upload</b> splits a huge object into parts uploaded in parallel and
-assembled server-side (you can&rsquo;t stream 5&nbsp;TB in one request).
-<b>Presigned URLs</b> grant temporary, scoped access so clients upload/download
-directly without proxying bytes through your service.</p>
+assembled server-side (you can&rsquo;t stream 5&nbsp;TB in one request). <b>Presigned URLs</b>
+grant temporary scoped access so clients upload/download <em>directly</em> to the data
+plane without proxying terabytes through your API.</p>
 
-<h2 class="sec">5 &middot; Real-world example</h2>
+<h3>The metadata service &mdash; its own scaling ladder</h3>
+<p>The index (<code>key &rarr; chunk locations, size, version, ACL</code>) is small per
+object but there are <b>trillions</b> of them, so it has its own derivation. A
+<b>single SQL table</b> is the right default &mdash; until trillions of rows blow past one
+node&rsquo;s index. Since access is a pure keyed lookup (<code>GET /bucket/key</code>), the
+ladder lands exactly where <a href="s14.html">S14 §4</a> and <a href="s3.html">S3</a> land:
+a <b>sharded KV / wide-column store</b> partitioned by key. <b>LIST</b> is the wrinkle &mdash;
+prefix scans want keys ordered, so the metadata store is usually <b>range-partitioned by
+key</b> (not hash), which reintroduces the hot-shard risk for a popular prefix
+(<a href="../primitives/p2.html">P2</a>).</p>
+<div class="estimate">tiny objects problem: a 1 KB object still needs a metadata row (~hundreds of bytes)
+  -> billions of tiny objects make METADATA, not data, the bottleneck
+  -> mitigations: pack small objects into larger blobs; charge/throttle per-request</div>
+
+<h2 class="sec">6 &middot; The hard constraint, in depth</h2>
+<div class="hard"><p>You get durability and scale almost free, but <b>zero transactionality
+and no in-place mutation</b>. An object is replaced whole, never edited; there are no
+multi-object transactions. Every design that tries to use an object store like a database
+(frequent small updates, read-modify-write loops) fails. You build <em>around</em> it:
+write new versions, keep mutable state in the external index/DB, treat objects as
+immutable. Modern S3 gives <b>read-after-write</b> consistency for new objects &mdash; know
+exactly what your store guarantees, because it shapes correctness.</p></div>
+
+<h2 class="sec">7 &middot; Real-world example</h2>
 <div class="example">
 <span class="tag">Amazon S3</span>
 <p>S3 is designed for <b>11 nines</b> of durability, achieved by redundantly storing
@@ -73,13 +111,15 @@ edits). It is the canonical "durable, scalable, but not a database" service that
 systems (<a href="../systems/s16.html">video</a>, <a href="../systems/s6.html">Datadog</a> cold tier) build upon.</p>
 </div>
 
-<h2 class="sec">6 &middot; Tradeoffs &amp; alternatives</h2>
+<h2 class="sec">8 &middot; Tradeoffs &amp; alternatives</h2>
 <p>Erasure coding saves storage but slows degraded reads vs replication; pick by
-read-latency sensitivity. For mutable, transactional, small-record data use a
-<a href="../systems/s3.html">KV store</a> or <a href="../systems/s4.html">RDBMS</a>; use the object store for the big
-immutable blobs and keep pointers in the DB.</p>
+read-latency sensitivity (hot small objects → replicate; cold large blobs → erasure-code).
+For mutable, transactional, small-record data use a <a href="../systems/s3.html">KV store</a> or
+<a href="../systems/s4.html">RDBMS</a>; use the object store for the big immutable blobs and
+keep pointers in the DB. Tiering across storage classes by access-frequency decay is the
+<a href="../primitives/p8.html">P8</a> dial.</p>
 
-<h2 class="sec">7 &middot; Key talking points</h2>
+<h2 class="sec">9 &middot; Key talking points</h2>
 <ul>
 <li>Lead with: <i>"durable + infinite, but immutable and non-transactional."</i></li>
 <li>Erasure coding for durability at lower storage cost (<a href="../primitives/p17.html">P17</a>).</li>
@@ -88,7 +128,7 @@ immutable blobs and keep pointers in the DB.</p>
 <li>Tiering via storage classes (<a href="../primitives/p8.html">P8</a>).</li>
 </ul>
 
-<h2 class="sec">8 &middot; Further reading</h2>
+<h2 class="sec">10 &middot; Further reading</h2>
 <ul>
 <li><a href="https://aws.amazon.com/s3/">Amazon S3</a> &middot; <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/Welcome.html">S3 developer guide</a></li>
 </ul>

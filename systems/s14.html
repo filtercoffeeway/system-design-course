@@ -12,80 +12,374 @@
 
 <hr>
 
-<h2 class="sec">1 &middot; Requirements &amp; scale</h2>
-<p><b>Functional:</b> shorten a long URL to a short code; redirect the code to the
-original; optional analytics. <b>Non-functional:</b> redirects are read-heavy and must
-be sub-millisecond; codes are globally unique and never collide.</p>
-<div class="estimate">Back-of-envelope
-100,000,000 new links/day                    ~ 1,200 writes/s
-read:write ~ 1000:1                            ~ 1,200,000 redirects/s
-code space: 62^7                              ~ 3.5x10^12 (7 base62 chars is plenty)
-storage: 100M/day x 365 x ~500 B             ~ 18 TB/yr (fits sharded KV)
-</div>
+<h2 class="sec">1 &middot; Requirements</h2>
+<p><b>Functional.</b> (1) <code>shorten(longUrl)</code> returns a short code; (2)
+<code>GET /{code}</code> redirects to the original URL; (3) optional custom/vanity
+aliases; (4) optional expiry; (5) click analytics. <b>Out of scope</b> for the core
+design: editing a link&rsquo;s target, user accounts &mdash; mention them, then set aside.</p>
+<p><b>Non-functional</b> &mdash; these are what actually shape the design:</p>
+<div class="tablewrap"><table>
+<tr><th>Property</th><th>Target</th><th>Why it matters</th></tr>
+<tr><td>Read latency</td><td>p99 &lt; ~10&nbsp;ms end-to-end; lookup itself sub-ms</td><td>A redirect sits in the user&rsquo;s click path; every ms is felt.</td></tr>
+<tr><td>Read:write ratio</td><td>~100:1 to 1000:1</td><td>Reads dominate by orders of magnitude &rarr; optimise the read path above all.</td></tr>
+<tr><td>Availability</td><td>Redirects ~99.99%; shorten can be lower</td><td>A dead redirect breaks every link ever shared. Reads &gt; writes in priority.</td></tr>
+<tr><td>Uniqueness</td><td>Codes globally unique, never reissued</td><td>A collision silently sends a user to the wrong site.</td></tr>
+<tr><td>Durability</td><td>Mapping must never be lost</td><td>Links live for years; losing one is a dead link forever.</td></tr>
+</table></div>
 
-<h2 class="sec">2 &middot; High-level architecture</h2>
+<h2 class="sec">2 &middot; Capacity estimation</h2>
+<p>Numbers first &mdash; they justify every later choice. Assume 100M new links/day.</p>
+<div class="estimate">WRITES
+  100,000,000 new links/day  / 86,400 s   &asymp; 1,160 writes/s   (peak ~3-5x &rarr; ~5k/s)
+
+READS  (redirects)
+  read:write 100:1                          &asymp; 116,000 redirects/s
+  read:write 1000:1 (viral)                 &asymp; 1,160,000 redirects/s
+
+STORAGE
+  row &asymp; 500 B (code, long URL, owner, created_at, expiry)
+  100M/day x 365 x 500 B                     &asymp; 18.2 TB/yr   (sharded KV / partitioned SQL)
+
+CODE SPACE  (base62 = [0-9a-zA-Z])
+  62^6 =        56,800,235,584   (~57 B)  &rarr; ~1.5 yr of links at 100M/day
+  62^7 =     3,521,614,606,208   (~3.5 T) &rarr; ~96 yr at 100M/day   &larr; pick 7 chars
+  62^8 =   218,340,105,584,896
+
+CACHE
+  hot set &asymp; 0.1% of a day's links = ~100,000 links x ~100 B  &asymp; 10 MB fits in RAM
+  even the full day (100M x 100 B = 10 GB) fits a small Redis cluster</div>
+<p>The takeaways that drive the rest: reads dwarf writes (so this is a caching
+problem), 7 base62 chars is the sweet spot, and the hot working set is tiny enough
+to live entirely in memory.</p>
+
+<h2 class="sec">3 &middot; API design</h2>
+<div class="estimate">POST /api/shorten
+  body : { "longUrl": "https://...", "customAlias"?: "go/launch", "expiry"?: ts }
+  200  : { "shortUrl": "https://sho.rt/15FTGg", "code": "15FTGg" }
+  409  : custom alias already taken
+
+GET /{code}                       &rarr;  302 Location: &lt;longUrl&gt;   (or 301; see tradeoffs)
+  404 if unknown/expired</div>
+<p>The shorten endpoint is a normal JSON POST; the redirect is a bare
+<code>GET /{code}</code> so the short link is just <code>https://sho.rt/15FTGg</code> with
+nothing extra in the path.</p>
+
+<h2 class="sec">4 &middot; Data model &amp; store selection</h2>
+<p>The schema is trivial &mdash; one row per link, looked up by its code:</p>
+<div class="estimate">links               (primary key = code)
+  code        VARCHAR(7)   PK     "15FTGg"
+  long_url    TEXT                "https://example.com/very/long/path?x=1"
+  owner_id    BIGINT
+  created_at  TIMESTAMP
+  expiry_at   TIMESTAMP   NULL
+  -- custom aliases live in the same table; the alias IS the code</div>
+<p>The interesting question is <em>which store</em> &mdash; and the honest answer is
+&ldquo;<b>start with SQL and escalate only when it actually breaks</b>,&rdquo; not &ldquo;NoSQL
+because it&rsquo;s web-scale.&rdquo;</p>
+
+<h4>Rung 0 — a single SQL table <span style="font-weight:400">(right default; fine for ages)</span></h4>
+<p>One Postgres/MySQL table, <code>code</code> as primary key. The access pattern is a
+<b>point lookup on the PK</b> &mdash; the single thing every database is fastest at; SQL
+does it as well as anything. At thousands of writes/s and tens of millions of rows this
+is completely adequate. Don&rsquo;t reach further yet.</p>
+<div class="newprob"><b>Bottleneck (where SQL breaks &mdash; and note <em>why</em>):</b> it&rsquo;s
+not the query shape, it&rsquo;s <b>volume on one node</b>. At 100M links/day that&rsquo;s ~36&nbsp;B
+rows and ~18&nbsp;TB/yr &mdash; past one machine&rsquo;s disk and, more importantly, past the RAM
+that holds the index. The PK is a random 7-char code, so the B-tree index has <b>no insert
+locality</b>: once it exceeds memory, each insert and each lookup risks a random disk seek,
+and the single primary caps write throughput. Vertical scaling buys time, then stops.</div>
+
+<h4>Rung 1 — read replicas <span style="font-weight:400">(reads scale, writes don't)</span></h4>
+<p>Redirects are 99%+ of traffic, so fan reads out to replicas. This is real headroom &mdash;
+but it does nothing for write volume or the fact that the <b>whole dataset still must fit
+on the primary</b>. It&rsquo;s a patch, not the fix.</p>
+<div class="newprob"><b>Bottleneck:</b> one primary still owns every write and the full
+18&nbsp;TB. You have to split the data itself.</div>
+
+<h4>Rung 2 — shard by code → and now SQL earns you nothing</h4>
+<p>Partition the rows across N nodes by <code>hash(code)</code>. That solves volume and
+write throughput. But look at what SQL is now giving you: <b>no joins</b> (one table), <b>no
+multi-row transactions</b> (every op is one key), <b>no range scans</b> (codes are random).
+You&rsquo;ve reduced a relational database to a <b>distributed hash map</b> &mdash; and you&rsquo;re
+hand-rolling the sharding, rebalancing, and cross-node replication yourself.</p>
+
+<h4>Rung 3 — a KV / wide-column store <span style="font-weight:400">(← pick)</span></h4>
+<p>A purpose-built KV / wide-column store (<a href="../systems/s3.html">DynamoDB /
+Cassandra</a>) <em>is</em> a sharded hash map: <code>code</code> as the partition key gives
+single-partition O(1) lookups, with horizontal partitioning, replication, and rebalancing
+built in (<a href="../primitives/p2.html">P2</a>). You arrive here not because &ldquo;URL
+shorteners use NoSQL&rdquo; but because the <b>access pattern is pure keyed lookup and the only
+thing SQL still offered was features this workload never uses</b>.</p>
+<div class="tablewrap"><table>
+<tr><th>Rung</th><th>Good until</th><th>Breaks on</th></tr>
+<tr><td>Single SQL table</td><td>~thousands w/s, index fits RAM</td><td>Index &gt; memory → random-seek inserts; one-node write cap</td></tr>
+<tr><td>+ read replicas</td><td>read-heavy growth</td><td>Writes + full dataset still on one primary</td></tr>
+<tr><td>Sharded SQL</td><td>volume &amp; writes scale</td><td>You&rsquo;re running a hash map by hand; SQL features unused</td></tr>
+<tr><td>KV / wide-column (← pick)</td><td>scales horizontally by key</td><td>(accepted) no joins/scans — but we never needed them</td></tr>
+</table></div>
+<div class="note"><b>Different access pattern, different landing rung.</b> This ladder ends at
+KV because the access is keyed point-lookup. If instead the workload were <b>analytical
+scans over a few columns of many rows</b> (e.g. the click-analytics table, or
+<a href="../systems/s6.html">metrics</a>), a row store dies on <b>scan I/O</b> &mdash; it reads
+whole rows to touch two columns &mdash; and the ladder lands on a <b>columnar</b> store
+(<a href="../primitives/p8.html">P8</a>) instead. The store follows the access pattern, not
+fashion.</div>
+<p>So the mapping table is KV; <b>analytics live elsewhere</b> &mdash; click events go to a
+separate pipeline (below), keeping the hot redirect table small and read-mostly.</p>
+
+<h2 class="sec">5 &middot; High-level architecture</h2>
 <pre class="mermaid">
 graph LR
-  U[user] --> CDN[CDN / edge cache]
-  CDN -->|hit| U
+  U[user click] --> CDN[CDN / edge cache]
+  CDN -->|hit ~edge| U
   CDN -->|miss| SVC[redirect service]
-  SVC --> CACHE[(Redis)]
-  CACHE -->|miss| KV[(sharded KV: code -> URL)]
-  SHORTEN[shorten API] --> KGS[key-gen service] --> KV
+  SVC --> CACHE[(Redis: code-&gt;URL)]
+  CACHE -->|miss| KV[(sharded KV: code-&gt;URL)]
+  W[shorten API] --> KGS[key-gen service] --> KV
+  SVC -.click event.-> Q[[queue]] --> AGG[analytics]
 </pre>
+<p>Two independent paths share the KV store. The <b>write path</b> (shorten) mints a
+code and persists the mapping. The <b>read path</b> (redirect) is a cache cascade:
+CDN &rarr; Redis &rarr; KV, where almost every request is answered before it reaches
+the store. A dotted async path peels click events off to analytics without touching
+the redirect&rsquo;s latency budget.</p>
 
-<h2 class="sec">3 &middot; The hard constraint, in depth</h2>
-<div class="hard"><p>The lookup must be <b>sub-millisecond</b> at enormous read volume,
-so a CDN/Redis cache at the edge <em>is</em> the read architecture (<a href="../primitives/p4.html">P4</a>,
-<a href="../primitives/p11.html">P11</a>). The backing store barely matters because almost every read is a
-cache hit on a small set of hot links. This is fundamentally a caching problem, not a
-storage problem.</p></div>
+<h2 class="sec">6 &middot; Code generation — the escalation ladder</h2>
+<p>This is the one genuinely interesting decision, and the right way to reach the
+answer is <b>not</b> to memorise &ldquo;use a key-gen service.&rdquo; Start with the simplest
+thing, find the load that kills it, and let each bottleneck push you to the next rung.
+Whatever produces the number, it&rsquo;s <b>base62-encoded</b> into the short code &mdash;
+<code>[0-9a-zA-Z]</code>, ~5.95 bits/char, so 7 chars address 3.5&nbsp;trillion links:</p>
+<div class="estimate">counter        base62 code     chars
+        125  -&gt;  "21"             2
+  1,000,000  -&gt;  "4c92"           4
+  1,000,000,000 -&gt; "15FTGg"       6
+ 56,800,235,583 -&gt; "ZZZZZZ"       6   &larr; last 6-char code (= 62^6 - 1)
+ 56,800,235,584 -&gt; "1000000"      7   &larr; rolls over to 7 chars cleanly
+3,500,000,000,000 -&gt; "ZCpdjxe"    7</div>
 
-<h2 class="sec">4 &middot; Component deep dives</h2>
-<h3>Code generation</h3>
-<p>Two approaches: <b>hash-and-check</b> (hash the URL, take N chars, retry on
-collision) or a <b>key-generation service</b> that pre-generates unique base62 codes and
-hands them out in batches (no collision checks on the hot path). Base62 (a-z,A-Z,0-9)
-keeps codes short and URL-safe; 7 chars covers trillions.</p>
-<h3>Read path (P4/P11)</h3>
-<p>Edge CDN &rarr; Redis &rarr; sharded KV, in that order; the vast majority of redirects
-never reach the KV store.</p>
-<h3>301 vs 302</h3>
-<p><b>301</b> (permanent) is cached by browsers forever &mdash; cheapest for you but you
-lose per-click analytics; <b>302</b> (temporary) always returns to your server &mdash;
-more load but you count every click. Choose by whether analytics matter.</p>
-<h3>Analytics</h3>
-<p>Each redirect emits a click event into the same ingestion pattern as
-<a href="../systems/s6.html">Datadog</a> (batch &rarr; queue &rarr; aggregate), kept off the redirect hot
-path.</p>
+<h3>Rung 0 — DB auto-increment <span style="font-weight:400">(good to ~a few k writes/s)</span></h3>
+<p><code>INSERT</code> the link, let the database hand back an auto-increment
+<code>BIGINT</code>, base62 it. <b>At 10 rps this is completely fine &mdash; ship it.</b>
+Unique, sortable, zero extra infrastructure.</p>
+<div class="newprob"><b>Bottleneck:</b> one node&rsquo;s write path caps at roughly a few
+thousand inserts/s (WAL + fsync bound), and it&rsquo;s a single point of failure. Worse, the
+moment you <b>shard</b> the database to scale writes, each shard&rsquo;s counter starts at 1,
+so two shards mint the <b>same</b> id &mdash; auto-increment doesn&rsquo;t survive sharding.
+And every shorten now waits on a durable DB write.</div>
 
-<h2 class="sec">5 &middot; Real-world example</h2>
+<h3>Rung 1 — Redis <code>INCR</code> <span style="font-weight:400">(good to ~100k/s)</span></h3>
+<p>Move the counter to a single in-memory atomic counter: <code>INCR url:seq</code>.
+~100k+ ops/s, decoupled from the durable write. Plenty for 1,160 writes/s with headroom.</p>
+<div class="newprob"><b>Bottleneck:</b> it&rsquo;s now one Redis node &mdash; a single point of
+failure and a single throughput ceiling &mdash; and <b>every shorten pays a network
+round-trip</b> to it. You can replicate Redis, but a counter can&rsquo;t be naively
+replicated (two replicas would re-issue numbers), so you&rsquo;re back to one hot node.</div>
+
+<h3>Rung 2 — Range / batch leasing <span style="font-weight:400">(scales ~linearly)</span></h3>
+<p>Stop asking for one id at a time. Each app server <b>leases a block</b> of, say, 1,000
+counter values (8,000,000&ndash;8,000,999) from a coordinator
+(<a href="../primitives/p10.html">P10</a> &mdash; a DB row, ZooKeeper, or etcd) and serves
+codes from RAM with <b>no coordination</b> until the block runs out. That turns a
+per-write lock into a per-1,000-writes lock &mdash; a <b>1000&times;</b> drop in
+coordination. At our load the coordinator sees ~1 lease/sec, not 1,160 ops/sec. Add app
+servers and throughput scales linearly; collisions are <b>impossible by construction</b>
+because ranges are disjoint, so the redirect path never checks uniqueness. <b>This is the
+right answer for a URL shortener</b> &mdash; and notice we <em>derived</em> the &ldquo;central
+key-gen service,&rdquo; we didn&rsquo;t assume it.</p>
+<div class="newprob"><b>Residual costs (acceptable here):</b> a server that crashes mid-block
+leaves a gap in the id space (harmless &mdash; we have trillions), and ids are only
+<em>roughly</em> time-ordered across servers, not strictly. For a URL shortener neither
+matters.</div>
+
+<h3>When the requirement is different — Snowflake</h3>
+<p>If you didn&rsquo;t need <em>short</em> codes but did need <b>distributed, time-sortable</b>
+ids with zero per-id coordination (order ids, event ids), the ladder ends one rung
+further at a <b>Snowflake</b> id: <code>[41-bit ms timestamp][10-bit machine id][12-bit
+seq]</code> = a 64-bit int generated entirely locally, ~4,096 ids/ms/node (~4M/s/node),
+sortable by time. Its cost is the bit you trade for going fully coordination-free:
+machine-id assignment and clock-skew handling. It&rsquo;s a poor fit here only because 64
+bits is ~11 base62 chars &mdash; longer than we want for a human-facing link.</p>
+
+<h3>The ladder, at a glance</h3>
+<div class="tablewrap"><table>
+<tr><th>Rung</th><th>Good until</th><th>Breaks on</th></tr>
+<tr><td>DB auto-increment</td><td>~few k writes/s, single node</td><td>SPOF; collides when you shard</td></tr>
+<tr><td>Redis INCR</td><td>~100k/s</td><td>Single hot node; RTT per id</td></tr>
+<tr><td>Range leasing (← pick)</td><td>scales with app servers</td><td>id gaps; only roughly ordered</td></tr>
+<tr><td>Snowflake</td><td>~4M/s/node, no coordination</td><td>needs machine ids + clock sync; 64-bit (long)</td></tr>
+</table></div>
+<p><b>Alternative family &mdash; hash-and-check:</b> instead of a counter, hash the long URL
+(SHA/MD5), take the first 7 base62 chars, retry with a salt on the rare collision.
+Stateless and gives the same URL the same code (natural dedup), but every write does a
+<code>read-before-write</code> to detect collisions, and birthday math makes those
+non-trivial as the table grows &mdash; which is why counter+ranges is usually preferred
+unless content-deduplication is itself a requirement.</p>
+<div class="note"><b>Production failure modes &amp; failover.</b> Each rung has a failure mode
+as well as a throughput ceiling; the containing mechanisms are detailed in the primitives,
+so they&rsquo;re not repeated here:
+<ul>
+<li><b>Counter:</b> must never fail over to a lagging replica &mdash; a promoted replica
+re-issues already-used ids. Needs a consensus-backed counter &rarr; <a href="../primitives/p10.html">P10</a>.</li>
+<li><b>Range leasing:</b> the high-water mark must be allocated through consensus or a
+coordinator failover double-issues ranges; and a server keeps minting from its <em>local</em>
+block while the coordinator is briefly down (graceful degradation) &rarr; <a href="../primitives/p10.html">P10</a>, <a href="../primitives/p16.html">P16</a>.</li>
+<li><b>Snowflake:</b> backward clock jumps (refuse-to-issue + leap smearing) and machine-id
+collisions (lease worker ids from ephemeral nodes) &rarr; <a href="../primitives/p10.html">P10</a>.</li>
+<li><b>Retries</b> minting duplicate ids are deduped with an idempotency key &rarr; <a href="../primitives/p9.html">P9</a>.</li>
+</ul></div>
+
+<h3>Scenario — what happens when the KGS is down</h3>
+<p>&ldquo;The key-gen service is down&rdquo; means the <b>coordinator</b> that hands out blocks
+is unreachable &mdash; not the app servers. Because each server already holds a leased block
+of ~1,000 values in RAM and mints from it with <b>no coordination</b>, writes keep
+succeeding through the outage. You only feel it when a server <em>drains its block</em> and
+tries to lease the next one. So the design degrades by rung:</p>
+<ul>
+<li><b>Short outage &mdash; ride it out for free.</b> Size blocks generously and
+<b>pre-fetch the next block before the current one drains</b>. The local buffer absorbs any
+realistic coordinator-recovery window and no write ever stalls. At ~1.16k writes/s a
+1,000-value block lasts ~0.86s per server, so pre-fetching (or leasing 100k-value blocks
+&rarr; ~86s of runway) covers a normal failover. This is the simplest fix and costs no new
+code.</li>
+<li><b>Long outage &mdash; namespaced hash-and-check fallback.</b> If an outage could outlast
+the buffer, fall back to the stateless <code>hash(long_url)</code> family (needs only the
+store, not the coordinator). The trap: hash codes scatter uniformly across the same 7-char
+space, and the counter path <em>never checks uniqueness</em> &mdash; so a fallback code can
+collide with a range the counter leases later, and the counter won&rsquo;t catch it. Fix by
+making the spaces <b>disjoint</b>: give fallback codes a reserved prefix or 8th char the
+counter never emits. Collision-free-by-construction survives the switch; read-before-write
+lives only on the fallback path.</li>
+</ul>
+<div class="newprob"><b>The real danger isn&rsquo;t &ldquo;down,&rdquo; it&rsquo;s bad
+failover.</b> If the coordinator fails over without durably committing its high-water mark,
+the new coordinator re-issues a range that&rsquo;s already out &rarr; duplicate codes. That
+is why the high-water mark must move through consensus
+(<a href="../primitives/p10.html">P10</a>), not just &ldquo;make the coordinator HA.&rdquo;</div>
+
+<h2 class="sec">7 &middot; The write path (shorten)</h2>
+<p>Client POSTs the long URL &rarr; app server takes the next code from its leased
+range (no coordination) &rarr; writes <code>code &rarr; long_url</code> to the KV store
+(<a href="../primitives/p9.html">idempotency key</a> from the client so a retried POST
+doesn&rsquo;t mint a second code) &rarr; returns <code>https://sho.rt/{code}</code>. For a
+custom alias, attempt an insert <em>if-not-exists</em> on the alias; a conflict returns
+409. Writes are ~1k/s &mdash; trivially handled.</p>
+
+<h2 class="sec">8 &middot; The read path — deriving the cache cascade</h2>
+<div class="hard"><p>The whole system lives or dies on redirect latency at ~10<sup>6</sup>
+reads/s. But don&rsquo;t <em>assert</em> &ldquo;put a CDN and Redis in front&rdquo; &mdash; derive it the
+same way, rung by rung.</p></div>
+<h4>Rung 0 — read straight from the store</h4>
+<p>Every redirect does a <code>GET code</code> against the KV store. Correct, and at low
+traffic completely fine.</p>
+<div class="newprob"><b>Bottleneck:</b> at ~1.16M reads/s the store needs enormous
+provisioning, and each read pays its full lookup + network latency on the user&rsquo;s click
+path. We&rsquo;re paying disk/replica cost for data that barely changes.</div>
+<h4>Rung 1 — an in-memory cache (Redis) in front (<a href="../primitives/p4.html">P4</a>)</h4>
+<p>Clicks follow a Zipfian distribution &mdash; a few viral links dominate &mdash; so the
+hot working set is tiny (~10&nbsp;MB, see capacity). Front the store with Redis and &gt;99%
+of reads are served from RAM; the KV store sees only a cold-link trickle (~5,800/s).</p>
+<div class="newprob"><b>Bottleneck:</b> a single viral link is <b>one key</b> &mdash; all its
+traffic lands on the <b>one Redis shard</b> that owns it (the <a href="../primitives/p2.html">P2</a>
+hot-key problem), and every read still crosses the network to your region.</div>
+<h4>Rung 2 — push to the edge / CDN (<a href="../primitives/p11.html">P11</a>) ← the architecture</h4>
+<p>Cache the 302 itself at the CDN edge, keyed by code, near the user. The truly viral
+links are absorbed at hundreds of edge POPs &mdash; no single node is a hotspot &mdash; and
+the redirect is answered geographically close, shaving the round-trip. The result is the
+three-tier cascade <b>CDN &rarr; Redis &rarr; KV</b>, which we <em>arrived at</em> by killing
+the hot-key and latency bottlenecks in turn.</p>
+<div class="tablewrap"><table>
+<tr><th>Rung</th><th>Good until</th><th>Breaks on</th></tr>
+<tr><td>Read from store</td><td>low read rate</td><td>~1M/s store cost; full latency per click</td></tr>
+<tr><td>+ Redis cache</td><td>hot set fits RAM (~10 MB)</td><td>viral link = one hot shard; in-region RTT</td></tr>
+<tr><td>+ CDN/edge (← pick)</td><td>planet-scale, viral-proof</td><td>(accepted) edge TTL vs invalidation freshness</td></tr>
+</table></div>
+<pre class="mermaid">
+sequenceDiagram
+  participant U as User
+  participant E as CDN/edge
+  participant R as Redis
+  participant K as KV store
+  U->>E: GET /15FTGg
+  alt edge hit
+    E-->>U: 302 Location (hot link)
+  else edge miss
+    E->>R: GET 15FTGg
+    alt redis hit (>99%)
+      R-->>E: long_url
+    else redis miss
+      R->>K: GET 15FTGg
+      K-->>R: long_url (populate)
+    end
+    E-->>U: 302 Location
+  end</pre>
+<div class="estimate">Cache math (why the store barely matters)
+  reads/s              &asymp; 1,160,000
+  hit ratio            &asymp; 99.5%
+  reads reaching KV    &asymp; 1,160,000 x 0.005  &asymp; 5,800/s   (a small KV shard set)</div>
+
+<h3>301 vs 302 — caching vs analytics</h3>
+<p>A <b>301 (permanent)</b> is cached by the browser and intermediaries indefinitely,
+so subsequent clicks never reach you &mdash; cheapest load, but you lose per-click
+analytics and can never change the target. A <b>302 (found/temporary)</b> comes back
+to your server every time &mdash; more load, but you count every click and retain
+control. Pick by whether analytics matter; most shorteners use 302 for exactly that
+reason.</p>
+
+<h3>Analytics pipeline</h3>
+<p>Each 302 emits a click event (code, timestamp, geo, referrer, UA) onto a queue,
+aggregated asynchronously &mdash; the same ingestion shape as
+<a href="../systems/s6.html">Datadog (S6)</a>: batch (<a href="../primitives/p1.html">P1</a>)
+&rarr; queue (<a href="../systems/s2.html">S2</a>) &rarr; roll-up. This is deliberately
+<b>off the redirect hot path</b>: the user is redirected immediately; counting happens
+behind the queue, so analytics load never inflates redirect latency.</p>
+
+<h2 class="sec">9 &middot; Scaling &amp; bottlenecks</h2>
+<p>The mapping table shards cleanly by <code>code</code> (the key is the shard key, so
+every lookup is single-partition &mdash; no scatter-gather). Redis scales by sharding
+the keyspace and adding read replicas for hot keys; the CDN absorbs the truly viral
+links so no single Redis node is a hotspot (<a href="../primitives/p2.html">P2</a>
+hot-key problem). The key-gen counter is the one global resource, and range-leasing is
+what keeps it from becoming a bottleneck. The analytics pipeline scales independently
+and can fall behind without affecting redirects.</p>
+
+<h2 class="sec">10 &middot; Tradeoffs &amp; alternatives</h2>
+<p><b>Counter vs hash</b>: ranges remove hot-path collisions at the cost of a key-gen
+service; hashing is stateless but pays a uniqueness read and leaks that the same URL
+maps to one code. <b>301 vs 302</b>: load vs analytics. <b>Vanity aliases</b> share the
+code namespace, so they need an if-not-exists insert and can&rsquo;t collide with generated
+codes (one trick: generate from a counter range that vanity codes are excluded from, or
+keep them in the same uniqueness check). <b>Expiry</b> adds a TTL and a sweeper, and the
+redirect must treat an expired row as a 404. <b>Predictability</b>: sequential counter
+codes are guessable/enumerable; if that matters, encrypt the counter (e.g. a Feistel
+permutation) before base62 so codes look random while staying collision-free.</p>
+
+<h2 class="sec">11 &middot; Real-world example</h2>
 <div class="example">
 <span class="tag">Bitly / TinyURL</span>
-<p>URL shorteners like Bitly serve billions of redirects and are built around exactly
-this shape: a tiny key&rarr;URL mapping fronted by aggressive caching/CDN so redirects
-are effectively cache hits, base62-style short codes, and a separate asynchronous
-analytics pipeline that counts clicks without slowing the redirect. The interesting
-engineering is all on the read/cache and analytics sides; the storage of the mapping is
-almost trivial.</p>
+<p>Bitly serves on the order of billions of redirects a month and is built around
+exactly this shape: a tiny <code>key&rarr;URL</code> mapping fronted by aggressive
+caching/CDN so redirects are effectively cache hits, short base62-style codes, and a
+separate asynchronous analytics pipeline that counts clicks without slowing the
+redirect. The interesting engineering is all on the read/cache and analytics sides;
+storing the mapping itself is nearly trivial &mdash; which is the whole lesson of this
+system.</p>
 </div>
 
-<h2 class="sec">6 &middot; Tradeoffs &amp; alternatives</h2>
-<p>Hash-and-check is stateless but needs collision handling; a key-gen service removes
-hot-path collisions but adds a component. 301 saves load but kills analytics. Custom
-vanity codes complicate uniqueness.</p>
-
-<h2 class="sec">7 &middot; Key talking points</h2>
+<h2 class="sec">12 &middot; Key talking points</h2>
 <ul>
-<li>It&rsquo;s a caching/read problem &mdash; CDN + Redis is the architecture (<a href="../primitives/p4.html">P4</a>, <a href="../primitives/p11.html">P11</a>).</li>
-<li>Base62 codes; key-gen service vs hash-and-check.</li>
-<li>301 vs 302 = caching vs analytics.</li>
-<li>Async click pipeline off the hot path (<a href="../systems/s6.html">S6</a> pattern).</li>
+<li>It&rsquo;s a <b>read/caching problem</b>, not a storage problem &mdash; CDN + Redis cascade is the architecture (<a href="../primitives/p4.html">P4</a>, <a href="../primitives/p11.html">P11</a>); >99% of reads never touch the store.</li>
+<li><b>Counter + base62 with range leasing</b> makes codes collision-free by construction and removes hot-path coordination; 7 chars = 3.5T codes = ~96 years of headroom.</li>
+<li>The <b>key is the shard key</b>, so every lookup is single-partition &mdash; no scatter-gather.</li>
+<li><b>301 vs 302</b> is the caching-vs-analytics tradeoff.</li>
+<li><b>Analytics ride an async pipeline</b> off the hot path (<a href="../systems/s6.html">S6</a> shape), so counting never slows a redirect.</li>
+<li>Capacity sanity: ~1k writes/s, ~1M reads/s, ~18&nbsp;TB/yr, ~10&nbsp;MB hot set.</li>
 </ul>
 
-<h2 class="sec">8 &middot; Further reading</h2>
+<h2 class="sec">13 &middot; Further reading</h2>
 <ul>
 <li><a href="https://www.educative.io/blog/system-design-tinyurl">System design: URL shortener (overview)</a></li>
+<li><a href="https://github.com/twitter-archive/snowflake">Twitter Snowflake</a> &mdash; distributed unique-ID generation (an alternative to a central counter).</li>
 </ul>
 
 <div class="prevnext"><a href="s13.html">&larr; S13 &middot; Distributed lock</a><a href="s15.html">S15 &middot; Ride-sharing &rarr;</a></div>

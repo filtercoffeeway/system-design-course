@@ -19,15 +19,26 @@
 <h2 class="sec">1 &middot; The problem it solves</h2>
 <p>In a request that fans out to many services or shards, the <em>average</em> is a
 lie: if each backend is usually fast but occasionally slow, the overall request is as
-slow as the slowest of N. At fan-out 100, a 1-in-100 slow event hits almost every
-request. Tail latency (p99, p999) is the real user experience.</p>
+slow as the slowest of N. The math is unforgiving:</p>
+<div class="estimate">each backend under its target latency 99% of the time:
+   1 backend   -> 99% of requests fast
+ 100 backends  -> 0.99^100 = 37% fast  -> 63% of requests see a slow backend</div>
+<p>So at fan-out 100 a 1-in-100 slow event hits almost every request &mdash; the tail
+(p99, p999), not the median, is the real user experience. You cannot fix this by making
+the median faster; you fight it with <b>redundancy</b>.</p>
 
-<h2 class="sec">2 &middot; How it works</h2>
+<h2 class="sec">2 &middot; How it works — hedging, and why it's cheap</h2>
 <p>Levers: <b>hedged requests</b> (send the request, and if no reply within, say, the
 p95, send a duplicate to another replica and take whichever returns first);
 <b>tied requests</b> (let replicas cancel each other once one starts); aggressive
 <b>timeouts + retry budgets</b>; <b>load shedding</b> (reject early when overloaded so
 you fail fast instead of degrading everyone); and request <b>prioritization</b>.</p>
+<p>The key insight is that hedging is <em>cheap</em> precisely because you only hedge the
+slow tail:</p>
+<div class="estimate">hedge only after the request misses p95:
+  -> only ~5% of requests ever send a second copy   = ~5% extra load
+  -> a hedged request is slow only if BOTH copies are slow: 0.05 x 0.05 = 0.25%
+  -> p99.9 collapses toward the median for a few % more total work</div>
 <pre class="mermaid">
 graph LR
   R[request] --> A[replica A]

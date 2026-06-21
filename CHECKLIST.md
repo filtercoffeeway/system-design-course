@@ -5,9 +5,13 @@ A page is **done** only when its `Full write-up` TODO card is replaced by a
 complete deep dive following the template, with at least one verified real-world
 example. Tick the box, update "Last touched", and add a changelog line.
 
-**Status:** all 35 pages have a first full draft. **Next up:** a review/polish
-pass — verify each real-world example's specifics against a current source,
-tighten prose, and add a second diagram where a page would benefit.
+**Status:** all 35 pages have a first full draft. **Depth pass in progress:**
+the first drafts are too high-level — named concepts (e.g. "Gorilla for time
+series") appear without mechanics. The depth pass adds, per page: worked
+byte/bit examples with real records, numeric walkthroughs, algorithm-level
+mechanics, and extra diagrams. **P8 done as the depth-pass template.**
+**Next up:** roll the same treatment across the remaining pages (start with the
+heaviest mechanics: P17, P5, P3, P6, S2, S6).
 
 Legend: `[x]` done · `[~]` in progress · `[ ]` not started
 
@@ -85,3 +89,12 @@ Progress: **35 / 35** pages have full write-ups.
   via batch generators (helpers.py + partA–D.py in the scratchpad), each with a
   diagram, a named real-world example, cross-links, and further reading. Removed
   all "interview" wording. Verified: 35/35 pages, 0 placeholders, 0 broken links.
+- 2026-06-20 — Began **depth pass**. Rewrote **P8** from ~250 to ~1630 words:
+  added the dictionary/RLE/delta/FoR encoding table with sample records, a full
+  Gorilla worked example (delta-of-delta timestamp bits + XOR value bits with
+  real IEEE-754 patterns, incl. window-reuse on v3), a raw-vs-Gorilla per-point
+  budget, a second Mermaid diagram, a variants table, and a Facebook/Gorilla
+  real-world example. Bit patterns computed in Python; Gorilla spec from the
+  VLDB 2015 paper (web search was unavailable to re-verify, but the scheme is a
+  fixed published spec). Note: the `Plan/docs` duplicate and `.bundle` are no
+  longer in the workspace — `system-design-course` is the single source now.

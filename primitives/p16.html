@@ -22,20 +22,37 @@ without bound, memory fills, and the system collapses &mdash; often catastrophic
 all at once. <b>Backpressure</b> is the mechanism by which a consumer tells a producer
 "slow down" so the system degrades gracefully instead.</p>
 
-<h2 class="sec">2 &middot; How it works</h2>
+<h2 class="sec">2 &middot; Why an unbounded buffer is a trap (Little's Law)</h2>
+<p>The instinct &mdash; &ldquo;just add a bigger queue&rdquo; &mdash; defers collapse, it doesn&rsquo;t
+prevent it. Whenever arrival rate exceeds service rate, the queue grows without bound,
+and <b>Little&rsquo;s Law</b> (L&nbsp;=&nbsp;&lambda;W) turns that backlog directly into
+ever-growing latency:</p>
+<div class="estimate">producer 10,000/s  ->  consumer 8,000/s   (deficit 2,000/s)
+  unbounded queue grows 2,000 items/s; after 60s -> 120,000 backlog
+  Little's Law: wait W = L / throughput = 120,000 / 8,000 = 15 s lag, and rising
+  -> the data is stale before it's processed; memory eventually OOMs</div>
+<p>A bounded buffer forces the decision instead of hiding it. With a cap of 10,000 the
+buffer fills in 5&nbsp;s, then a <b>policy</b> must fire.</p>
+
+<h2 class="sec">3 &middot; The options, lossless to lossy</h2>
 <pre class="mermaid">
 graph LR
   P[producer] -->|bounded buffer| C[consumer]
   C -.->|credits / acks: I can take N more| P
   P -.->|buffer full: block / drop / sample| X[policy]
 </pre>
-<p>Options, from lossless to lossy: <b>block</b> the producer (propagates slowness
-upstream but loses nothing), <b>credit/ack-based flow control</b> (consumer grants the
-producer permission for N more items), a <b>durable queue</b> as a shock absorber
-(<a href="../systems/s2.html">Kafka</a>), or explicit <b>drop/sample</b> when losing data beats
-falling over (metrics, logs).</p>
+<p><b>Block</b> the producer (lossless, but propagates slowness upstream);
+<b>credit/ack flow control</b> (consumer grants the producer permission for N more items,
+so the producer self-limits to the consumer&rsquo;s rate and the queue never overflows);
+a <b>durable queue</b> as a shock absorber (<a href="../systems/s2.html">Kafka</a> &mdash; absorbs
+bursts on disk); or explicit <b>drop/sample</b> when losing data beats falling over
+(metrics, logs). Worked credit flow:</p>
+<div class="estimate">consumer advertises credit = 1,000 (its free buffer slots)
+  producer may send at most 1,000 in-flight; as consumer drains, it returns credits
+  -> producer's effective rate is pinned to the consumer's drain rate (8,000/s)
+  -> queue depth stays &le; the advertised window; no overflow, no OOM</div>
 
-<h2 class="sec">3 &middot; The new bottleneck it hands you</h2>
+<h2 class="sec">4 &middot; The new bottleneck it hands you</h2>
 <div class="newprob">
 <p>Every choice has a cost: <b>blocking</b> pushes latency back up the chain (and can
 deadlock if it reaches the user); <b>dropping/sampling</b> loses data; an
@@ -44,7 +61,7 @@ useless. There is no free option &mdash; you are choosing <em>which</em> failure
 prefer.</p>
 </div>
 
-<h2 class="sec">4 &middot; Real-world example</h2>
+<h2 class="sec">5 &middot; Real-world example</h2>
 <div class="example">
 <span class="tag">TCP &amp; Netflix concurrency-limits</span>
 <p>The oldest example is <b>TCP flow control</b>: the receiver advertises a window
@@ -57,19 +74,19 @@ The Reactive Streams standard (RxJava, Project Reactor) bakes credit-based
 backpressure into stream APIs for the same reason.</p>
 </div>
 
-<h2 class="sec">5 &middot; Applying it in a design</h2>
+<h2 class="sec">6 &middot; Applying it in a design</h2>
 <p>Any producer/consumer boundary: <i>"bounded buffer with explicit policy &mdash; block
 if we can&rsquo;t lose data, sample if we can; a durable log absorbs bursts; shed load
 past capacity."</i> It&rsquo;s the natural follow-on to batching (<a href="../primitives/p1.html">P1</a>).</p>
 
-<h2 class="sec">6 &middot; Pitfalls</h2>
+<h2 class="sec">7 &middot; Pitfalls</h2>
 <ul>
 <li>Unbounded in-memory queues (OOM waiting to happen).</li>
 <li>No defined policy for "buffer full."</li>
 <li>Retry storms that ignore backpressure signals.</li>
 </ul>
 
-<h2 class="sec">7 &middot; Further reading</h2>
+<h2 class="sec">8 &middot; Further reading</h2>
 <ul>
 <li><a href="https://github.com/Netflix/concurrency-limits">Netflix concurrency-limits</a></li>
 <li><a href="https://www.reactive-streams.org/">Reactive Streams</a></li>

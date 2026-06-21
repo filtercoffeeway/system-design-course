@@ -12,18 +12,34 @@
 
 <hr>
 
-<h2 class="sec">1 &middot; Requirements &amp; scale</h2>
-<p><b>Functional:</b> <code>get(key)</code> / <code>put(key, value)</code> at planet
-scale, always-on. <b>Non-functional:</b> very high throughput, low latency,
-incremental scalability, and tolerance of node and network failure &mdash; with a
-deliberate consistency choice.</p>
-<div class="estimate">Back-of-envelope
-100,000,000,000 keys x 1 KB                 = 100 TB logical
-replication factor 3                         = 300 TB
-1,000,000 ops/s / 50,000 ops/s per node      ~ 20+ nodes just for throughput
-</div>
+<h2 class="sec">1 &middot; Requirements</h2>
+<p><b>Functional:</b> <code>get(key)</code> and <code>put(key, value)</code> (optionally
+<code>delete</code>, TTL) at planet scale. No queries, no joins &mdash; pure keyed access.</p>
+<div class="tablewrap"><table>
+<tr><th>Property</th><th>Target</th><th>Consequence</th></tr>
+<tr><td>Throughput</td><td>~1M+ ops/s</td><td>must partition across many nodes</td></tr>
+<tr><td>Latency</td><td>single-digit ms p99</td><td>in-memory/SSD + no coordination on the hot path</td></tr>
+<tr><td>Availability</td><td>always writable (or always-correct — pick)</td><td>this is the CAP decision (§8)</td></tr>
+<tr><td>Scalability</td><td>add nodes with ~no reshuffle</td><td>consistent hashing (<a href="../primitives/p2.html">P2</a>)</td></tr>
+<tr><td>Durability</td><td>survive node + AZ loss</td><td>replicate N=3 across AZs</td></tr>
+</table></div>
 
-<h2 class="sec">2 &middot; High-level architecture</h2>
+<h2 class="sec">2 &middot; Capacity estimation</h2>
+<div class="estimate">100,000,000,000 keys x 1 KB        = 100 TB logical
+replication factor N=3              = 300 TB on disk
+1,000,000 ops/s / ~50,000 per node ~ 20+ nodes for throughput alone
+  -> 100 TB / node SSD budget also forces ~tens of nodes; partitioning is mandatory</div>
+
+<h2 class="sec">3 &middot; API &amp; data model</h2>
+<div class="estimate">get(key)                -> value, version
+put(key, value, [version]) -> ok        (version enables compare-and-set)
+delete(key)             -> ok</div>
+<p>The data model <em>is</em> the access pattern: an opaque <code>key &rarr; value</code>
+map, no secondary indexes, no scans. That&rsquo;s exactly why a KV store &mdash; not a
+relational DB &mdash; fits (the store-selection ladder from <a href="s14.html">S14 §4</a>
+lands here whenever access is pure keyed lookup). The key is the partition key.</p>
+
+<h2 class="sec">4 &middot; High-level architecture</h2>
 <pre class="mermaid">
 graph LR
   C[client] --> CO[coordinator node]
@@ -31,33 +47,88 @@ graph LR
   CO --> N2[replica 2]
   CO --> N3[replica 3]
 </pre>
-<p>Keys are placed on a consistent-hash ring (<a href="../primitives/p2.html">P2</a>) and replicated to
-the next N nodes. Any node can coordinate a request; writes/reads use quorums.</p>
+<p>Any node can act as <b>coordinator</b> for a request &mdash; there is no leader &mdash; and
+writes/reads use <b>quorums</b>. Two sub-decisions deserve their own derivation: how keys
+map to nodes, and how each node stores bytes.</p>
+<h3>How keys map to nodes &mdash; the partitioning ladder</h3>
+<p>Naive <code>node = hash(key) % N</code> spreads evenly but reshuffles ~80% of keys when
+you add a node (measured in <a href="../primitives/p2.html">P2</a>) &mdash; fatal for an elastic
+cluster. <b>Consistent hashing</b> places nodes and keys on a ring so adding a node moves
+only ~1/N of keys; <b>virtual nodes</b> (each physical node owns ~100–256 ring segments)
+even out the load and scatter a departing node&rsquo;s range across many neighbours:</p>
+<div class="estimate">grow 4 -> 5 nodes, 10,000 keys:
+  hash % N          -> ~80% of keys move    (cluster-wide stampede)
+  consistent hash   -> ~18% of keys move    (only the new node's arc)
+  + vnodes          -> per-node load within ~10% of even</div>
+<p>So the ring + vnodes is what makes the store <b>incrementally scalable</b> &mdash; the
+property the requirements demanded. Each key&rsquo;s value is then replicated to the next
+<b>N</b> nodes clockwise on the ring.</p>
 
-<h2 class="sec">3 &middot; The hard constraint, in depth</h2>
-<div class="hard"><p>CAP is felt viscerally here. Under a network partition you must
-either return a possibly-stale value (AP) or refuse to answer (CP). Dynamo-style stores
-choose <b>availability</b> and expose tunable quorums (R + W &gt; N for read-your-writes
-overlap); a CP store like a Raft-replicated KV chooses consistency and rejects writes
-in a minority partition. The interviewer wants you to pick deliberately and justify
-it from the use case.</p></div>
+<h2 class="sec">5 &middot; The write path &amp; storage engine</h2>
+<h3>Storage engine ladder &mdash; B-tree vs LSM</h3>
+<p>Each node needs an on-disk structure. A <b>B-tree</b> (the OLTP default) updates pages
+in place: great for reads, but a KV store is write-heavy and in-place updates are random
+I/O that caps write throughput. An <b>LSM engine</b> buffers writes in a memtable + WAL,
+flushes sorted SSTables, and compacts in the background &mdash; turning writes into
+<b>sequential</b> appends and trading in some read amplification (cut back by Bloom filters
+that skip SSTables for absent keys). For a write-heavy KV store the LSM wins; full mechanics
+and the amplification trade are in <a href="../primitives/p17.html">P17</a>.</p>
+<h3>The write itself</h3>
+<p>The coordinator routes a <code>put</code> to the N replicas and waits for <b>W</b> acks:</p>
+<div class="estimate">put(k,v), N=3 W=2:
+  coordinator hashes k -> replicas {A,B,C}
+  sends v to A,B,C; waits for 2 acks (W=2)
+  A ok, B ok -> ACK client   (C may still be catching up)
+  if C is DOWN -> hinted handoff: park C's copy on a neighbor D,
+                  tagged "for C", replay when C returns</div>
 
-<h2 class="sec">4 &middot; Component deep dives</h2>
-<h3>Storage engine (P17)</h3>
-<p>LSM-tree (memtable &rarr; SSTables &rarr; compaction) for write-heavy workloads, WAL
-for durability, Bloom filters to skip disk on misses &mdash; see <a href="../primitives/p17.html">P17</a>.</p>
-<h3>Partitioning &amp; replication (P2, P3)</h3>
-<p>Consistent hashing with virtual nodes spreads data and makes scaling incremental;
-each key&rsquo;s value is replicated to N successors. Quorum reads/writes and tunable
-consistency are the <a href="../primitives/p3.html">P3</a> dial.</p>
-<h3>Conflict handling</h3>
-<p>With leaderless writes, two clients can update concurrently. <b>Vector clocks /
-version vectors</b> detect causally-concurrent versions; the app (or last-writer-wins)
-reconciles. <b>Hinted handoff</b> lets a temporarily-down replica&rsquo;s writes be
-parked on a neighbor and replayed later; <b>Merkle-tree anti-entropy</b> repairs
-divergent replicas in the background.</p>
+<h2 class="sec">6 &middot; The read path</h2>
+<div class="estimate">get(k), N=3 R=2:
+  coordinator reads from 2 replicas (R=2)
+  A returns v2 (version 7), C returns v1 (version 5)
+  newest wins -> return v2
+  read repair: asynchronously push v2 to C so it converges</div>
+<p>Because <b>R + W &gt; N</b> (2 + 2 &gt; 3) the read set and write set always overlap, so
+a quorum read is guaranteed to see the latest quorum write &mdash; the mechanism worked in
+<a href="../primitives/p3.html">P3</a>. <b>Read repair</b> piggybacks on reads to heal stale
+replicas; the background <b>Merkle-tree anti-entropy</b> repairs replicas that reads never
+touch (each replica keeps a hash tree of its key ranges; two replicas compare roots, then
+descend only into subtrees whose hashes differ, so they exchange just the diverged keys).</p>
 
-<h2 class="sec">5 &middot; Real-world example</h2>
+<h2 class="sec">7 &middot; Conflicts &amp; the hard constraint</h2>
+<p>Leaderless writes mean two clients can update <code>k</code> concurrently on different
+replicas. A <b>version vector</b> (a per-replica counter) detects whether two versions are
+causally ordered or genuinely concurrent:</p>
+<div class="estimate">cart, vv = [A:0, B:0]
+  client adds milk via replica A -> {milk},  vv=[A:1, B:0]
+  client adds eggs via replica B -> {eggs},  vv=[A:0, B:1]   (B hadn't seen A's write)
+  compare [A:1,B:0] vs [A:0,B:1]: neither dominates -> CONCURRENT -> conflict</div>
+<p>How you resolve it is its own small ladder: <b>last-writer-wins</b> (pick by timestamp &mdash;
+simple, but silently drops the other update, so the cart loses an item) &rarr; <b>version
+vectors + app merge</b> (keep both, let the app reconcile &mdash; Dynamo returns both
+siblings) &rarr; <b>CRDT</b> (a type like a set-union cart that merges automatically and
+always converges). Pick by whether a dropped write is acceptable; for a cart it isn&rsquo;t,
+so you merge. Full mechanics in <a href="../primitives/p3.html">P3</a>.</p>
+<div class="hard"><p><b>CAP, felt viscerally.</b> Under a network partition the quorum can&rsquo;t
+be formed for some keys, and you must choose &mdash; another ladder:</p></div>
+<div class="tablewrap"><table>
+<tr><th>Choice</th><th>Under partition</th><th>Use when</th></tr>
+<tr><td><b>AP</b> (Dynamo-style, tunable quorum)</td><td>serve possibly-stale / accept writes via sloppy quorum + hinted handoff</td><td>cart, sessions, likes — availability &gt; freshness</td></tr>
+<tr><td><b>CP</b> (Raft-replicated KV, e.g. etcd)</td><td>minority partition refuses writes/reads → errors</td><td>config, locks, anything that must be correct</td></tr>
+</table></div>
+<p>Dynamo chose AP so &ldquo;add to cart&rdquo; is never rejected; etcd chose CP so cluster state is
+never wrong. Stating this choice and justifying it from the use case is the whole answer.</p>
+
+<h2 class="sec">8 &middot; Scaling &amp; bottlenecks</h2>
+<p>Adding a node steals a fair set of vnodes from existing nodes, moving only ~1/N of keys
+(<a href="../primitives/p2.html">P2</a>). The classic failure is the <b>hot key / wide
+partition</b> &mdash; one key (or a low-cardinality partition key like <code>country=US</code>)
+lands all its load on one replica set, recreating the single-node ceiling; mitigate by
+splitting the key or fronting it with a cache (<a href="../primitives/p4.html">P4</a>).
+Stronger consistency (higher R/W, or CP) costs latency and availability; that&rsquo;s the dial
+you tune per workload.</p>
+
+<h2 class="sec">9 &middot; Real-world example</h2>
 <div class="example">
 <span class="tag">Amazon Dynamo / DynamoDB</span>
 <p>Amazon&rsquo;s 2007 <b>Dynamo</b> paper is the blueprint: consistent hashing + virtual
@@ -69,13 +140,14 @@ core (three AZs) and exposes the consistency dial as eventually- vs strongly-con
 reads. Cassandra and Riak are open-source embodiments of the same paper.</p>
 </div>
 
-<h2 class="sec">6 &middot; Tradeoffs &amp; alternatives</h2>
+<h2 class="sec">10 &middot; Tradeoffs &amp; alternatives</h2>
 <p>Leaderless AP maximizes availability but pushes conflict handling onto you. A
 Raft/Paxos-replicated CP KV (etcd-like) gives linearizable reads but sacrifices
-availability in a partition and write throughput. The hot-key problem (<a href="../primitives/p2.html">P2</a>)
-&mdash; a single wide partition &mdash; is the classic operational failure.</p>
+availability in a partition and write throughput. A simpler single-leader KV (Redis +
+replicas) is great until the write rate or dataset exceeds one primary. Pick by the
+consistency and scale the workload actually needs.</p>
 
-<h2 class="sec">7 &middot; Key talking points</h2>
+<h2 class="sec">11 &middot; Key talking points</h2>
 <ul>
 <li>Open with the CAP choice and justify AP vs CP from the use case.</li>
 <li>Consistent hashing + vnodes for elastic partitioning (<a href="../primitives/p2.html">P2</a>).</li>
@@ -84,7 +156,7 @@ availability in a partition and write throughput. The hot-key problem (<a href="
 <li>Vector clocks, hinted handoff, Merkle anti-entropy for AP correctness.</li>
 </ul>
 
-<h2 class="sec">8 &middot; Further reading</h2>
+<h2 class="sec">12 &middot; Further reading</h2>
 <ul>
 <li><a href="https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf">Dynamo (SOSP 2007)</a></li>
 <li><a href="https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Introduction.html">Amazon DynamoDB docs</a></li>

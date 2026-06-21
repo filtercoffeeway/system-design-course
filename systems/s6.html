@@ -137,6 +137,52 @@ keeps growing, the Agent must shed — sample, drop, or slow down — rather tha
 over. The pipeline is built to degrade, not collapse. See
 <a href="../primitives/p16.html">P16</a>.</p>
 
+<h3>Alerting: deriving when (and whether) you need a stream processor</h3>
+<p>&ldquo;Fire alerts on thresholds&rdquo; sounds like it demands a real-time
+stream-processing engine (Flink/Kafka Streams). It usually doesn&rsquo;t. Derive the
+rung from the alert <em>condition</em>, don&rsquo;t reach for Flink because the diagram
+looks busier.</p>
+<h4>Rung 0 — evaluate rules by querying the store</h4>
+<p>An evaluator runs each rule (<code>avg(cpu) by region &gt; 0.9 for 5m</code>) on a
+schedule by querying the hot TSDB — the Prometheus model. The query path
+(<a href="../primitives/p7.html">P7</a> scatter-gather) already exists, so an alert is
+just a saved query plus a for-duration. Correct and cheap for threshold alerts,
+moderate rule counts, and ~10&nbsp;s–1&nbsp;min evaluation latency.</p>
+<div class="newprob"><b>Bottleneck:</b> two things break it. Re-running thousands of
+windowed aggregations against the store every tick re-scans the same recent blocks
+over and over; and because the Agent flushes on a ~10&nbsp;s interval and the network
+adds lag, points arrive <em>after</em> their timestamp — so a query-time window
+silently mixes late data, and the alert is computed on arrival-time, not event-time.</div>
+<h4>Rung 1 — evaluate against the rollups you already compute</h4>
+<p>The pipeline already produces write-time 1-min rollups (§4, <a href="../primitives/p5.html">P5</a>)
+and source pre-aggregates (<a href="../primitives/p1.html">P1</a>). Point the evaluator at
+those instead of raw series: far fewer rows per tick, and the rollup boundary gives a
+stable window. Reuses existing machinery, no new system.</p>
+<div class="newprob"><b>Bottleneck:</b> fixed rollup granularities can&rsquo;t express a
+<em>sliding</em> event-time window, late-data correction, sessionization, multi-stream
+joins, or anomaly/derivative conditions. When the alert logic needs keyed state over an
+event-time window, the rollups don&rsquo;t have it.</div>
+<h4>Rung 2 — stateful stream processor on the Kafka buffer (the Flink-class rung)</h4>
+<p>Now it&rsquo;s hard to avoid: a stream processor consumes the durable Kafka buffer
+already in the diagram and maintains keyed, event-time windowed state with watermarks,
+evaluating alert conditions <em>in-stream</em> as points flow — sliding p99 windows,
+late-data handling, complex-event and anomaly detection at the full 4&times;10<sup>7</sup>
+points/s. Its cost is the operational weight of managed state and checkpointing. Note it
+need not be Flink specifically — Kafka Streams, Spark Structured Streaming, or a streaming
+database (Materialize, RisingWave) sit on this same rung; Flink is strongest when you want
+large state + true event-time + low latency together.</p>
+<div class="example">
+<span class="tag">rung → good until → breaks on</span>
+<p><b>Query-the-store:</b> threshold alerts, moderate rules → expensive re-scan + no
+event-time correctness. &nbsp;<b>Evaluate-the-rollups:</b> fixed-window aggregates over
+existing roll-ups → no sliding/event-time/stateful conditions. &nbsp;<b>Stream processor:</b>
+event-time windowed + anomaly alerting at volume → managed state, checkpointing, ops weight.</p>
+</div>
+<p>So a stream processor becomes mandatory <em>only</em> once the spec includes
+event-time-correct windowed or anomaly alerting at high volume. The storage and
+threshold-alerting half of this system ships fine without one — which is exactly the
+requirement you should name out loud before adding it.</p>
+
 <h2 class="sec">5 · Real-world example</h2>
 <div class="example">
 <span class="tag">Datadog</span>
@@ -180,6 +226,9 @@ combinations — not point rate."</i></li>
 <li>Scatter-gather with pushdown aggregation; merge partials
 (<a href="../primitives/p7.html">P7</a>).</li>
 <li>Separate metrics from logs; index logs selectively to contain cardinality.</li>
+<li>Derive alerting by rung: query-the-store → evaluate-the-rollups → stateful stream
+processor (Flink-class) — the last is forced only by event-time windowed / anomaly alerts
+at volume, not by &ldquo;we have alerts.&rdquo;</li>
 </ul>
 
 <h2 class="sec">8 · Further reading</h2>

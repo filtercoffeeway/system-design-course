@@ -22,30 +22,62 @@ Replication keeps multiple copies so you survive failures, scale reads, and plac
 data near users. The catch is that copies drift apart, so you must also choose
 <em>how consistent</em> they have to be.</p>
 
-<h2 class="sec">2 &middot; How it works</h2>
+<h2 class="sec">2 &middot; The replication ladder</h2>
+<h4>Rung 0 — one copy</h4>
+<p>Simplest possible. Dies with its node, and serves only as fast as one machine.</p>
+<div class="newprob"><b>Bottleneck:</b> no durability, no read scale.</div>
+<h4>Rung 1 — single-leader, async replication</h4>
+<p>All writes go to one leader; it streams the change log to read-only followers.
+Buys durability (copies survive node loss) and <b>read scale</b> (fan reads across
+followers). The leader is still the single writer, and followers <b>lag</b>.</p>
+<div class="newprob"><b>Bottleneck:</b> replication lag → a read of a follower right
+after a write may not see it (read-after-write anomaly); writes still cap at one node.</div>
+<h4>Rung 2 — synchronous / quorum replication</h4>
+<p>Wait for replicas to acknowledge before confirming a write. No stale reads if you
+read a quorum &mdash; at the cost of write latency. The leaderless form (Dynamo-style)
+drops the leader entirely: write to <b>W</b> replicas, read from <b>R</b>, and choose
+<b>R + W &gt; N</b> so the read and write sets must overlap. Worked, N=3:</p>
 <pre class="mermaid">
 graph LR
-  W[write] --> L[Leader]
-  L --> F1[Follower 1]
-  L --> F2[Follower 2]
-  R1[read] --> F1
-  R2[read] --> L
+  W["write v2 (W=2)"] --> A["A: v2"]
+  W --> B["B: v2"]
+  C["C: v1 (missed it)"]
+  R["read (R=2) from B,C"] --> B
+  R --> C
+  R --> M["see v2 & v1 → newest wins → v2"]
 </pre>
-<p>Three models: <b>single-leader</b> (all writes to one leader, replicated to
-followers &mdash; simple, but followers lag); <b>multi-leader</b> (write to any
-region, replicate both ways &mdash; conflicts must be resolved); <b>leaderless /
-quorum</b> (write to W replicas, read from R, with R + W &gt; N for overlap &mdash;
-Dynamo-style).</p>
+<div class="estimate">N=3, W=2, R=2  →  W + R = 4 &gt; 3  →  write set {A,B} and read set always overlap
+  write v2 to {A,B}; C still holds v1
+  read from {B,C}: gets v2 (B) and v1 (C) → version says v2 newer → return v2 ✓
+  if instead R=1 and you read {C}: returns stale v1 ✗   (W+R = 3, not &gt; N)</div>
+<p>So the quorum inequality isn&rsquo;t a slogan &mdash; it&rsquo;s the exact condition that the
+nodes you read are guaranteed to include one that saw the latest write.</p>
+<div class="newprob"><b>Bottleneck:</b> higher latency (wait for a majority), and the
+leaderless/multi-leader forms admit <b>write conflicts</b> (next section).</div>
 
-<h2 class="sec">3 &middot; The consistency ladder</h2>
-<p>Consistency is a dial, not a switch. From strongest/most expensive to
-cheapest/loosest: <b>strict serializable &rarr; linearizable &rarr; bounded
-staleness &rarr; read-your-writes &rarr; eventual</b>. <b>CAP</b> says under a network
-partition you must drop either consistency (serve stale, AP) or availability (return
-an error, CP). <b>PACELC</b> adds the part everyone forgets: even when there&rsquo;s
-no partition, you trade latency vs consistency on every request.</p>
+<h2 class="sec">3 &middot; The consistency ladder (the dial)</h2>
+<p>Orthogonal to <em>where</em> writes go is <em>how consistent</em> reads must be &mdash;
+a dial, not a switch, from most expensive to loosest: <b>strict serializable &rarr;
+linearizable &rarr; bounded staleness &rarr; read-your-writes &rarr; eventual</b>. Pick the
+loosest rung the requirement tolerates. <b>CAP</b>: under a network partition you must
+drop either consistency (serve stale, AP) or availability (return an error, CP).
+<b>PACELC</b> adds the part everyone forgets &mdash; even with no partition (E, &ldquo;else&rdquo;)
+you trade <b>l</b>atency vs <b>c</b>onsistency on every request.</p>
 
-<h2 class="sec">4 &middot; The new bottleneck it hands you</h2>
+<h2 class="sec">4 &middot; Conflicts &amp; version vectors</h2>
+<p>The moment two replicas can both accept a write (multi-leader or leaderless), they can
+diverge. A <b>version vector</b> &mdash; a per-replica counter &mdash; detects whether two
+versions are causally ordered or genuinely concurrent:</p>
+<div class="estimate">start: cart = {} , vv = [A:0, B:0]
+  A adds milk:   value={milk},      vv=[A:1, B:0]
+  B adds eggs:   value={eggs},      vv=[A:0, B:1]   (B didn't see A's write)
+compare [A:1,B:0] vs [A:0,B:1]: neither dominates → CONCURRENT → conflict
+  resolution: merge ({milk,eggs}) or last-writer-wins (one silently lost)</div>
+<p>Last-writer-wins is simplest but <b>silently drops</b> one update; a mergeable type
+(a CRDT, like a set-union cart) keeps both. The point is you can&rsquo;t avoid the choice
+once two writers exist.</p>
+
+<h2 class="sec">5 &middot; The new bottleneck it hands you</h2>
 <div class="newprob">
 <p><b>Replication lag</b> is the headline cost: read a follower right after writing
 the leader and you may not see your own write (read-after-write anomaly). Fixes &mdash;
@@ -56,7 +88,7 @@ data). <b>Stronger consistency</b> costs latency and availability: a quorum writ
 waits for a majority, and a linearizable system can&rsquo;t serve a minority partition.</p>
 </div>
 
-<h2 class="sec">5 &middot; Real-world example</h2>
+<h2 class="sec">6 &middot; Real-world example</h2>
 <div class="example">
 <span class="tag">Amazon DynamoDB &amp; Google Spanner</span>
 <p>DynamoDB exposes the dial directly: a read can be <em>eventually consistent</em>
@@ -70,19 +102,19 @@ DynamoDB lets you pay less for staleness; Spanner pays latency for global strong
 consistency.</p>
 </div>
 
-<h2 class="sec">6 &middot; Applying it in a design</h2>
+<h2 class="sec">7 &middot; Applying it in a design</h2>
 <p>State the requirement first, then pick the rung: <i>"this counter can be eventually
 consistent, so I&rsquo;ll read from any replica; this balance must be read-your-writes,
 so I&rsquo;ll pin the user to the leader or wait for a version."</i></p>
 
-<h2 class="sec">7 &middot; Pitfalls</h2>
+<h2 class="sec">8 &middot; Pitfalls</h2>
 <ul>
 <li>Defaulting to "strong consistency everywhere" and eating needless latency.</li>
 <li>Last-writer-wins silently losing concurrent updates.</li>
 <li>Reading your own writes from a lagging replica.</li>
 </ul>
 
-<h2 class="sec">8 &middot; Further reading</h2>
+<h2 class="sec">9 &middot; Further reading</h2>
 <ul>
 <li><a href="https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/HowItWorks.ReadConsistency.html">DynamoDB read consistency</a></li>
 <li><a href="https://research.google/pubs/pub39966/">Spanner: Google&rsquo;s Globally-Distributed Database</a></li>

@@ -3,6 +3,32 @@
 Instructions for any Claude session working on this project. Read this first,
 then read `CHECKLIST.md` to see what is done and what to write next.
 
+> ## ⭐ THE #1 RULE — derive every major decision as a ladder
+>
+> This governs the **entire course** and overrides any instinct to just state an
+> answer. **Never assert a major design decision; derive it.** For every
+> significant choice — ID/key generation, which datastore, caching, partitioning,
+> replication, consistency, the queue, the index, transport — walk the ladder:
+>
+> **simplest thing that works → the concrete number/load where it breaks (the
+> bottleneck) → the next option that relieves it → its new bottleneck → … → the
+> "complex" answer, now obviously necessary.**
+>
+> The reader must *derive* why (e.g.) a central token service or a KV store is
+> needed by watching the simpler options each die at a specific scale — never
+> memorize it. Anchor every rung to a number ("fine at ~10 rps; caps at a few
+> k/s; so…"), and end with a small `rung → good until → breaks on` table. This is
+> the curriculum's own thesis (*every lever creates a new bottleneck*) applied
+> **inside each decision**. Exemplars: `systems/s14.html` §4 (store) and §6
+> (id generation). Full spec in `DEPTH-PASS.md`.
+
+> **Active work: the depth pass.** Every page has a first draft, but the drafts
+> are too high-level (they name concepts without showing the mechanics, bits, or
+> numbers). The current job is to deepen each page. **Read `DEPTH-PASS.md`** for
+> the per-page tracker, the two depth standards (primitive "mechanism deep dive"
+> vs system "full interview answer"), and the session recipe. The depth exemplars
+> are `primitives/p8.html` (primitive) and `systems/s14.html` (system).
+
 ## The idea
 
 This is a **bottleneck-first system design curriculum**, published as a static

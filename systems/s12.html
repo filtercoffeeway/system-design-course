@@ -12,20 +12,62 @@
 
 <hr>
 
-<h2 class="sec">1 &middot; Requirements &amp; scale</h2>
-<p><b>Functional:</b> run a unit of work reliably &mdash; now, later, or on a schedule
-&mdash; with retries and no duplicate <em>effect</em>. <b>Non-functional:</b> at-least
--once execution, fault tolerance, horizontal worker scale, visibility into failures.</p>
-<div class="estimate">Back-of-envelope
-10,000,000 tasks/day                         ~ 115/s avg, bursty
-each task: lease -> run -> ack, with retries
-delayed tasks                                 a future-time index scanned continuously
-</div>
+<h2 class="sec">1 &middot; Requirements</h2>
+<p><b>Functional:</b> run a unit of work reliably &mdash; <em>now</em>, <em>later</em> (at a
+future time), or <em>on a schedule</em> (cron) &mdash; with retries and no duplicate
+<em>effect</em>. <b>Non-functional:</b></p>
+<div class="tablewrap"><table>
+<tr><th>Property</th><th>Target</th><th>Consequence</th></tr>
+<tr><td>Delivery</td><td>at-least-once</td><td>workers must be idempotent (<a href="../primitives/p9.html">P9</a>)</td></tr>
+<tr><td>Durability</td><td>an accepted task is never lost</td><td>persist before ack; queue is durable</td></tr>
+<tr><td>Fault tolerance</td><td>a dead worker&rsquo;s task re-runs</td><td>leases + visibility timeout</td></tr>
+<tr><td>Scale</td><td>workers scale horizontally</td><td>pull-based dispatch (§8)</td></tr>
+<tr><td>Visibility</td><td>failures are inspectable</td><td>retries + dead-letter queue</td></tr>
+</table></div>
 
-<h2 class="sec">2 &middot; High-level architecture</h2>
+<h2 class="sec">2 &middot; Capacity estimation</h2>
+<div class="estimate">10,000,000 tasks/day  / 86,400 s  ~ 116/s average, bursty -> peak ~1,000/s
+delayed tasks pending at any time ~ 100,000,000 (scheduled minutes–months out)
+  -> "find due tasks" cannot be a full scan of 100M rows every second (§7)
+task record ~ a few hundred bytes -> 100M x ~300 B ~ 30 GB pending state</div>
+
+<h2 class="sec">3 &middot; API &amp; data model</h2>
+<div class="estimate">enqueue(task, run_at?, idempotency_key, context) -> task_id
+poll(worker_id, capacity)               -> leased task(s)        (pull model, §8)
+ack(task_id, lease_token) / nack(task_id)</div>
+<p>Two tables, because two access patterns pull in opposite directions:</p>
+<div class="estimate">tasks   (partition key = task_id)        -- point access: ack, status, idempotency
+  task_id      PK
+  payload
+  state        ENUM(pending, leased, done, dead)
+  lease_until  TIMESTAMP NULL   -- visibility-timeout expiry
+  lease_token  UUID NULL        -- fences a stale worker's ack (P10)
+  attempts     INT
+  context      JSON             -- W3C trace context: traceparent/tracestate (§ tracing)
+  concurrency_policy ENUM(allow, forbid, replace)  -- for recurring jobs
+
+schedule  (partition key = time_bucket, e.g. "2026-06-20T14:32")  -- the OUTBOX
+  time_bucket  PK part         -- minute (or 5-min) the task is due in
+  run_at       TIMESTAMP
+  task_id      ref
+  -- row is DELETED once the task is moved to the worker queue</div>
+<div class="newprob"><b>Why two tables (the partitioning paradox):</b> if the single
+<code>tasks</code> table is partitioned by <code>task_id</code>, the due-time query
+<code>WHERE run_at &le; now()</code> has <b>no partition key</b> &mdash; the engine must
+<b>scatter-gather the <code>run_at</code> index across every partition</b> (<a href="../primitives/p7.html">P7</a>),
+which at 100M pending tasks cripples the DB. The fix is a separate <b>time-partitioned
+schedule/outbox table</b>: the scheduler reads only the partition for the current minute
+bucket, and deletes the row once the task is enqueued for a worker. Point operations stay
+on <code>tasks</code> (by <code>task_id</code>); time scans stay on <code>schedule</code>
+(by <code>time_bucket</code>). Same data, two layouts for two access patterns.</div>
+<p>The <code>lease_token</code> is a <b>fencing token</b> (<a href="../primitives/p10.html">P10</a>):
+an ack is only honoured if its token matches the current lease, so a slow worker whose
+lease already expired and was reassigned can&rsquo;t ack someone else&rsquo;s run.</p>
+
+<h2 class="sec">4 &middot; High-level architecture</h2>
 <pre class="mermaid">
 graph LR
-  P[producer] --> Q[(task queue)]
+  P[producer] --> Q[(durable task queue)]
   Q -->|lease w/ visibility timeout| W1[worker]
   Q --> W2[worker]
   W1 -->|ack on success| Q
@@ -33,29 +75,197 @@ graph LR
   SCH[scheduler + lock] -->|enqueue due tasks| Q
 </pre>
 
-<h2 class="sec">3 &middot; The hard constraint, in depth</h2>
-<div class="hard"><p>You cannot get both <b>exactly-once execution</b> and fault
-tolerance without an expensive distributed transaction. A worker can finish a task and
-crash before acking &mdash; so the task will run again. The accepted answer is
-<b>at-least-once delivery + idempotent workers</b> (<a href="../primitives/p9.html">P9</a>): make running
-twice produce the same result, and stop chasing true exactly-once.</p></div>
+<h2 class="sec">5 &middot; Delivery semantics &mdash; the ladder</h2>
+<h4>Rung 0 — at-most-once (fire and forget)</h4>
+<p>Hand the task to a worker, delete it immediately. If the worker crashes, the task is
+<b>lost</b>. Fine for a best-effort metric, unacceptable for real work.</p>
+<div class="newprob"><b>Bottleneck:</b> a crash silently drops the task.</div>
+<h4>Rung 1 — at-least-once (delete only after ack)</h4>
+<p>Keep the task; delete it only when the worker <b>acks</b> success. A crash before ack
+means the task re-runs &mdash; never lost, but possibly run <b>twice</b>.</p>
+<div class="newprob"><b>Bottleneck:</b> duplicate execution (worker finished, then crashed before acking).</div>
+<h4>Rung 2 — at-least-once + idempotent workers ← the answer</h4>
+<p>Accept that re-runs happen and make running twice <b>harmless</b>: workers carry an
+idempotency key (<a href="../primitives/p9.html">P9</a>) so a duplicate effect is deduped. True
+exactly-once <em>execution</em> would need a distributed transaction across the queue and
+the worker&rsquo;s side effects &mdash; too expensive &mdash; so you buy exactly-once <em>effect</em>
+cheaply with idempotency instead. (See the hard constraint, §9.)</p>
 
-<h2 class="sec">4 &middot; Component deep dives</h2>
-<h3>Visibility timeout &amp; leasing</h3>
-<p>When a worker picks up a task it becomes invisible to others for T seconds (the
-visibility timeout / lease). If the worker finishes and acks, the task is deleted; if it
-dies, the lease expires and another worker retakes it. Long tasks renew the lease.</p>
-<h3>Retries &amp; dead-letter queue</h3>
-<p>Transient failures retry with exponential backoff; after N failures the task moves to
-a <b>DLQ</b> for inspection so a poison message can&rsquo;t loop forever. You always want
-a DLQ.</p>
-<h3>Cron in a distributed system (P10)</h3>
-<p>"Who fires the scheduled job?" If every node fires it, it runs N times. The standard
-answer: a single scheduler elected via a distributed lock / leader election
-(<a href="../primitives/p10.html">P10</a>, <a href="../systems/s13.html">S13</a>), which enqueues due tasks for the
-worker pool.</p>
+<h2 class="sec">6 &middot; The task lifecycle &amp; lease (worked)</h2>
+<p>When a worker leases a task it becomes <b>invisible</b> to others for T seconds (the
+visibility timeout). Ack deletes it; a crash lets the lease expire and another worker
+retakes it. Long tasks <b>renew</b> the lease before it lapses:</p>
+<div class="estimate">visibility timeout T = 30s
+  t=0   worker A leases task (lease_until=30, token=k1) -> invisible to others
+  t=20  A still running -> renews lease (lease_until=50)        [heartbeat]
+  t=35  A finishes -> ack(token=k1) -> task deleted             [happy path]
 
-<h2 class="sec">5 &middot; Real-world example</h2>
+crash case:
+  t=0   A leases (lease_until=30, token=k1)
+  t=12  A crashes (no renew)
+  t=30  lease expires -> task visible again
+  t=31  worker B leases (token=k2)
+  t=40  A's ghost returns, ack(token=k1) -> REJECTED (current token is k2)  <- fencing</div>
+<p>Tuning T is a tradeoff: short T recovers from dead workers fast but risks
+double-running a slow-but-alive one; long T is safe against false death but slow to
+recover. Retries use <b>exponential backoff</b> (1s, 2s, 4s, …); after N attempts the task
+moves to a <b>dead-letter queue</b> so a poison task can&rsquo;t loop forever. Always have a DLQ.</p>
+
+<h2 class="sec">7 &middot; Delayed &amp; scheduled tasks &mdash; the ladder</h2>
+<h4>Rung 0 — poll a due-time query</h4>
+<p><code>SELECT * FROM tasks WHERE run_at &lt;= now() AND state='pending'</code> every second.
+Simple; fine at thousands of pending tasks. With 100M pending it re-scans a huge index
+every second &mdash; and (see §3) if <code>tasks</code> is partitioned by <code>task_id</code>
+this scan <b>scatter-gathers across every partition</b>. The scan dominates.</p>
+<div class="newprob"><b>Bottleneck:</b> repeated (and cross-partition) scan over a large future-task set.</div>
+<h4>Rung 1 — time-partitioned schedule table</h4>
+<p>Put due tasks in the separate <code>schedule</code> table <b>partitioned by
+<code>time_bucket</code></b> (the minute they&rsquo;re due). Each tick reads only the
+<em>current bucket&rsquo;s</em> partition &mdash; a single-partition range read, not a cluster-wide
+scan &mdash; and deletes rows as it drains them. Reads now scale with <em>due</em> tasks, not
+total pending.</p>
+<h4>Rung 2 — in-memory min-heap (priority queue by <code>run_at</code>)</h4>
+<p>Hold near-term tasks in a binary <b>min-heap</b> ordered by due time. The scheduler
+<b>peeks the top</b> (earliest task) in O(1), <b>sleeps until exactly that time</b> &mdash; or
+wakes early if a sooner task is inserted &mdash; then pops and enqueues it. Event-driven: no
+polling, no scanning, and fires at the right instant.</p>
+<div class="estimate">heap ops:  insert O(log n),  peek-min O(1),  pop O(log n)
+loop: t = heap.peek().run_at;  sleep(t - now)  (or until a sooner insert);  dispatch heap.pop()</div>
+<p>It is a <b>cache, not the source of truth</b>: the heap lives on the elected scheduler
+(<a href="../primitives/p10.html">P10</a>) and holds only a <b>near-term horizon</b> (e.g. tasks
+due in the next few minutes), refilled from the <code>schedule</code> table as time advances
+&mdash; you can&rsquo;t fit 100M far-future tasks in RAM. Standard in-process timer structure (Java
+<code>DelayQueue</code>, Go timers).</p>
+<div class="newprob"><b>Failover storm &mdash; and the fix:</b> when the leader dies, the new one
+must rebuild this heap, but it must <b>not</b> scan 100M rows (a 30&nbsp;s rebuild = a 30&nbsp;s
+spike in delivery latency). Because Rung 1 already bucketed by time, the new leader loads
+only the <b>current and next bucket(s)</b> &mdash; the next few minutes of work &mdash; so recovery
+is a single-partition read in milliseconds, not a table scan. Coupling the time-bucket index
+to the heap is what makes failover cheap.</div>
+<h4>Rung 3 — timing wheel (at extreme churn)</h4>
+<p>The heap&rsquo;s O(log n) per op only bites with millions of timers and very high
+insert/cancel rates (think per-request timeouts). A <b>timing wheel</b> gets <b>O(1)</b>
+insert and expiry. Picture a clock face: an array of N slots used as a ring, each slot one
+tick of time, and a hand that advances one slot per tick and fires whatever tasks sit there.</p>
+<div class="estimate">8-slot wheel, tick=1s, hand at slot 0:
+  schedule A due in 3s -> slot (0+3)=3        insert = O(1)
+  schedule B due in 5s -> slot 5
+  hand ticks 1,2,3...  -> at slot 3 fire A, at slot 5 fire B   expiry = O(1)/tick
+  due &gt; N slots? store rounds = d / N and fire when the counter hits 0</div>
+<p>A single wheel only reaches N ticks ahead, so <b>hierarchical</b> wheels stack
+resolutions like clock hands &mdash; second, minute, hour. A far-future task lives in a coarse
+wheel and <b>cascades</b> down to a finer one as its time nears (a 90&nbsp;s task waits in the
+minute wheel, then cascades into the second wheel at slot 30). This gives O(1) at unbounded
+range; the cost is <b>resolution</b> &mdash; a task fires at the next tick boundary, so you accept
+bounded jitter. Same durable-backed, near-term-horizon idea as the heap; it&rsquo;s how Linux
+kernel timers, Kafka&rsquo;s <code>SystemTimer</code>, and Netty&rsquo;s <code>HashedWheelTimer</code>
+work. Reach for it when the heap is the bottleneck, not before.</p>
+<pre class="mermaid">
+graph LR
+  HW["hour wheel (coarse)"] -->|hand advances → cascade| MW["minute wheel"]
+  MW -->|cascade as due nears| SW["second wheel → fires at the tick"]
+</pre>
+<h4>Cron: who fires it? (<a href="../primitives/p10.html">P10</a>)</h4>
+<p>If every scheduler node fires a cron, it runs N times. Elect a <b>single</b> scheduler via
+a distributed lock / leader election (<a href="../primitives/p10.html">P10</a>,
+<a href="../systems/s13.html">S13</a>) that enqueues due tasks for the worker pool; a fencing
+token stops a stale ex-leader from also firing.</p>
+<h4>Cron overrun: what if a run overlaps the next tick?</h4>
+<p>A job scheduled every 1&nbsp;min but taking 5&nbsp;min is still running when its next tick
+arrives. Don&rsquo;t leave this implicit &mdash; make it a <code>concurrency_policy</code> on the job
+(this is exactly Kubernetes CronJob&rsquo;s <code>concurrencyPolicy</code>):</p>
+<div class="estimate">Allow    -> start the new run anyway (concurrent runs; default for independent jobs)
+Forbid   -> skip this tick if the previous run is still in flight
+Replace  -> cancel/kill the in-flight run and start the new one</div>
+<p>The firer checks the previous run&rsquo;s state (via its <code>task_id</code>/lease) before
+enqueuing the next, and applies the policy.</p>
+
+<h2 class="sec">8 &middot; Picking the right worker by capacity</h2>
+<p>A classic follow-up: <em>with a pool of workers of differing load, how does a task reach
+one that can actually handle it?</em> Derive it.</p>
+<h4>Rung 0 — random / round-robin push</h4>
+<p>Scheduler assigns each task to a worker by round-robin. Ignores load, so a slow or
+already-busy worker keeps getting piled on while others idle &mdash; tail latency explodes.</p>
+<div class="newprob"><b>Bottleneck:</b> dispatch is blind to capacity.</div>
+<h4>Rung 1 — pull-based (workers pull when free) ← best default</h4>
+<p>Flip the direction: workers <b>long-poll the queue and take the next task only when they
+have a free slot</b>. Capacity tracking becomes implicit &mdash; a busy worker simply doesn&rsquo;t
+pull &mdash; so load self-balances with zero global state. This is the SQS+Lambda model, and
+the right default for homogeneous tasks.</p>
+<div class="newprob"><b>Prefetch trap (buffer bloat):</b> for throughput, workers often <b>prefetch
+a batch</b> (say 10) rather than one at a time. But the lease/visibility timeout starts when a
+task is <em>leased</em>, not when it starts <em>running</em>. If task #1 runs long, #9 and #10
+sit idle in the worker&rsquo;s local buffer until <b>their lease expires &mdash; and another worker
+re-leases them</b>, causing accidental concurrent execution while the first worker is perfectly
+healthy. Fixes: cap prefetch to what a worker can start ~immediately, and <b>heartbeat/renew the
+lease for every task in the buffer</b>, not just the one on a thread. (Kafka&rsquo;s
+<code>max.poll.records</code> + <code>max.poll.interval</code> is this exact knob.)</div>
+<div class="newprob"><b>Bottleneck:</b> you can&rsquo;t <em>target</em> a worker (no affinity/locality), and a single shared queue can be a contention point at very high rates.</div>
+<h4>Rung 2 — Join-Idle-Queue (JIQ)</h4>
+<p>A scalable middle ground between pull and push. Each dispatcher keeps a small list of
+<b>idle</b> workers; when a worker finishes and has a free slot it <b>advertises itself</b> to
+a (random) dispatcher&rsquo;s idle-list. The dispatcher routes each task to a worker from that
+list and removes it; if the list is empty it falls back (random worker / another dispatcher).
+The load-balancing work moves <b>off the request path</b> &mdash; no per-task polling of worker
+load &mdash; so it scales to huge fleets, and because a worker only advertises when it actually
+has spare capacity, JIQ is <b>capacity-aware by construction</b> (an underpowered or busy worker
+simply advertises less often). It keeps the self-balancing property of pull while letting the
+dispatcher <em>push</em> to a known-free worker. (Lu et al., Microsoft, 2011.)</p>
+<div class="newprob"><b>Bottleneck:</b> still doesn&rsquo;t honour task-specific <em>affinity</em>; under sustained overload the idle-lists are empty and it degrades to the fallback.</div>
+<h4>Rung 3 — least-loaded push (when you must target)</h4>
+<p>If tasks need a specific worker (data locality, a warm cache, a GPU), push to the worker
+reporting the lowest load via heartbeats. But the global load view is <b>stale</b>, so every
+dispatcher piles onto whoever currently looks least-loaded &mdash; a <b>herd</b> that overshoots.</p>
+<h4>Rung 4 — power-of-two-choices ← robust targeted push</h4>
+<p>Pick <b>two</b> workers at random and send to the less loaded of the two. With stale
+information this gives near-optimal balance and avoids the herd &mdash; a tiny change with an
+outsized effect (max load ~log&nbsp;n &rarr; ~log&nbsp;log&nbsp;n).</p>
+<div class="note"><b>But doesn&rsquo;t random P2C pick an underpowered worker?</b> Yes &mdash; naive P2C
+compares <em>raw queue length</em>, so it can sample two weak/busy workers and route to the
+&ldquo;less bad&rdquo; one, ignoring real capacity. Three fixes: (1) compare <b>utilization</b>
+(in-flight &divide; capacity), not raw count &mdash; a small worker at 2/2 correctly loses to a big
+one at 4/10; (2) <b>filter feasible workers first</b>, then P2C among survivors (the K8s
+filter-then-score shape), so an underpowered worker is never a candidate; (3) <b>P2C +
+peak-EWMA</b> (Finagle&rsquo;s default) &mdash; latency-based load implicitly reflects capacity,
+since a weak worker runs slower and looks more loaded.</div>
+<p>On top of any targeted rung, layer <b>capability routing</b> (GPU tasks &rarr; GPU workers)
+and <b>affinity</b> (consistent-hash a task&rsquo;s entity to the same worker for cache locality,
+<a href="../primitives/p2.html">P2</a>).</p>
+<div class="tablewrap"><table>
+<tr><th>Rung</th><th>Good until</th><th>Breaks on</th></tr>
+<tr><td>Random/round-robin</td><td>uniform tasks &amp; workers</td><td>load-blind → hot workers</td></tr>
+<tr><td>Pull-based (← default)</td><td>homogeneous work</td><td>no targeting/affinity; shared-queue contention</td></tr>
+<tr><td>Join-Idle-Queue</td><td>huge fleets, capacity-aware</td><td>no affinity; empty idle-lists under overload</td></tr>
+<tr><td>Least-loaded push</td><td>need targeting</td><td>stale view → herd</td></tr>
+<tr><td>Power-of-two-choices</td><td>targeting at scale (use utilization, not raw count)</td><td>capacity-blind if it compares raw queue length</td></tr>
+</table></div>
+
+<h2 class="sec">9 &middot; The hard constraint, in depth</h2>
+<div class="hard"><p>You cannot get both <b>exactly-once execution</b> and fault tolerance
+without an expensive distributed transaction spanning the queue and the worker&rsquo;s side
+effects. A worker can finish the work and crash in the instant before acking &mdash; so the
+task <em>will</em> run again. The accepted answer is <b>at-least-once + idempotent workers</b>
+(<a href="../primitives/p9.html">P9</a>): make a second run produce the same result, and for any
+external side effect carry an idempotency key so the <em>effect</em> happens once even when
+the <em>execution</em> happens twice. Stop chasing true exactly-once.</p></div>
+
+<h2 class="sec">10 &middot; Scaling, observability &amp; bottlenecks</h2>
+<p>Workers scale out trivially under the pull model. The <b>queue</b> is the thing that
+bottlenecks: partition it (<a href="../primitives/p2.html">P2</a>) for throughput, accepting that
+global ordering is lost (usually fine for independent tasks). The <b>scheduler/cron firer</b>
+is a single elected node &mdash; cheap, but a failover must be clean (fencing) and cheap to
+recover (the bucketed-rebuild fix, §7). A <b>poison task</b> that always fails would loop
+forever without the DLQ + max-attempts cap. A hot tenant can starve others &mdash; add
+per-tenant queues or weighted fair scheduling.</p>
+<h3>Observability: don&rsquo;t lose the trace</h3>
+<p>An async task scheduled for 3 days out is a debugging black hole: when it fails, how do you
+tie it back to the HTTP request that created it? Capture the <b>W3C Trace Context</b>
+(<code>traceparent</code>/<code>tracestate</code>) into the task&rsquo;s <code>context</code> field
+at enqueue time, and have the worker <b>re-establish that span</b> when it runs days later. Now
+the worker&rsquo;s logs stitch to the original request in your APM (Datadog, Honeycomb), so a
+3-day-delayed failure is traceable to its origin. Carry the idempotency key in the same field.</p>
+
+<h2 class="sec">11 &middot; Real-world example</h2>
 <div class="example">
 <span class="tag">AWS SQS + Lambda &amp; Uber Cadence</span>
 <p>The simple case is <b>SQS + Lambda</b>: SQS provides at-least-once delivery, a
@@ -68,21 +278,59 @@ first-class concepts &mdash; the same at-least-once + idempotency philosophy, sc
 durable workflows (and the engine behind sagas, <a href="../primitives/p14.html">P14</a>).</p>
 </div>
 
-<h2 class="sec">6 &middot; Tradeoffs &amp; alternatives</h2>
+<h2 class="sec">12 &middot; Tradeoffs &amp; alternatives</h2>
 <p>A plain queue (SQS) is simple but you build orchestration yourself; a workflow engine
 (Temporal/Cadence) handles state and retries but is heavier. Shorter visibility timeouts
 recover from dead workers faster but risk double-processing live-but-slow ones.</p>
 
-<h2 class="sec">7 &middot; Key talking points</h2>
+<h2 class="sec">13 &middot; Interview follow-ups (Q&amp;A)</h2>
+<p><b>How do you pick a worker by capacity?</b> Prefer <b>pull-based</b> dispatch (or
+<b>JIQ</b> &mdash; idle workers advertise to dispatchers) so capacity is signalled by having a
+free slot, with no per-task load polling. When you must push, use <b>power-of-two-choices</b>
+&mdash; but compare <b>utilization (load &divide; capacity)</b>, not raw queue length, or it routes to
+an underpowered worker; equivalently, <b>filter feasible workers, then P2C</b>. Layer
+capability/affinity routing on top (§8).</p>
+<p><b>How do you guarantee a task isn&rsquo;t run twice for a money-side effect?</b> You can&rsquo;t
+prevent double <em>execution</em>; you make the <em>effect</em> idempotent &mdash; the worker
+carries an idempotency key and the side effect is deduped on it (<a href="../primitives/p9.html">P9</a>).</p>
+<p><b>A slow worker&rsquo;s lease expired and the task was reassigned &mdash; how do you stop its
+late ack from corrupting state?</b> The lease carries a <b>fencing token</b>; the queue rejects
+an ack whose token isn&rsquo;t the current one (<a href="../primitives/p10.html">P10</a>).</p>
+<p><b>How do you schedule 100M future tasks without scanning constantly?</b> Don&rsquo;t poll a
+big <code>WHERE run_at&le;now</code>; bucket by due-time and read only the current bucket, with a
+<b>timing wheel</b> for near-term tasks (§7).</p>
+<p><b>How do you stop one tenant from starving others?</b> Per-tenant queues or weighted fair
+queueing, so a flood from one tenant can&rsquo;t monopolise the worker pool.</p>
+<p><b>What if a task must run exactly at its scheduled second?</b> Be honest: a distributed
+scheduler gives <em>at-least</em> the requested time with small jitter, not hard real-time;
+tighten the wheel resolution if needed, but don&rsquo;t promise wall-clock precision.</p>
+<p><b>Why two tables instead of one?</b> Point ops (ack/status) want partitioning by
+<code>task_id</code>; the due-scan wants partitioning by time. One table can&rsquo;t serve both &mdash;
+a <code>task_id</code>-partitioned table forces the due query to scatter-gather every partition.
+So <code>tasks</code> (by id) + a <code>schedule</code> outbox (by time_bucket), drained and
+deleted as tasks fire (§3).</p>
+<p><b>A cron run overruns its next tick &mdash; concurrent, skip, or replace?</b> Make it explicit
+with a <code>concurrency_policy</code>: <b>Allow</b> (run concurrently), <b>Forbid</b> (skip while
+the prior run is in flight), or <b>Replace</b> (kill the old, start the new) &mdash; the firer
+checks the previous run&rsquo;s state before enqueuing (§7).</p>
+<p><b>How do you debug a task that fails 3 days after it was scheduled?</b> Propagate <b>W3C
+trace context</b> (<code>traceparent</code>) in the task&rsquo;s <code>context</code> field and
+re-open the span in the worker, so its logs stitch back to the original request in your APM (§10).</p>
+<p><b>How does prefetching cause double execution even with healthy workers?</b> Buffered tasks
+keep aging against their lease; if the buffer drains slowly they expire and get re-leased
+elsewhere. Cap prefetch and heartbeat <em>every</em> buffered task, not just the running one (§8).</p>
+
+<h2 class="sec">14 &middot; Key talking points</h2>
 <ul>
 <li>At-least-once + idempotent workers; drop the exactly-once dream (<a href="../primitives/p9.html">P9</a>).</li>
 <li>Visibility timeout / lease prevents double-running.</li>
 <li>Always a dead-letter queue for poison tasks.</li>
 <li>Single elected scheduler for cron (<a href="../primitives/p10.html">P10</a>).</li>
+<li>Pull-based dispatch self-balances load; power-of-two-choices when you must push.</li>
 <li>Exponential backoff on retries.</li>
 </ul>
 
-<h2 class="sec">8 &middot; Further reading</h2>
+<h2 class="sec">15 &middot; Further reading</h2>
 <ul>
 <li><a href="https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-visibility-timeout.html">SQS visibility timeout</a> &middot; <a href="https://temporal.io/">Temporal</a></li>
 </ul>

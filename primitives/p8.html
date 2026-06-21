@@ -17,61 +17,196 @@
 <hr>
 
 <h2 class="sec">1 &middot; The problem it solves</h2>
-<p>Two different cost problems: analytical queries that read a few columns over
-billions of rows waste enormous I/O in a row store, and data that is rarely read
-shouldn&rsquo;t sit on expensive hot storage. <b>Columnar</b> layout fixes the first;
-<b>tiering</b> fixes the second.</p>
+<p>This primitive answers two different cost questions that look unrelated but share
+one fix &mdash; <b>match the physical layout to the access pattern instead of storing
+everything the same way</b>.</p>
+<p>The first is <b>scan I/O</b>. An analytical query like
+<code>SELECT avg(latency_ms) FROM requests WHERE day = '2026-06-19'</code> touches two
+columns out of maybe two hundred, but a row store interleaves all columns on disk:
+to read those two values per row it must drag every other column through the I/O path
+and the CPU cache. On a billion-row table that is the difference between reading
+~16&nbsp;GB and reading ~200&nbsp;GB. <b>Columnar</b> layout fixes this.</p>
+<p>The second is <b>storage cost over time</b>. A metric scraped every 10&nbsp;seconds is
+read constantly for the first hour, occasionally for the first week, and almost never
+after a month &mdash; yet it costs the same per byte on hot SSD whether it is read a
+million times or never. <b>Tiering</b> fixes this by letting the storage medium decay in
+cost as the data&rsquo;s access frequency decays. <b>Compression</b> sits underneath both:
+it is what makes a column cheap to scan and cheap to keep.</p>
 
 <h2 class="sec">2 &middot; How it works</h2>
-<p><b>Columnar</b> (Parquet, ORC): store all values of a column together. A query that
-selects 3 of 200 columns reads only those 3, and same-type runs compress beautifully
-(dictionary, run-length, delta). <b>Tiering</b>: keep recent/hot data on fast storage,
-roll older data to cheaper tiers on an access-frequency decay
-(hot &rarr; warm &rarr; cold/archive). Time-series systems combine both: immutable,
-time-partitioned, compressed blocks that age into object storage.</p>
+<h3>Columnar layout</h3>
+<p>A row store writes one record contiguously: <code>(t0,host0,200)(t1,host1,201)&hellip;</code>.
+A column store (Parquet, ORC) transposes that &mdash; it writes <i>all</i> timestamps
+together, then all hosts, then all status codes:</p>
+<div class="estimate">row store  : [t0,h0,200][t1,h1,201][t2,h2,200][t3,h3,500] &hellip;
+column store: [t0,t1,t2,t3 &hellip;] [h0,h1,h2,h3 &hellip;] [200,201,200,500 &hellip;]
+                &uarr; one column, one contiguous run, one data type</div>
+<p>Two wins fall out of this transpose. <b>Projection pushdown</b>: a query reads only the
+column files it names, skipping the rest at the I/O layer. <b>Predicate pushdown</b>: each
+column chunk carries <b>min/max statistics</b> (and often a Bloom filter) in its footer, so
+a chunk whose <code>[min,max]</code> can&rsquo;t satisfy <code>WHERE day = &hellip;</code> is skipped
+without being read at all. And because a column is one data type with low cardinality or
+slow-changing values, it <b>compresses an order of magnitude better</b> than a mixed row.</p>
+
+<h3>The encodings that make a column small</h3>
+<p>Compression here is not one algorithm but a small toolbox, picked per-column-chunk by
+the writer based on the data it sees:</p>
+<div class="tablewrap"><table>
+<tr><th>Encoding</th><th>Best for</th><th>Sample column &rarr; encoded form</th></tr>
+<tr><td><b>Dictionary</b></td><td>Low-cardinality strings/categories</td>
+<td><code>[us-east,us-east,eu-west,us-east]</code> &rarr; dict <code>{0:us-east,1:eu-west}</code> + codes <code>[0,0,1,0]</code> (2 bits each)</td></tr>
+<tr><td><b>Run-length (RLE)</b></td><td>Long repeats (often after sorting)</td>
+<td><code>[200,200,200,200,500]</code> &rarr; <code>(200&times;4)(500&times;1)</code></td></tr>
+<tr><td><b>Delta + bit-pack</b></td><td>Sorted/monotonic ints, IDs, timestamps</td>
+<td><code>[1000,1004,1008,1012]</code> &rarr; base <code>1000</code> + deltas <code>[4,4,4]</code> packed in 3 bits</td></tr>
+<tr><td><b>Frame-of-reference</b></td><td>Clustered numeric ranges</td>
+<td><code>[5012,5009,5021]</code> &rarr; ref <code>5000</code> + <code>[12,9,21]</code></td></tr>
+</table></div>
+<p>These stack: dictionary codes are then RLE&rsquo;d, deltas are then bit-packed, and the
+whole chunk is finally run through a general compressor (Snappy, Zstd). The combination is
+why a sorted low-cardinality column can shrink 20&times; or more.</p>
+
+<h3 id="gorilla">Compression for time series: Gorilla</h3>
+<p>Time-series points have a brutal amount of structure the generic encodings above don&rsquo;t
+fully exploit: <b>consecutive points have near-identical timestamps and slowly-changing
+float values</b>. A raw point is 16 bytes &mdash; an 8-byte timestamp and an 8-byte IEEE-754
+double. Facebook&rsquo;s <b>Gorilla</b> scheme compresses a stream of such points to
+<b>~1.37 bytes per point</b> on production data &mdash; better than an order of magnitude &mdash;
+using two tricks, one per field.</p>
+
+<h4>Timestamps &rarr; delta-of-delta</h4>
+<p>Metrics are scraped on a fixed interval, so the <i>gap between gaps</i> is almost always
+zero. Gorilla stores the <b>delta of the delta</b> (how much the interval changed) with a
+variable-length prefix code &mdash; the more unusual the value, the more bits it costs:</p>
+<div class="estimate">delta-of-delta D = (t_n &minus; t_n&minus;1) &minus; (t_n&minus;1 &minus; t_n&minus;2)
+
+  D == 0            &rarr; '0'                     (1 bit)   &larr; the common case
+  D in [-63, 64]    &rarr; '10'  + 7-bit value
+  D in [-255, 256]  &rarr; '110' + 9-bit value
+  D in [-2047,2048] &rarr; '1110'+ 12-bit value
+  otherwise         &rarr; '1111'+ 32-bit value</div>
+<p>Worked on a 60-second scrape that hiccups by 8 seconds once:</p>
+<div class="estimate">t1=1609459260  delta=60   (first delta, 14 bits)
+t2=1609459320  delta=60   dod= 0  &rarr; '0'                  1 bit
+t3=1609459380  delta=60   dod= 0  &rarr; '0'                  1 bit
+t4=1609459448  delta=68   dod=+8  &rarr; '10' + 0001000      9 bits
+t5=1609459508  delta=60   dod=-8  &rarr; '10' + 1111000      9 bits</div>
+<p>On a clean stream essentially every timestamp after the first costs a <b>single bit</b>
+(the paper reports the vast majority of real timestamps land in the <code>D==0</code> case),
+versus 64 bits stored raw.</p>
+
+<h4>Values &rarr; XOR of consecutive doubles</h4>
+<p>Two successive readings of the same metric usually share most of their bits, so Gorilla
+stores <code>v_n XOR v_n&minus;1</code>. If the values are identical the XOR is all zeros &mdash;
+one bit. If not, the set bits cluster in a contiguous middle block, so it stores just that
+block: a count of leading zeros, the block length, then the meaningful bits.</p>
+<div class="estimate">v0 = 15.5     &rarr; store full 64 bits (block seed)
+v1 = 15.5     XOR = 0                                  &rarr; '0'                          1 bit
+v2 = 14.0625  XOR = 0000000000000011001000&hellip;0
+              lead0=14  meaningful=11001 (len 5)       &rarr; '1' '1' [14][5][11001]      18 bits
+v3 = 14.25    XOR = 0000000000000000101000&hellip;0
+              lead0=16 trail0=45 &mdash; fits inside v2's window
+                                                       &rarr; '1' '0' [00101]              7 bits</div>
+<p>Note v3: because its meaningful bits sit <i>within</i> the leading/trailing zero window
+already established by v2, Gorilla skips re-sending the lengths &mdash; control bit <code>'0'</code>
+says &ldquo;reuse the previous window&rdquo; and it spends only the 5 window bits. That window-reuse
+is most of the value-side savings. The first 64-bit seed amortizes to nothing over a
+two-hour block of hundreds of points.</p>
+<pre class="mermaid">
+graph TD
+  P[new point t,v] --> TS{timestamp}
+  TS -->|dod = 0| T1["emit '0' (1 bit)"]
+  TS -->|dod != 0| T2["emit prefix + N bits"]
+  P --> VX{XOR with prev value}
+  VX -->|XOR = 0| V1["emit '0' (1 bit)"]
+  VX -->|fits prev window| V2["'10' + meaningful bits"]
+  VX -->|new window| V3["'11' + lead + len + bits"]
+</pre>
+<div class="estimate">Per-point budget, raw vs Gorilla (steady metric, 2-hour block):
+  raw     : 64-bit ts + 64-bit value            = 128 bits = 16.0 bytes
+  Gorilla : ~1-bit ts + ~1-2 bit value (amort.) &asymp; 11 bits  &asymp; 1.37 bytes
+  &rarr; ~12&times; smaller; months of metrics fit in RAM, which is Gorilla's whole point</div>
+
+<h3>Tiering</h3>
+<p>Compression shrinks each point; tiering decides <i>where the compressed blocks live</i> as
+they age. Keep recent data fine-grained on fast storage, roll older data up (downsample
+1s&nbsp;&rarr;&nbsp;1m&nbsp;&rarr;&nbsp;1h) and migrate it to cheaper media on an access-frequency
+decay. Time-series systems combine all three moves: immutable, time-partitioned, Gorilla-
+compressed blocks that downsample and age into object storage.</p>
 <pre class="mermaid">
 graph LR
-  H[hot: SSD, fine-grained] --> W[warm: rolled up]
-  W --> C[cold: object store / archive]
+  H["hot: SSD, raw resolution, last hours"] --> W["warm: rolled up 1m, last weeks"]
+  W --> C["cold: object store / archive, 1h, months+"]
 </pre>
 
-<h2 class="sec">3 &middot; The new bottleneck it hands you</h2>
+<h2 class="sec">3 &middot; Variants &amp; when to use each</h2>
+<div class="tablewrap"><table>
+<tr><th>Lever</th><th>Use when</th><th>Cost it trades</th></tr>
+<tr><td>Columnar (Parquet/ORC)</td><td>Wide tables, scans touch few columns</td><td>Bad at point updates; rewrite whole column chunks</td></tr>
+<tr><td>Gorilla / time-series codec</td><td>Regular-interval float metrics</td><td>(De)compress CPU; needs append-only, in-block decoding</td></tr>
+<tr><td>Downsampling / roll-ups</td><td>Old data queried at coarse resolution</td><td>Lossy &mdash; raw resolution is gone</td></tr>
+<tr><td>Lifecycle tiers (S3 classes)</td><td>Access frequency decays with age</td><td>Cold reads are slow + per-request priced</td></tr>
+</table></div>
+
+<h2 class="sec">4 &middot; The new bottleneck it hands you</h2>
 <div class="newprob">
-<p>Columnar is superb for scans but <b>poor for point writes/updates</b> &mdash; you
-rewrite column files, so it&rsquo;s append/batch oriented, not OLTP. Compression trades
-<b>CPU</b> for I/O. Tiering trades <b>cold-tier latency</b> (a query over archived data
-is slow) and, for object storage, request cost. Immutability means updates become
-append + compaction.</p>
+<p>Columnar is superb for scans but <b>poor for point writes/updates</b> &mdash; a single-row
+change means rewriting column chunks, so it is append/batch oriented, not OLTP. Compression
+trades <b>CPU for I/O</b>: every read now pays a decode, and Gorilla&rsquo;s in-block scheme means
+you can&rsquo;t random-access point #500 without walking the block from its seed. Tiering trades
+<b>cold-tier latency</b> &mdash; a query over archived data is slow and, on object storage,
+per-request priced &mdash; and downsampling is <b>lossy</b>, so a roll-up you regret can&rsquo;t be
+un-rolled. Immutability turns every update into <b>append + compaction</b>, which is the
+write-amplification problem <a href="p17.html">P17 (LSM storage)</a> exists to manage.</p>
 </div>
 
-<h2 class="sec">4 &middot; Real-world example</h2>
+<h2 class="sec">5 &middot; Real-world example</h2>
 <div class="example">
-<span class="tag">Google Dremel / BigQuery</span>
-<p>Dremel (the engine behind BigQuery) stores data in a <b>columnar</b> format and
-scans only the projected columns across thousands of nodes, which is how it scans
-terabytes in seconds without indexes &mdash; the columnar read is the optimization. Its
-open-source descendant <b>Parquet</b> is now the default analytical file format
-(used by Spark, Presto, Snowflake). On the tiering side, Amazon <b>S3 storage
-classes</b> (Standard &rarr; Infrequent Access &rarr; Glacier) implement the
-access-frequency decay model: cheaper per-GB, slower/per-request-pricier to read.</p>
+<span class="tag">Facebook Gorilla</span>
+<p>Gorilla is Facebook&rsquo;s in-memory time-series store (the engine under Beringei and the
+inspiration for Prometheus&rsquo;s TSDB). The delta-of-delta + XOR scheme above took their
+production metric stream from 16 bytes/point to <b>~1.37 bytes/point</b> &mdash; the ~12&times; that
+let them hold <b>26 hours of data for ~10&nbsp;billion time series in RAM</b>, turning queries
+that hit disk into in-memory reads. The compression <i>is</i> the architecture: it is what
+makes the in-memory tier economically possible.</p>
+</div>
+<div class="example">
+<span class="tag">Google Dremel / BigQuery &middot; Parquet &middot; S3</span>
+<p>Dremel (the engine behind BigQuery) stores data <b>columnar</b> and scans only projected
+columns across thousands of nodes &mdash; how it scans terabytes in seconds without indexes.
+Its open-source descendant <b>Parquet</b> is now the default analytical file format (Spark,
+Presto, Snowflake), carrying the same dictionary/RLE/delta encodings and per-chunk min/max
+stats for predicate pushdown. On the tiering side, Amazon <b>S3 storage classes</b>
+(Standard&nbsp;&rarr;&nbsp;Infrequent&nbsp;Access&nbsp;&rarr;&nbsp;Glacier) implement the
+access-frequency decay model directly: cheaper per-GB, slower and per-request-pricier to
+read. See <a href="../systems/s6.html">Datadog (S6)</a> and <a href="../systems/s5.html">Object store (S5)</a>.</p>
 </div>
 
-<h2 class="sec">5 &middot; Applying it in a design</h2>
-<p>For analytics: <i>"columnar storage with predicate/projection pushdown so we only
-read needed columns."</i> For cost: <i>"hot data fine-grained on SSD, roll up and tier
-to object storage after N days."</i> See <a href="../systems/s8.html">Distributed SQL</a> and
-<a href="../systems/s6.html">Datadog</a>.</p>
+<h2 class="sec">6 &middot; Applying it in a design</h2>
+<p>For analytics: <i>&ldquo;columnar storage with predicate and projection pushdown so we read
+only the columns and chunks a query needs.&rdquo;</i> For metrics: <i>&ldquo;Gorilla-style
+delta-of-delta on timestamps and XOR on values, so a month of series fits in RAM.&rdquo;</i>
+For cost: <i>&ldquo;raw resolution on SSD for N days, then downsample and tier to object
+storage.&rdquo;</i> The sentence that shows you understand the tradeoff:
+<i>&ldquo;columnar and compressed buys scan throughput and cheap retention, but I&rsquo;m giving up
+point updates and paying CPU on every read &mdash; so this tier is append-only.&rdquo;</i>
+See <a href="../systems/s8.html">Distributed SQL (S8)</a> and <a href="../systems/s6.html">Datadog (S6)</a>.</p>
 
-<h2 class="sec">6 &middot; Pitfalls</h2>
+<h2 class="sec">7 &middot; Pitfalls</h2>
 <ul>
-<li>Using columnar for a write-heavy OLTP workload.</li>
-<li>Tiering data to cold storage that&rsquo;s still queried interactively.</li>
+<li>Using columnar for a write-heavy OLTP workload &mdash; every update rewrites chunks.</li>
+<li>Tiering or downsampling data that is still queried interactively at fine resolution.</li>
+<li>Leaving columns unsorted: RLE and delta encodings collapse on unsorted data, so the
+clustering/sort order is half the compression win.</li>
+<li>Forgetting Gorilla blocks are sequential-decode-only &mdash; you can&rsquo;t seek to one point
+without replaying the block from its 64-bit seed.</li>
 </ul>
 
-<h2 class="sec">7 &middot; Further reading</h2>
+<h2 class="sec">8 &middot; Further reading</h2>
 <ul>
+<li><a href="https://www.vldb.org/pvldb/vol8/p1816-teller.pdf">Gorilla: A Fast, Scalable, In-Memory Time Series Database (Pelkonen et al., VLDB 2015)</a> &mdash; the delta-of-delta + XOR scheme.</li>
 <li><a href="https://research.google/pubs/pub36632/">Dremel: Interactive Analysis of Web-Scale Datasets</a></li>
-<li><a href="https://parquet.apache.org/">Apache Parquet</a> &middot; <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/storage-class-intro.html">S3 storage classes</a></li>
+<li><a href="https://parquet.apache.org/docs/file-format/data-pages/encodings/">Apache Parquet encodings</a> &middot; <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/storage-class-intro.html">S3 storage classes</a></li>
 </ul>
 
 <div class="prevnext"><a href="p7.html">&larr; P7 &middot; Scatter-gather</a><a href="p9.html">P9 &middot; Idempotency &rarr;</a></div>
