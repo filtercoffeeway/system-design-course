@@ -8,84 +8,127 @@
 <nav class="side" id="side"></nav>
 <main><div class="reading" id="top">
 <div class="crumb"><a href="../index.html">Curriculum</a> / Part III · Systems / Cluster C — High fan-out</div><h1>9 · Social Feed (Twitter / Instagram)</h1>
-<div class="summary"><div class="hard"><b>Hard constraint:</b> the celebrity / hot-user problem — one write from 100M followers triggers 100M synchronous fan-outs; naive push deadlocks.</div><div class="prims"><b>Primitives exercised:</b> <a href="../primitives/p5.html">P5</a> (fan-out), <a href="../primitives/p2.html">P2</a> (hot-key), <a href="../primitives/p4.html">P4</a> (sorted set).</div><p>Fan-out on write vs read; hybrid (push for normal, pull for celebrities) + hot-node detection; ranked vs chronological (ML breaks simple merge); Redis sorted set as the natural timeline structure.</p></div>
+<div class="summary"><div class="hard"><b>Hard constraint:</b> the celebrity / hot-user problem — one post by an account with 100M followers triggers 100M timeline writes. Naive fan-out-on-write can't absorb that, and naive fan-out-on-read can't serve the timeline fast. The answer is a hybrid driven by author degree.</div><div class="prims"><b>Primitives exercised:</b> <a href="../primitives/p5.html">P5</a> (fan-out), <a href="../primitives/p2.html">P2</a> (hot-key), <a href="../primitives/p4.html">P4</a> (timeline cache / sorted set), <a href="../primitives/p7.html">P7</a> (merge), <a href="../primitives/p12.html">P12</a> (tail).</div><p>Fan-out on write vs read; hybrid (push for the tail, pull for celebrities) + hot-author detection; Redis sorted set as the timeline; chronological merge vs ML ranking (candidate-gen + re-rank).</p></div>
 
 <hr>
 
-<h2 class="sec">1 &middot; Requirements &amp; scale</h2>
-<p><b>Functional:</b> users follow others; posting distributes to followers; each user
-reads a merged, recent (often ranked) timeline. <b>Non-functional:</b> very fast reads
-(timeline open is the most common action), reasonable write latency, handle wildly
-uneven follower graphs.</p>
-<div class="estimate">Back-of-envelope
-300,000,000 DAU, each opens timeline ~10x/day = 3x10^9 reads/day (~35k/s avg, higher peak)
-avg user posts a few times/day                -> reads &gt;&gt; writes by orders of magnitude
-follower distribution                          power-law: most tiny, a few at 100M+
+<h2 class="sec">1 &middot; Requirements</h2>
+<p><b>Functional:</b> users follow others; a post distributes to followers; each user opens a merged, recent (often ML-ranked) home timeline; support likes/reposts/replies counts. <b>Non-functional:</b></p>
+<div class="tablewrap"><table>
+<tr><th>Property</th><th>Target</th><th>Consequence</th></tr>
+<tr><td>Read latency</td><td>timeline opens in &lt; ~200 ms</td><td>precompute timelines; cache (<a href="../primitives/p4.html">P4</a>)</td></tr>
+<tr><td>Read:write ratio</td><td>reads &raquo; writes (~20:1+)</td><td>do work at write time, not read time</td></tr>
+<tr><td>Graph skew</td><td>power-law: most tiny, a few at 100M+</td><td>no single fan-out works (&sect;4, the wall)</td></tr>
+<tr><td>Freshness</td><td>new posts appear in seconds</td><td>push for most; pull-merge for the few huge</td></tr>
+<tr><td>Availability</td><td>timeline always loads (stale OK)</td><td>cache is rebuildable from source posts</td></tr>
+</table></div>
+<p>The whole design follows from one asymmetry: <b>reads vastly outnumber writes</b>, so you want to pay at <em>write</em> time to make reads cheap &mdash; <em>except</em> the celebrity case breaks that, which is the entire interview.</p>
+
+<h2 class="sec">2 &middot; Capacity estimation</h2>
+<div class="estimate">300,000,000 DAU, each opens timeline ~10x/day = 3,000,000,000 reads/day
+  -> ~35,000 reads/s average, ~100,000/s peak
+posts: ~0.5/user/day = 150,000,000/day  -> ~1,700/s
+  -> read:write ~ 20:1  -> optimize the READ path
+
+fan-out-on-write cost (avg 200 followers): 150M posts x 200 = 30,000,000,000 timeline writes/day
+celebrity (100M followers): ONE post = 100,000,000 timeline writes
+  at 1M writes/s that's ~100 s of pure fan-out for a single tweet     <- the wall
+
+timeline cache: 300M users x ~800 recent entries x 16 B (id+score) ~ 3.8 TB in Redis
 </div>
 
-<h2 class="sec">2 &middot; High-level architecture</h2>
+<h2 class="sec">3 &middot; API & data model</h2>
+<div class="estimate">post(user_id, content) -> post_id
+getTimeline(user_id, cursor, limit) -> [posts]      // the hot path
+follow(user_id, target) / unfollow(...)
+
+posts:      post_id (Snowflake, time-sortable) -> {author, content, ts, counts}
+graph:      followers(user_id) -> [user]   /   following(user_id) -> [user]
+timeline:   user_id -> sorted set { post_id : score }   (Redis, capped to recent N)  (P4)
+</div>
+<p>Post IDs are <b>Snowflake</b>-style (time-ordered, see <a href="../systems/s14.html">S14</a>/<a href="../primitives/p10.html">P10</a>) so a timeline sorts by ID without a separate timestamp and merges are trivial.</p>
+
+<h2 class="sec">4 &middot; The fan-out ladder (the heart of the design)</h2>
+<h3>Rung 1 &mdash; fan-out on read (pull)</h3>
+<p>Store nothing per-follower. At read time, fetch the recent posts of everyone the user follows and merge-sort by time (<a href="../primitives/p7.html">P7</a>). <b>Good until:</b> users follow many accounts &mdash; merging hundreds of followees' posts on <em>every</em> timeline open, 100k times/s, is enormous read-time work and slow. Reads dominate, so paying at read time is exactly backwards.</p>
+<h3>Rung 2 &mdash; fan-out on write (push)</h3>
+<p>When a user posts, immediately append the post id to <em>every follower's</em> precomputed timeline (a Redis sorted set). A read is then O(1): just slice the user's own timeline. Perfect for the read-heavy workload. <b>Breaks on:</b> the <b>celebrity</b> &mdash; a 100M-follower post is 100M writes per tweet (~100 s of fan-out), a massive bursty amplification; and it wastes writes pushing to inactive followers who'll never open the app.</p>
+<h3>Rung 3 &mdash; hybrid (push for the tail, pull for the head)</h3>
+<p>Classify authors by follower count. <b>Ordinary authors</b> (below a threshold T) are <b>pushed</b> at write time into followers' timelines. <b>Celebrities</b> (followers &ge; T) are <b>not</b> pushed; instead, at read time, the reader's timeline is the merge of (a) their precomputed pushed timeline and (b) a pull of the handful of celebrities they follow (whose recent posts are cached once, globally, and read by all their followers).</p>
+<div class="estimate">read(user):
+  base   = timeline_cache[user]                  // pushed posts from normal authors (O(1))
+  celebs = [c for c in following(user) if is_celebrity(c)]
+  recent = union(celeb_recent_cache[c] for c in celebs)   // few, globally cached
+  return rank(merge(base, recent))[:limit]
+</div>
+<p>Why this works: pushing a celebrity to 100M timelines is the expensive thing, and there are few celebrities, so <em>pulling</em> them is cheap (one cached read per celebrity, shared by all followers). Pushing the long tail is cheap per author and makes the common read O(1). You pay the right cost on the right side for each population. The threshold T (~tens of thousands of followers) is tuned where push cost (followers per post) exceeds pull cost (followers-who-open &times; merge work).</p>
+<div class="tablewrap"><table>
+<tr><th>Strategy</th><th>Write cost</th><th>Read cost</th><th>Breaks on</th></tr>
+<tr><td>Pull (read)</td><td>O(1)</td><td>merge all followees</td><td>read-heavy load, many followees</td></tr>
+<tr><td>Push (write)</td><td>O(followers)</td><td>O(1)</td><td>celebrity 100M-write storm</td></tr>
+<tr><td>Hybrid</td><td>O(followers) for tail only</td><td>O(1) + merge few celebs</td><td>two paths + a hot-author classifier</td></tr>
+</table></div>
+
+<h2 class="sec">5 &middot; High-level architecture</h2>
 <pre class="mermaid">
 graph TD
-  POST[post] --> FO[fan-out service]
-  FO -->|normal users: push| TL[(per-user timeline cache: Redis)]
-  CEL[celebrity post] -->|do NOT push| PULL[pull + merge at read]
+  POST[post] --> CL{author degree?}
+  CL -->|normal| FO[fan-out workers] -->|append id| TL[(per-user timeline: Redis sorted set)]
+  CL -->|celebrity| CC[(celeb recent-posts cache, global)]
   READ[open timeline] --> TL
-  READ --> PULL
-  TL --> RANK[rank/merge] --> READ
+  READ --> CC
+  TL --> MG[merge + rank] --> READ
+  POST --> PS[(durable post store)]
 </pre>
+<p>Fan-out is async off the post path: <code>post()</code> writes the durable post + enqueues a fan-out job; workers drain it into follower timelines. The timeline cache is capped to the most recent N ids and is rebuildable from the durable post store + graph, so losing it is a latency event, not data loss (<a href="../primitives/p4.html">P4</a>).</p>
 
-<h2 class="sec">3 &middot; The hard constraint, in depth</h2>
-<div class="hard"><p>The <b>celebrity / hot-user</b> problem. With fan-out on write, one
-post by an account with 100M followers triggers 100M timeline writes &mdash;
-synchronously, that deadlocks the system; even async it&rsquo;s a massive, bursty
-amplification. So you cannot push for everyone. The standard answer is <b>hybrid</b>:
-push for ordinary authors, pull-and-merge for the few huge ones, detected by follower
-count (<a href="../primitives/p5.html">P5</a>, <a href="../primitives/p2.html">P2</a> hot-key).</p></div>
+<h2 class="sec">6 &middot; The hot-author / celebrity handling (P2)</h2>
+<div class="hard"><p>The celebrity is a <b>hot key</b> (<a href="../primitives/p2.html">P2</a>): the author node, and the read fan-out of their post, concentrate load. Detection is by follower count (or recent posting velocity), maintained as the graph changes. A user can cross the threshold (a viral moment), so the classifier must update and the system must handle the transition (stop pushing, start being pulled).</p></div>
+<p>Two subtleties the sharp interviewer raises: (1) <b>The fan-out itself must be fanned out</b> &mdash; even a 200-follower push, multiplied by 1,700 posts/s, is millions of writes/s, so fan-out workers are sharded and the timeline store is partitioned by user. (2) <b>Bursty celebrity reads</b> &mdash; when a celebrity posts, all their followers' next reads pull the same cached post; request coalescing / a hot replica (<a href="../primitives/p4.html">P4</a>) prevents a stampede on that one cache key.</p>
 
-<h2 class="sec">4 &middot; Component deep dives</h2>
-<h3>Fan-out strategy (P5)</h3>
-<p>Push (fan-out on write) precomputes each follower&rsquo;s timeline for O(1) reads;
-pull (fan-out on read) merges followees&rsquo; recent posts at query time. Hybrid mixes
-them by author degree &mdash; see <a href="../primitives/p5.html">P5</a>.</p>
-<h3>Timeline storage (P4)</h3>
-<p>A per-user timeline is naturally a <b>Redis sorted set</b> keyed by score = timestamp
-(or rank score), capped to the most recent N entries &mdash; a cache (<a href="../primitives/p4.html">P4</a>)
-that can be rebuilt from source.</p>
-<h3>Ranking</h3>
-<p>A chronological feed is a simple merge; an <b>ML-ranked</b> feed scores candidates
-(engagement, recency, affinity) and can no longer be a plain timeline merge &mdash; it
-becomes candidate-generation + ranking.</p>
+<h2 class="sec">7 &middot; Ranking: chronological vs ML (ladder)</h2>
+<p><b>Chronological</b> is a pure time-sorted merge &mdash; trivial, but lower engagement and vulnerable to spam volume. <b>ML-ranked</b> feeds change the shape: the timeline is no longer "the most recent posts" but "the best posts," scored by predicted engagement, affinity to the author, recency, and media type. That turns the read into a two-stage pipeline (same shape as <a href="../systems/s7.html">S7</a>/<a href="../systems/s19.html">S19</a>):</p>
+<ul>
+<li><b>Candidate generation:</b> gather a few hundred candidates (pushed timeline + pulled celebrity posts + "out-of-network" recommended posts).</li>
+<li><b>Ranking:</b> a model scores each candidate; the top ones are returned. The expensive model runs only over the recalled shortlist, never the whole post corpus.</li>
+</ul>
+<p>This is why a ranked feed can't just be a Redis slice: the sorted set gives <em>candidates</em>, and an inference service produces the final order. The counts (likes/reposts) feeding ranking are themselves an approximate-counting problem at scale (<a href="../systems/s22.html">S22</a>).</p>
 
-<h2 class="sec">5 &middot; Real-world example</h2>
+<h2 class="sec">8 &middot; Scaling & bottlenecks at 10&times;</h2>
+<p>At 1M reads/s: the timeline cache shards by user; celebrity post caches get extra replicas to absorb read bursts. Fan-out becomes the write-side bottleneck during mega-events (a global celebrity posts during the Super Bowl) &mdash; the fan-out queue absorbs the burst and drains over seconds (followers see the post within seconds, which is fine). <b>Inactive-follower waste</b> grows: optimize by only pushing to <em>recently active</em> users and lazily rebuilding a returning user's timeline from source (pull) on login. The graph store (followers/following) is itself huge and is sharded; "who follows X" for a celebrity is a hot, large list, often stored/streamed rather than loaded wholesale.</p>
+
+<h2 class="sec">9 &middot; Tradeoffs & alternatives</h2>
+<p>Pure push: fastest reads, but the celebrity storm and wasted writes to dormant followers. Pure pull: cheap writes, slow reads &mdash; wrong for a read-heavy product. Hybrid: best overall, at the cost of two code paths and a hot-author classifier. Chronological (simple, transparent, "real-time") vs ML-ranked (more engagement and infra, less predictable, harder to debug "why did I see this?"). Cap stored timeline length (you don't need a user's 10,000th-oldest post in cache) to bound memory &mdash; deep scrollback falls back to a pull from the durable store.</p>
+
+<h2 class="sec">10 &middot; Real-world example</h2>
 <div class="example">
 <span class="tag">Twitter / Instagram</span>
-<p>Twitter&rsquo;s home timeline pushes tweets into per-follower timelines held in Redis
-for fast reads, but switches to pulling at read time for very-high-follower accounts to
-avoid the fan-out explosion &mdash; the canonical hybrid. Instagram (heavily Django +
-Cassandra + Redis) similarly precomputes feeds and caps stored entries, leaning on
-caching and careful denormalization. In both, the architecture is a direct consequence
-of the celebrity constraint: there is no single fan-out strategy that works for both
-the long tail and the megastars.</p>
+<p>Twitter's home-timeline architecture pushes tweets into per-follower timelines held in Redis for fast O(1) reads, but switches to <b>pulling at read time for very-high-follower accounts</b> to avoid the fan-out explosion &mdash; the canonical hybrid, and the source of the "celebrity problem" framing. Instagram (Django + Cassandra + Redis) similarly precomputes feeds, caps stored entries, and leans heavily on caching and denormalization. Both moved from chronological to <b>ranked</b> feeds, turning the read into candidate-generation + ML ranking. In every case the architecture is a direct consequence of the celebrity constraint: there is no single fan-out strategy that serves both the long tail and the megastars.</p>
 </div>
 
-<h2 class="sec">6 &middot; Tradeoffs &amp; alternatives</h2>
-<p>Pure push: fastest reads, breaks on celebrities and wastes writes on inactive
-followers. Pure pull: cheap writes, slow reads at scale. Hybrid: best overall, at the
-cost of two paths and a hot-author classifier. Ranking adds latency and infra but
-drives engagement.</p>
+<h2 class="sec">11 &middot; Interview follow-ups (Q&amp;A)</h2>
+<p><b>Q: Why not just fan-out on write for everyone?</b> A 100M-follower post is 100M writes (~100 s of fan-out for one tweet) and wastes writes on dormant followers. The expensive population (celebrities) is small, so pull them at read time instead; push only the cheap long tail.</p>
+<p><b>Q: How do you pick the push/pull threshold?</b> Where push cost (followers written per post) exceeds pull cost (active followers &times; per-read merge of that author). Empirically tens of thousands of followers; it's tuned, and authors crossing it switch strategy.</p>
+<p><b>Q: A user follows 50 celebrities &mdash; their read now merges 50 pulled lists. Is that slow?</b> Each celebrity's recent posts are cached <em>once globally</em> and read by all followers, so it's 50 cheap cache reads + a small merge, not 50 expensive computations. Coalesce concurrent reads of a hot celebrity post.</p>
+<p><b>Q: How do you avoid a stampede when a celebrity posts and millions refresh?</b> The celebrity post lands in one global cache key; request coalescing / hot replicas serve the burst (<a href="../primitives/p4.html">P4</a>), rather than each reader recomputing.</p>
+<p><b>Q: How does an ML-ranked feed change the design?</b> The timeline sorted set becomes a <em>candidate source</em>, not the final order; a ranking service scores candidates and reorders. Reads go from a Redis slice to candidate-gen + inference, adding latency and infra (same pattern as <a href="../systems/s7.html">S7</a>).</p>
+<p><b>Q: What happens when the timeline cache is lost?</b> It's a rebuildable cache, not the source of truth &mdash; rebuild a user's timeline from the durable post store + their follow graph on next read. Availability over precomputation; the cost is a slower first load.</p>
+<p><b>Q: How do you handle counts (likes/reposts) at this scale?</b> Approximate, mergeable counters rather than a hot row per post (<a href="../systems/s22.html">S22</a>/<a href="../primitives/p2.html">P2</a> hot-key) &mdash; exact-to-the-like isn't required for ranking or display.</p>
 
-<h2 class="sec">7 &middot; Key talking points</h2>
+<h2 class="sec">12 &middot; Key talking points</h2>
 <ul>
-<li>Reads &gt;&gt; writes; optimize the timeline read.</li>
-<li>Hybrid fan-out; push for the tail, pull for celebrities (<a href="../primitives/p5.html">P5</a>).</li>
-<li>Redis sorted set as the timeline structure (<a href="../primitives/p4.html">P4</a>).</li>
-<li>Hot-user detection (<a href="../primitives/p2.html">P2</a>).</li>
-<li>Chronological merge vs ML ranking.</li>
+<li>Reads &raquo; writes (~20:1) &rarr; do the work at <b>write</b> time to make reads O(1).</li>
+<li>Fan-out ladder: pull &rarr; push &rarr; <b>hybrid</b> (push the tail, pull celebrities) &mdash; the celebrity is a hot key (<a href="../primitives/p5.html">P5</a>, <a href="../primitives/p2.html">P2</a>).</li>
+<li>Per-user timeline = a capped <b>Redis sorted set</b>, a rebuildable cache (<a href="../primitives/p4.html">P4</a>); Snowflake ids make merges time-ordered.</li>
+<li>Push only to <em>active</em> followers; lazily rebuild a returning user's timeline from source.</li>
+<li>Ranked feed = candidate generation + ML re-rank, not a plain merge (same shape as <a href="../systems/s7.html">S7</a>/<a href="../systems/s19.html">S19</a>).</li>
+<li>Celebrity post = a hot cache key; coalesce reads to avoid a stampede.</li>
 </ul>
 
-<h2 class="sec">8 &middot; Further reading</h2>
+<h2 class="sec">13 &middot; Further reading</h2>
 <ul>
-<li><a href="https://www.infoq.com/presentations/Twitter-Timeline-Scalability/">Twitter timeline scalability</a></li>
+<li><a href="https://www.infoq.com/presentations/Twitter-Timeline-Scalability/">Twitter timeline scalability (InfoQ)</a></li>
+<li><a href="https://instagram-engineering.com/">Instagram Engineering</a> &middot; Twitter Engineering — home timeline / fan-out</li>
 </ul>
 
 <div class="prevnext"><a href="s8.html">&larr; S8 &middot; Distributed SQL</a><a href="s10.html">S10 &middot; Chat &rarr;</a></div>

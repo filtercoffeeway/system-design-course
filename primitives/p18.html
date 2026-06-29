@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>P18 Distributed sort — System Design Curriculum</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head><body>
+<div class="wrap">
+<nav class="side" id="side"></nav>
+<main><div class="reading" id="top">
+<div class="crumb"><a href="../index.html">Curriculum</a> / Part II · Primitives / P18</div><h1>P18 · Distributed sort &amp; external merge (MapReduce)</h1>
+<div class="summary"><div class="field"><b>What it is:</b> sort (or group/join) a dataset far larger than one machine's RAM by spilling sorted runs to disk and merging them — and, at cluster scale, by shuffle-partitioning data across nodes.</div>
+<div class="field"><b>Reach for it when:</b> "sort/group/join a dataset bigger than memory," batch ETL, building an index, coordinating a cluster over a huge input.</div>
+<div class="field"><b>The lever:</b> never need all data in memory at once — produce sorted <em>runs</em> that fit in RAM, then do a streaming k-way merge; across nodes, range/hash-partition so each node sorts only its slice.</div>
+<div class="newprob"><b>New problem it hands you:</b> the <b>shuffle</b> (moving data so co-sorted/co-grouped rows land together) becomes the dominant cost (<a href="../primitives/p7.html">P7</a>); data <b>skew</b> makes one partition a straggler (<a href="../primitives/p12.html">P12</a>); intermediate spill needs disk + fault tolerance.</div>
+<div class="prims"><b>Exemplified by:</b> <a href="../systems/s8.html">Distributed SQL (sort-merge join)</a>, <a href="../systems/s16.html">Video transcode (map/stitch)</a>, MapReduce/Spark.</div></div>
+
+<hr>
+
+<h2 class="sec">1 &middot; The problem it solves</h2>
+<p>You must sort, group, deduplicate, or join a dataset that doesn't fit in RAM &mdash; a terabyte of logs, a petabyte of clickstream, the input to an index build. An in-memory sort (<code>quicksort</code>) needs the whole array in memory and dies the moment the data exceeds RAM. The fix is a family of techniques that process the data in <em>memory-sized pieces</em>, the foundation under sort-merge joins, group-by, and the entire MapReduce/Spark batch model.</p>
+
+<h2 class="sec">2 &middot; The ladder: in-memory → external → distributed</h2>
+<h3>Rung 0 &mdash; in-memory sort</h3>
+<p><code>sort(array)</code> in RAM. O(n log n), simple, fast. <b>Breaks on:</b> data &gt; RAM &mdash; you can't even load it.</p>
+<h3>Rung 1 &mdash; external merge sort (one machine, data &gt; RAM)</h3>
+<p>Two phases. <b>Run-generation (the "spill"):</b> read a RAM-sized chunk, sort it in memory, write it to disk as a sorted <b>run</b>; repeat until the input is exhausted. <b>Merge:</b> open all runs at once and do a <b>k-way merge</b> &mdash; a min-heap holds the current head of each run; pop the smallest, write it to output, advance that run, repeat. Memory only ever holds one chunk (phase 1) or k small read-buffers + one output buffer (phase 2), never the whole dataset.</p>
+<div class="estimate">1 TB to sort, 8 GB RAM:
+  run generation: 1 TB / 8 GB        = 125 sorted runs of 8 GB each
+  merge fan-in: RAM / per-run buffer = 8 GB / 8 MB = ~1000 runs mergeable in one pass
+  125 runs < 1000  ->  ONE merge pass suffices
+  passes = ceil(log_1000(125)) = 1
+  total disk IO ~ read+write data once per phase ~ 3 x 1 TB = 3 TB
+</div>
+<p><b>The k-way merge, stepped:</b> heads of 3 runs = [run1:2, run2:5, run3:1]; heap min = 1 &rarr; emit 1, advance run3 to its next value; heap is now [2,5,9] &rarr; emit 2; and so on. Each output record costs one O(log k) heap operation. <b>Breaks on:</b> too many runs for one merge pass (k &gt; fan-in) forces multiple passes (each re-reads the whole dataset), and a single disk's I/O caps throughput.</p>
+<p><b>Two optimizations that matter in practice.</b> (1) <b>Replacement selection</b> generates <em>longer</em> runs than a plain sort-a-chunk approach: keep a min-heap of size = RAM, and as you emit the smallest record, pull in the next input record &mdash; if it's &ge; the one just emitted it can still join the <em>current</em> run, otherwise it's held for the next. On random data this yields runs of ~2&times; RAM on average (and a single run if the input is already nearly sorted), halving the number of runs the merge must handle. (2) <b>Double-buffering / overlap:</b> while the CPU merges from one set of read buffers, the next blocks are prefetched and the output buffer is flushed asynchronously, so disk I/O and compute overlap instead of stalling each other &mdash; the difference between being I/O-bound at disk speed and being twice as slow. Both are why a real external sort is closer to "read once, write once, merge once" than the naive pass count suggests.</p>
+<h3>Rung 2 &mdash; distributed sort / shuffle (data &raquo; one machine)</h3>
+<p>Spread the data and the sorting across a cluster. Two patterns:</p>
+<ul>
+<li><b>Range-partition then local sort (TeraSort style):</b> sample the data to pick range boundaries; route each record to the node owning its range (the <b>shuffle</b>); each node sorts its range locally (external merge sort, rung 1); concatenating nodes' outputs in range order yields a globally sorted result &mdash; no final global merge needed.</li>
+<li><b>MapReduce shuffle (sort as a side effect):</b> <em>map</em> emits (key, value); the framework <b>partitions</b> by key, <b>sorts</b> each partition, and groups equal keys; <em>reduce</em> sees keys in sorted order with their values grouped. Sorting is how grouping happens.</li>
+</ul>
+<div class="estimate">map -> partition(key) -> sort within partition -> reduce (keys arrive grouped & sorted)
+1 PB over 1000 nodes -> ~1 TB/node; each node range-sorts its slice;
+shuffle moves each record once to its target partition  <- the dominant cost
+</div>
+
+<h2 class="sec">3 &middot; How it works (diagram)</h2>
+<pre class="mermaid">
+graph TD
+  IN[huge input] --> M1[map/scan: chunk + sort -> runs]
+  IN --> M2[map/scan]
+  M1 -->|shuffle: partition by range/key| P1[partition A]
+  M1 --> P2[partition B]
+  M2 --> P1
+  M2 --> P2
+  P1 --> R1[node sorts A locally: external merge]
+  P2 --> R2[node sorts B locally]
+  R1 --> OUT[concatenate in order = globally sorted]
+  R2 --> OUT
+</pre>
+
+<h2 class="sec">4 &middot; The new bottleneck: shuffle &amp; skew</h2>
+<div class="newprob">
+<p><b>The shuffle dominates.</b> Sorting locally is cheap; <em>moving</em> every record across the network to its target partition is the expensive part &mdash; an all-to-all transfer of the entire dataset (the same cost that dominates <a href="../systems/s8.html">distributed SQL</a> joins, <a href="../primitives/p7.html">P7</a>). Minimizing and overlapping shuffle with compute is the real engineering.</p>
+<p><b>Skew makes one partition a straggler.</b> If range boundaries are poorly chosen (or one key is hot), one node gets far more data than the rest and the whole job waits on it (<a href="../primitives/p12.html">P12</a>). Fixes: <b>sample</b> the data to pick balanced range boundaries; <b>salt</b> a hot key across sub-partitions; speculative execution for the laggard.</p>
+</div>
+
+<h2 class="sec">5 &middot; Variants &amp; when to use each</h2>
+<div class="tablewrap"><table>
+<tr><th>Technique</th><th>Use when</th><th>Cost</th></tr>
+<tr><td>In-memory sort</td><td>data fits in RAM</td><td>O(n log n), trivial</td></tr>
+<tr><td>External merge sort</td><td>data &gt; RAM, one machine</td><td>~2&ndash;3 disk passes; bounded by one disk</td></tr>
+<tr><td>Range-partition + local sort</td><td>globally sorted output at cluster scale</td><td>one shuffle; needs good boundaries (sampling)</td></tr>
+<tr><td>MapReduce/hash shuffle</td><td>group-by / join / dedup at scale</td><td>shuffle + per-partition sort; skew-sensitive</td></tr>
+</table></div>
+<p>The <b>fault-tolerance</b> dial differs too: batch frameworks (MapReduce, Spark) <em>materialize</em> the shuffle output to disk so a failed task re-runs from the last stage, not from scratch &mdash; the reason a 6-hour job survives a node death (contrast streaming MPP in <a href="../systems/s8.html">S8</a>, which re-runs the whole query).</p>
+
+<h2 class="sec">6 &middot; Real-world example</h2>
+<div class="example">
+<span class="tag">Google MapReduce / Hadoop / Spark</span>
+<p>Google's <b>MapReduce</b> made distributed sort the backbone of batch computing: the framework's guaranteed "keys arrive at the reducer sorted and grouped" <em>is</em> a distributed external sort, implemented as map-side spill-and-sort + a shuffle + a reduce-side merge. The <b>TeraSort</b> benchmark (sorting a terabyte, later petabytes) is the canonical demonstration: sample to pick range boundaries, range-partition in the shuffle, sort each partition locally, and the concatenation is globally ordered. <b>Spark</b> generalizes this with in-memory shuffles and spill-to-disk when partitions exceed RAM &mdash; and a sort-merge join is literally "sort both sides (externally if needed), then merge." The recurring lesson: the sort is easy; the shuffle and the skew are the system-design problem.</p>
+</div>
+
+<h2 class="sec">7 &middot; Applying it in a design</h2>
+<p>Reach for it whenever an operation needs <em>all</em> the data ordered or grouped but the data exceeds memory. Say: <i>"this is bigger than RAM, so I'll generate sorted runs and k-way merge them; at cluster scale I'll range-partition in a shuffle and sort each partition locally &mdash; and I'll sample to avoid skew and materialize the shuffle for fault tolerance."</i> It's the engine under group-by, sort-merge joins (<a href="../systems/s8.html">S8</a>), index builds (<a href="../primitives/p6.html">P6</a>), dedup at scale (<a href="../systems/s18.html">S18</a>), and parallel transcode/stitch (<a href="../systems/s16.html">S16</a>).</p>
+
+<h2 class="sec">8 &middot; Pitfalls</h2>
+<ul>
+<li>Assuming an in-memory sort will "just" work on data near or over RAM (OOM / thrash).</li>
+<li>Ignoring shuffle cost &mdash; it usually dwarfs the sort itself.</li>
+<li>Picking range boundaries blindly instead of sampling &rarr; skewed partitions and a straggler.</li>
+<li>Too many runs for a single merge pass &rarr; extra full passes over the data.</li>
+<li>Not materializing intermediate shuffle output in long jobs &rarr; a single failure restarts everything.</li>
+</ul>
+
+<h2 class="sec">9 &middot; Further reading</h2>
+<ul>
+<li><a href="https://research.google/pubs/pub62/">MapReduce: Simplified Data Processing on Large Clusters</a> (Dean &amp; Ghemawat)</li>
+<li>Knuth, TAOCP Vol. 3 (external sorting) &middot; <a href="http://sortbenchmark.org/">Sort Benchmark (TeraSort)</a></li>
+</ul>
+
+<div class="prevnext"><a href="p17.html">&larr; P17 &middot; Storage internals</a><a href="p19.html">P19 &middot; CRDTs &rarr;</a></div>
+</div></main>
+</div>
+<a href="#top" class="backtop" title="Back to top">&uarr;</a>
+<script type="module">
+  import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+  mermaid.initialize({ startOnLoad: true, theme: 'neutral' });
+</script>
+<script>window.SITE_BASE="../";</script>
+<script src="../assets/site.js"></script>
+</body></html>

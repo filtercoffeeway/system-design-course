@@ -8,86 +8,127 @@
 <nav class="side" id="side"></nav>
 <main><div class="reading" id="top">
 <div class="crumb"><a href="../index.html">Curriculum</a> / Part III · Systems / Cluster C — High fan-out</div><h1>11 · Notification System</h1>
-<div class="summary"><div class="hard"><b>Hard constraint:</b> at-least-once is easy; exactly-once is near-impossible — you can't see whether FCM/Twilio actually delivered. Design for idempotency.</div><div class="prims"><b>Primitives exercised:</b> <a href="../primitives/p9.html">P9</a>, <a href="../primitives/p5.html">P5</a>, <a href="../primitives/p1.html">P1</a>/priority, <a href="../primitives/p16.html">P16</a> (channel limits).</div><p>Priority queues (critical vs marketing); idempotency keys; channel-specific rate limits; scheduled/delayed delivery with a scanner; per-channel preference checks before send.</p></div>
+<div class="summary"><div class="hard"><b>Hard constraint:</b> at-least-once is easy; exactly-once is effectively impossible — the channels (FCM/APNs/Twilio) are black boxes you can't introspect. Design for idempotent dedup, and pace every external provider or get throttled/banned.</div><div class="prims"><b>Primitives exercised:</b> <a href="../primitives/p9.html">P9</a> (idempotency), <a href="../primitives/p5.html">P5</a> (fan-out), <a href="../primitives/p1.html">P1</a> (priority/batching), <a href="../primitives/p16.html">P16</a> (backpressure), <a href="../systems/s1.html">S1</a> (rate limit), <a href="../systems/s12.html">S12</a> (scheduling).</div><p>Priority queues (critical vs marketing); idempotency keys; per-channel rate limits; scheduled/delayed delivery; per-channel preference + quiet-hours checks at send time; retry/DLQ.</p></div>
 
 <hr>
 
-<h2 class="sec">1 &middot; Requirements &amp; scale</h2>
-<p><b>Functional:</b> deliver messages across channels (push, SMS, email, in-app) with
-priorities, scheduling, user preferences, and at-least-once delivery.
-<b>Non-functional:</b> high throughput, no double-sends, respect external provider
-limits, isolate slow/marketing traffic from urgent alerts.</p>
-<div class="estimate">Back-of-envelope
-500,000,000 notifications/day                ~ 6,000/s avg, large campaign spikes
-channels: FCM, APNs, Twilio (SMS), SES (email) -- each with its own rate limits
-preference + dedup state per user-channel
+<h2 class="sec">1 &middot; Requirements</h2>
+<p><b>Functional:</b> a unified API any internal service can call to notify a user across channels (push, SMS, email, in-app), with priorities, scheduling, templating, user preferences/opt-outs, and delivery tracking. <b>Non-functional:</b></p>
+<div class="tablewrap"><table>
+<tr><th>Property</th><th>Target</th><th>Consequence</th></tr>
+<tr><td>Delivery</td><td>at-least-once, no <em>duplicate effect</em></td><td>idempotent dedup key (<a href="../primitives/p9.html">P9</a>)</td></tr>
+<tr><td>Isolation</td><td>a 50M marketing blast can't delay a 2FA code</td><td>priority queues (&sect;6)</td></tr>
+<tr><td>Provider limits</td><td>never exceed FCM/APNs/Twilio ceilings</td><td>per-channel rate limiter (<a href="../systems/s1.html">S1</a>)</td></tr>
+<tr><td>Throughput</td><td>~6k/s avg, campaign spikes 30k+/s</td><td>queue-buffered, horizontally scaled workers</td></tr>
+<tr><td>Preferences</td><td>opt-outs & quiet hours honored</td><td>checked per channel at send time</td></tr>
+</table></div>
+<p>The defining reality: <b>the hard parts are not storage or novel algorithms &mdash; they're reliability, dedup, and third-party management.</b> The channels are external services you must integrate with, pace, and treat as unreliable black boxes. The system is mostly a reliable, idempotent, rate-controlled fan-out pipeline.</p>
+
+<h2 class="sec">2 &middot; Capacity estimation</h2>
+<div class="estimate">500,000,000 notifications/day  / 86,400 s  ~ 5,800/s average
+campaign spike: 10,000,000 sent over 5 min  = ~33,000/s   (10x+ average -> must buffer)
+fan-out: one "campaign" event -> 50,000,000 individual sends (P5 fan-out)
+
+provider ceilings (illustrative):
+  Twilio long-code SMS default ~1 msg/s per number -> bulk needs short codes / many numbers
+  APNs / FCM: high but per-connection/per-project quotas -> pace per channel
+
+dedup state: key per (user, event, channel), 30-day TTL
+  500M/day x 30 = 15B keys x ~64 B ~ 1 TB  -> Redis w/ TTL (or a Bloom filter front)
 </div>
 
-<h2 class="sec">2 &middot; High-level architecture</h2>
+<h2 class="sec">3 &middot; API & data model</h2>
+<div class="estimate">notify(user_id, event_type, payload, channels[], priority, idempotency_key, send_at?) -> notif_id
+getStatus(notif_id) -> {per_channel: {queued|sent|delivered|failed}}
+
+device_registry:  user_id -> [ {channel, token/address, platform, active, last_seen} ]
+preferences:      (user_id, channel, event_type) -> {opted_in, quiet_hours, frequency_cap}
+dedup:            idempotency_key -> {state, sent_at}   (TTL)
+outbox/schedule:  time_bucket -> [notif_id]             (for send_at, like S12)
+</div>
+
+<h2 class="sec">4 &middot; The hard constraint: delivery semantics (ladder)</h2>
+<div class="hard"><p>You cannot achieve exactly-once delivery: once you hand a message to APNs/FCM/Twilio, you get an <em>accepted</em> ack, not a <em>delivered-to-human</em> confirmation, and the network can fail <em>after</em> a send but <em>before</em> you record it. So a retry might double-send. The only safe design is at-least-once + idempotent dedup.</p></div>
+<h3>Rung 0 &mdash; fire and forget</h3>
+<p>Call the provider, move on. <b>Breaks on:</b> any transient failure loses the notification silently &mdash; the 2FA code never arrives.</p>
+<h3>Rung 1 &mdash; at-least-once with retries</h3>
+<p>Persist the request, send, retry on transient errors with exponential backoff, dead-letter after N attempts. <b>Breaks on:</b> retries cause <em>duplicates</em> &mdash; the user gets the same "your driver arrived" push three times because the first two succeeded at the provider but the ack was lost.</p>
+<h3>Rung 2 &mdash; at-least-once + idempotency key (the answer)</h3>
+<p>The caller supplies (or the system derives) an <b>idempotency key</b> per (user, event, channel) (<a href="../primitives/p9.html">P9</a>). Before sending, the worker atomically claims the key (<code>SET NX</code>); if it's already claimed/sent, skip. A retry re-presents the same key &rarr; deduped. Now retries are safe: at-least-once <em>attempts</em>, at-most-once <em>effect</em>.</p>
+<div class="estimate">worker:
+  if not dedup.setnx(key, "sending", ttl): return   // someone else has it / already sent
+  ok = provider.send(msg)
+  dedup.set(key, "sent" if ok else "failed")
+  if not ok and attempts < N: requeue with backoff   // same key -> still deduped
+</div>
+<div class="newprob"><b>New bottleneck &mdash; the dedup store at 15B keys.</b> A 1 TB Redis of keys is costly. Relief: TTL keys (most events only need a 24h&ndash;30d dedup window), and front the exact store with a <b>Bloom filter</b> (<a href="../primitives/p9.html">P9</a>) &mdash; "definitely not seen" skips the lookup; "maybe seen" checks the store. The Bloom filter's false positives only cause an occasional extra lookup, never a wrong dedup.</div>
+
+<h2 class="sec">5 &middot; High-level architecture</h2>
 <pre class="mermaid">
 graph LR
-  SRC[services] --> API[notification API]
-  API --> PQ[priority queues]
+  SRC[internal services] --> API[notification API: validate + template + idempotency]
+  API --> SCH{send_at?}
+  SCH -->|future| OUT[(schedule/outbox, S12)]
+  SCH -->|now| PQ[priority queues: critical / transactional / bulk]
+  OUT -->|due| PQ
   PQ --> W[workers]
-  W --> PREF{prefs + dedup}
-  PREF --> CH1[push: FCM/APNs]
+  W --> PREF{prefs + quiet hours + dedup}
+  PREF -->|per-channel rate limit| CH1[push: FCM/APNs]
   PREF --> CH2[SMS: Twilio]
   PREF --> CH3[email: SES]
+  CH1 -->|delivery receipt| FB[feedback/reconcile + DLQ]
 </pre>
 
-<h2 class="sec">3 &middot; The hard constraint, in depth</h2>
-<div class="hard"><p>At-least-once is easy; <b>exactly-once is effectively
-impossible</b> because the external channels (FCM, APNs, Twilio) are black boxes &mdash;
-you can&rsquo;t know whether a push truly reached the device. So you design for
-<b>idempotency</b> (<a href="../primitives/p9.html">P9</a>): a dedup key per (user, event) so retries
-don&rsquo;t double-send, plus tracking to reconcile. You also must honor each
-channel&rsquo;s rate limits or get throttled/banned.</p></div>
+<h2 class="sec">6 &middot; Priority & isolation</h2>
+<p>A single FIFO queue is fatal: a 50M-recipient marketing campaign sitting ahead of a 2FA code means the code arrives after the user gives up. Split into <b>priority lanes</b> &mdash; e.g. <em>critical</em> (2FA, security), <em>transactional</em> (trip updates, order shipped), <em>bulk</em> (marketing, digests) &mdash; with separate queues and worker pools so bulk can never starve critical. Workers drain higher lanes first (or dedicated pools per lane to guarantee headroom). Per-channel buffers apply <a href="../primitives/p16.html">P16</a> backpressure so a slow provider doesn't back up the whole pipeline; under overload, bulk is shed first.</p>
 
-<h2 class="sec">4 &middot; Component deep dives</h2>
-<h3>Priority &amp; isolation (P1/P16)</h3>
-<p>Separate queues so a 10M-recipient marketing blast can&rsquo;t starve a 2FA code or
-a "your driver arrived" alert. Workers drain high-priority first; per-channel buffers
-apply backpressure (<a href="../primitives/p16.html">P16</a>).</p>
-<h3>Idempotency &amp; retries (P9)</h3>
-<p>Dedup key written before send; retries on transient channel failures with backoff;
-dead-letter after N attempts &mdash; see <a href="../primitives/p9.html">P9</a>.</p>
-<h3>Channel rate limits</h3>
-<p>FCM/APNs/Twilio each have per-second/per-account ceilings; a per-channel rate
-limiter (<a href="../systems/s1.html">S1</a>) and token-bucket pacing keep you under them.</p>
-<h3>Scheduling &amp; preferences</h3>
-<p>Future-dated notifications go to a delayed store scanned by a timer (the same delayed
--queue pattern as the <a href="../systems/s12.html">task scheduler</a>). Per-channel opt-outs and
-quiet-hours are checked at send time, per channel, not once globally.</p>
+<h2 class="sec">7 &middot; The fan-out path & provider pacing</h2>
+<p>A campaign is a <a href="../primitives/p5.html">P5</a> fan-out: one event expands to millions of per-user sends. The expansion happens off the critical path &mdash; the API enqueues a campaign job; a fan-out worker reads the audience and emits individual notification messages into the bulk lane. Each individual send then passes through:</p>
+<ol>
+<li><b>Preference + quiet-hours check</b> (per channel, at send time &mdash; not once globally, because a user may allow push but not SMS, and quiet hours are per-timezone). A frequency cap ("max 3 marketing/day") is enforced here too.</li>
+<li><b>Per-channel rate limiter</b> (<a href="../systems/s1.html">S1</a> token bucket): pace sends to stay under each provider's ceiling. Exceeding APNs/FCM/Twilio limits gets you throttled or banned, so the limiter is a hard gate, not best-effort. Distinct buckets per provider/account.</li>
+<li><b>Channel adapter</b>: translate to the provider's API (APNs payload, FCM message, Twilio SMS), send, record the result.</li>
+</ol>
+<p>Channel-specific batching helps: APNs/FCM accept multicast/batch sends, so the worker batches many tokens per call (<a href="../primitives/p1.html">P1</a>) to amortize round trips and stay efficient under the rate cap.</p>
 
-<h2 class="sec">5 &middot; Real-world example</h2>
+<h2 class="sec">8 &middot; Scheduling, device registry & feedback</h2>
+<p><b>Scheduling:</b> future-dated notifications go to a time-bucketed <b>outbox</b> scanned per minute &mdash; the exact delayed-delivery pattern from <a href="../systems/s12.html">S12</a> (don't full-scan a pending table; partition by due-time bucket). <b>Device registry</b> maps a user to their device tokens; tokens expire and rotate, so the system must process provider <b>feedback</b> (APNs/FCM return "unregistered" for dead tokens) and prune them, or you waste sends and hurt your sender reputation. <b>Delivery receipts</b> (where the channel provides them &mdash; SMS DLRs, email opens/bounces) feed a reconciliation loop that updates status and retries or dead-letters failures.</p>
+<div class="newprob"><b>New bottleneck &mdash; debugging async sends.</b> A notification that fires minutes later from a queue is a black hole for tracing. Carry W3C trace context + the idempotency key through the queue (the same async-context check as <a href="../systems/s12.html">S12</a>) so a delivery (or a missing one) stitches back to the originating request in your APM.</div>
+
+<h2 class="sec">9 &middot; Scaling & failure</h2>
+<p>At 10&times; (campaign spikes to 300k/s): the bulk lane absorbs the spike in the queue and drains at the providers' allowed rate &mdash; you can't send faster than the channels accept, so the queue <em>is</em> the shock absorber (and bulk latency stretching to minutes is acceptable; critical lanes are isolated). Shard dedup and rate-limit state by user/channel. The DLQ collects exhausted retries for inspection. The whole system degrades gracefully: shed bulk, protect transactional and critical.</p>
+
+<h2 class="sec">10 &middot; Tradeoffs & alternatives</h2>
+<p>Push (fast, free, but only to app-installed devices that may be offline) vs SMS (high reach/reliability, costs money, rate-limited) vs email (cheap, high volume, low urgency). Aggressive retries improve delivery but raise duplicate risk and cost &mdash; idempotency is what lets you retry freely. Real-time vs <b>digest/batched</b> delivery trades immediacy for volume control and user-annoyance (collapse 20 "someone liked your post" into one digest). Build-your-own channel adapters vs a delivery aggregator (e.g. a CPaaS) trades control for speed.</p>
+
+<h2 class="sec">11 &middot; Real-world example</h2>
 <div class="example">
 <span class="tag">Uber</span>
-<p>Uber has described its push platform handling on the order of hundreds of millions
-of notifications a day across push/SMS/email, with the same shape as above: a unified
-API in front of channel-specific adapters (APNs, FCM, SMS providers), priority
-separation so operational messages (trip updates) beat promotional ones, idempotency to
-avoid duplicate trip alerts, and per-provider rate control. The defining reality is
-that the channels are third parties you must integrate with and pace, so the platform
-is mostly about reliability, dedup, and provider management rather than novel storage.</p>
+<p>Uber has described a real-time push platform handling on the order of hundreds of millions of messages a day across push/SMS/email, with exactly this shape: a unified API in front of channel-specific adapters (APNs, FCM, SMS providers), priority separation so operational messages (trip updates) beat promotional ones, idempotency to avoid duplicate trip alerts, and per-provider rate control. The platform also tracks delivery receipts and reconciles, and prunes dead device tokens from provider feedback. The defining lesson matches the constraint: the channels are third parties you must integrate with and pace, so the platform is mostly reliability, dedup, and provider management rather than novel storage.</p>
 </div>
 
-<h2 class="sec">6 &middot; Tradeoffs &amp; alternatives</h2>
-<p>Push for speed vs SMS/email for reach and reliability. Aggressive retries improve
-delivery but risk duplicates and cost; idempotency lets you retry safely. Real-time vs
-batched/digest delivery trades immediacy for volume control.</p>
+<h2 class="sec">12 &middot; Interview follow-ups (Q&amp;A)</h2>
+<p><b>Q: Why can't you guarantee exactly-once delivery?</b> The providers ack <em>acceptance</em>, not human delivery, and a failure can occur after a successful send but before you record it &mdash; so any safe system retries, which can duplicate. You make the <em>effect</em> idempotent (dedup key) so duplicates don't matter, rather than chasing impossible exactly-once.</p>
+<p><b>Q: A marketing campaign is delaying 2FA codes &mdash; fix?</b> Priority lanes with isolated queues and worker pools: critical/transactional never share a queue with bulk, and bulk is shed first under load. The campaign drains at provider-allowed rate from its own lane.</p>
+<p><b>Q: How do you avoid getting banned by Twilio/APNs?</b> A per-channel/per-account token-bucket rate limiter (<a href="../systems/s1.html">S1</a>) that's a hard gate before every send, plus honoring provider feedback (back off on 429s, prune dead tokens). Bulk SMS uses short codes / many numbers because long codes are ~1/s.</p>
+<p><b>Q: The dedup store is 1 TB &mdash; can you make it cheaper?</b> TTL keys to the needed dedup window, and front the store with a Bloom filter so "definitely new" skips the exact lookup. False positives only cost an extra lookup, never a wrong dedup (<a href="../primitives/p9.html">P9</a>).</p>
+<p><b>Q: How do scheduled notifications work without scanning a huge table?</b> Time-bucketed outbox scanned per minute (same as <a href="../systems/s12.html">S12</a>) &mdash; the scheduler reads only the current bucket's partition, never the whole pending set.</p>
+<p><b>Q: Where are preferences and quiet hours enforced?</b> Per channel, at send time &mdash; not once at the API &mdash; because consent and timezone-based quiet hours differ per channel and the audience may have been computed hours earlier (a user could opt out in between).</p>
 
-<h2 class="sec">7 &middot; Key talking points</h2>
+<h2 class="sec">13 &middot; Key talking points</h2>
 <ul>
-<li>Design for at-least-once + idempotent dedup, not exactly-once (<a href="../primitives/p9.html">P9</a>).</li>
-<li>Priority queues isolate urgent from bulk (<a href="../primitives/p1.html">P1</a>, <a href="../primitives/p16.html">P16</a>).</li>
-<li>Respect per-channel provider rate limits (<a href="../systems/s1.html">S1</a>).</li>
-<li>Delayed queue + scanner for scheduling (<a href="../systems/s12.html">S12</a>).</li>
-<li>Check preferences per channel at send time.</li>
+<li>Design for <b>at-least-once + idempotent dedup</b>, not exactly-once (<a href="../primitives/p9.html">P9</a>); channels are unreliable black boxes.</li>
+<li><b>Priority lanes</b> isolate critical/transactional from bulk (<a href="../primitives/p1.html">P1</a>, <a href="../primitives/p16.html">P16</a>) so a campaign never delays a 2FA code.</li>
+<li>Respect per-channel <b>provider rate limits</b> with token buckets (<a href="../systems/s1.html">S1</a>) &mdash; a hard gate, not best-effort.</li>
+<li>Campaign = <b>fan-out</b> off the critical path (<a href="../primitives/p5.html">P5</a>); batch multicast sends per channel.</li>
+<li>Time-bucketed outbox for scheduling (<a href="../systems/s12.html">S12</a>); prune dead device tokens from provider feedback.</li>
+<li>The queue is the shock absorber: you can't send faster than channels accept, so buffer and pace.</li>
 </ul>
 
-<h2 class="sec">8 &middot; Further reading</h2>
+<h2 class="sec">14 &middot; Further reading</h2>
 <ul>
-<li><a href="https://www.uber.com/blog/real-time-push-platform/">Uber &mdash; real-time push platform</a></li>
+<li><a href="https://www.uber.com/blog/real-time-push-platform/">Uber — real-time push platform</a></li>
+<li>APNs / FCM delivery & feedback docs &middot; Twilio messaging rate-limit guidance</li>
 </ul>
 
 <div class="prevnext"><a href="s10.html">&larr; S10 &middot; Chat</a><a href="s12.html">S12 &middot; Task scheduler &rarr;</a></div>

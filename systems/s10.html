@@ -8,85 +8,125 @@
 <nav class="side" id="side"></nav>
 <main><div class="reading" id="top">
 <div class="crumb"><a href="../index.html">Curriculum</a> / Part III · Systems / Cluster C — High fan-out</div><h1>10 · Chat System (WhatsApp / Slack)</h1>
-<div class="summary"><div class="hard"><b>Hard constraint:</b> routing — when A messages B, how does A's server find which of 10k connection servers holds B's socket?</div><div class="prims"><b>Primitives exercised:</b> <a href="../primitives/p13.html">P13</a>, <a href="../primitives/p4.html">P4</a> (routing lookup), <a href="../primitives/p1.html">P1</a> (offline delivery).</div><p>WebSocket/SSE; stateful connection servers; per-conversation sequence numbers (global ordering impossible and unnecessary); delivery receipts as a separate event stream; presence as high-frequency aggregation; client-side dedup on retry.</p></div>
+<div class="summary"><div class="hard"><b>Hard constraint:</b> routing — when A messages B, A's gateway must find which of hundreds of stateful connection servers currently holds B's live socket, against millions of connect/disconnect churn events. The scaling problem is connection state, not the message table.</div><div class="prims"><b>Primitives exercised:</b> <a href="../primitives/p13.html">P13</a> (live connections), <a href="../primitives/p4.html">P4</a> (routing registry), <a href="../primitives/p1.html">P1</a> (offline store-and-forward), <a href="../primitives/p9.html">P9</a> (dedup/idempotency), <a href="../primitives/p5.html">P5</a> (group fan-out).</div><p>WebSocket gateways; routing registry (user&rarr;gateway); per-conversation sequence numbers (global ordering impossible and unnecessary); receipts as a separate event stream; presence as high-frequency aggregation; client-side dedup on retry.</p></div>
 
 <hr>
 
-<h2 class="sec">1 &middot; Requirements &amp; scale</h2>
-<p><b>Functional:</b> 1:1 and group messaging, delivery + read receipts, presence,
-history, offline delivery. <b>Non-functional:</b> real-time push, ordered per
-conversation, durable, at huge connection counts.</p>
-<div class="estimate">Back-of-envelope
-2,000,000,000 users, say 400M concurrent online
-connections per gateway (efficient stack)    ~ on the order of 1M+ per server
-=> hundreds of gateway servers just to hold sockets
-presence heartbeats                           hundreds of millions/min -> aggregation problem
+<h2 class="sec">1 &middot; Requirements</h2>
+<p><b>Functional:</b> 1:1 and group messaging; delivery and read receipts; presence (online/last-seen/typing); message history and multi-device sync; offline delivery. <b>Non-functional:</b></p>
+<div class="tablewrap"><table>
+<tr><th>Property</th><th>Target</th><th>Consequence</th></tr>
+<tr><td>Latency</td><td>message delivered in &lt; ~100&ndash;500 ms when online</td><td>persistent push, not polling (<a href="../primitives/p13.html">P13</a>)</td></tr>
+<tr><td>Connections</td><td>hundreds of millions concurrent</td><td>stateful gateways; sockets are the scarce resource</td></tr>
+<tr><td>Ordering</td><td>consistent <em>per conversation</em></td><td>per-conversation sequence # (not global)</td></tr>
+<tr><td>Durability</td><td>never lose an accepted message</td><td>persist before ack; store-and-forward</td></tr>
+<tr><td>Offline</td><td>deliver on reconnect</td><td>per-recipient inbox queue (&sect;8)</td></tr>
+</table></div>
+<p>The reframing that drives everything: in chat the scarce resource is <b>open sockets and the routing between them</b>, not message storage (messages are tiny and often deleted after delivery). So the design centers on the connection tier and the registry, not a clever database.</p>
+
+<h2 class="sec">2 &middot; Capacity estimation</h2>
+<div class="estimate">2,000,000,000 users, ~400,000,000 concurrently online
+connections per gateway (efficient async stack) ~ 1,000,000+
+  -> ~400 gateway servers just to HOLD the sockets
+conn memory ~10 KB/socket -> 1M conns ~ 10 GB RAM/server (buffers + TLS state)
+
+messages ~ 100,000,000,000/day = ~1.2M/s average (bursty higher)
+  message ~ 200 B -> if stored a day ~ 20 TB/day (often deleted post-delivery)
+
+presence: 400M online x heartbeat/30s = ~13,000,000 heartbeats/s   <- aggregation problem
+group fan-out: one send to a 256-member group = up to 256 deliveries (P5)
 </div>
 
-<h2 class="sec">2 &middot; High-level architecture</h2>
+<h2 class="sec">3 &middot; API & data model</h2>
+<div class="estimate">// over the persistent socket
+send(conversation_id, client_msg_id, body) -> ack{server_seq}      // client_msg_id = dedup key
+recv -> {conversation_id, server_seq, sender, body, ts}
+receipt(conversation_id, up_to_seq, state)  // delivered | read
+presence(subscribe conversation_id|user_id) -> stream of {user, online, last_seen}
+
+messages:  (conversation_id, seq) -> {sender, body, ts}    // partition key = conversation_id
+inbox:     user_id -> queue of undelivered {conversation_id, seq}   // offline (&sect;8)
+routing:   user_id -> {gateway_id, session, last_seen}     // the registry (&sect;5)
+</div>
+<p>Partitioning <b>by conversation_id</b> keeps a conversation's messages and its monotonic <code>seq</code> together &mdash; the natural unit for ordering and history reads.</p>
+
+<h2 class="sec">4 &middot; Transport (ladder)</h2>
+<h3>Rung 1 &mdash; short polling</h3>
+<p>Client asks "anything new?" every few seconds. <b>Breaks on:</b> latency (up to the poll interval) and waste &mdash; 400M clients polling every 5&nbsp;s is 80M req/s of mostly-empty responses.</p>
+<h3>Rung 2 &mdash; long polling / SSE</h3>
+<p>Client holds a request open until the server has something (long poll), or uses Server-Sent Events for a one-way push stream. Better latency, but still HTTP overhead per message and awkward for the client&rarr;server direction. <b>Breaks on:</b> chat is bidirectional and chatty (typing, receipts) &mdash; one-way or request-scoped transports fight the workload.</p>
+<h3>Rung 3 &mdash; WebSocket (the answer)</h3>
+<p>One persistent, full-duplex TCP connection per client to a gateway (<a href="../primitives/p13.html">P13</a>). Messages flow both ways with minimal framing overhead; the server can push instantly. The cost is <b>statefulness</b>: the gateway now holds live connection state, which is the entire scaling challenge below.</p>
+
+<h2 class="sec">5 &middot; The hard constraint: routing (in depth)</h2>
+<div class="hard"><p>A connects to gateway G1; B connects to G2. When A sends to B, <b>A's gateway must discover that B's socket lives on G2</b>, among hundreds of gateways, and forward the message there &mdash; while connect/disconnect churn changes the answer millions of times a minute.</p></div>
+<p>The mechanism is a <b>routing registry</b>: <code>user_id &rarr; {gateway_id, session}</code>, written on every connect and deleted on disconnect, kept in a fast shared store (Redis / a gossip-backed table). The send path:</p>
+<div class="estimate">A -> G1: send(conv, msg)
+G1: persist message (durable, assign seq)        // never ack before persist
+G1: registry.lookup(B) -> G2
+G1 -> G2: forward(msg)   ;  G2 -> B over B's socket
+B online?  push now.   B offline?  enqueue to B's inbox (store-and-forward, &sect;8)
+</div>
+<div class="newprob"><b>New bottleneck &mdash; registry churn & failover.</b> The registry takes millions of writes/min from connect/disconnect, and a gateway crash orphans ~1M entries at once. Fixes: a heartbeat/TTL on each registry entry so stale routes self-expire (don't rely on a clean disconnect); on gateway failure, its clients reconnect (to a new gateway) and re-register &mdash; the registry rebuilds from the clients, not from a scan. Bound the reconnect storm with jittered backoff. This is the "bound the failover cost of in-memory state" check: recovery time is one reconnect interval, and undelivered messages are safe because they were persisted before ack.</div>
+<p>An alternative to a central registry is <b>consistent-hash routing</b>: <code>gateway = hash(user_id)</code> so anyone can compute where a user <em>should</em> be without a lookup &mdash; but real deployments still need a registry because a user's actual gateway is wherever they happened to connect (load balancers, reconnects), so the registry remains the source of truth, optionally with hashing as a hint.</p>
+
+<h2 class="sec">6 &middot; High-level architecture</h2>
 <pre class="mermaid">
 graph LR
   A[user A] <-->|WebSocket| G1[gateway]
   B[user B] <-->|WebSocket| G2[gateway]
-  G1 -->|"B -> G2?"| REG[(routing registry)]
-  G1 --> MQ[message service + store]
-  MQ --> G2 --> B
+  G1 -->|lookup B| REG[(routing registry: user -> gateway, Redis)]
+  G1 --> MS[message service + durable store]
+  MS --> INBOX[(offline inbox queue)]
+  G1 -->|forward| G2 --> B
+  MS --> SEQ[per-conversation seq assigner]
 </pre>
 
-<h2 class="sec">3 &middot; The hard constraint, in depth</h2>
-<div class="hard"><p><b>Routing.</b> When A sends to B, A&rsquo;s gateway must find which
-of thousands of gateway servers currently holds B&rsquo;s socket. That requires a fast,
-always-current registry (<code>user_id &rarr; gateway</code>) updated on every connect
-and disconnect &mdash; millions of churn events. If B is offline, the message must be
-stored and delivered on reconnect. Connection state, not the message table, is the
-scaling problem (<a href="../primitives/p13.html">P13</a>).</p></div>
+<h2 class="sec">7 &middot; Ordering & delivery semantics</h2>
+<p><b>Per-conversation ordering, not global.</b> A single global order across all messages would require a global sequencer &mdash; a throughput bottleneck and totally unnecessary (no one perceives the order of two unrelated chats). Instead each conversation has a monotonic <code>seq</code> assigned by the message service for that conversation; clients order by it and detect gaps (and request a resync if a seq is missing).</p>
+<p><b>Delivery state is a separate event stream</b>, not a field mutated on the message: "sent &rarr; delivered &rarr; read" are <em>receipts</em> that flow as their own small messages (often coalesced: "read up to seq N"). Embedding state in the message would mean rewriting it on every status change and fighting the immutable, ordered log; a separate receipt stream keeps the message log append-only.</p>
+<p><b>Exactly-once is unaffordable; use at-least-once + dedup</b> (<a href="../primitives/p9.html">P9</a>): the client stamps each send with a <code>client_msg_id</code>; a retried send (after a lost ack) carries the same id, and the server (and receiving client) dedup on it. So a flaky network causes at-most-once <em>effect</em> despite at-least-once <em>attempts</em>.</p>
 
-<h2 class="sec">4 &middot; Component deep dives</h2>
-<h3>Connections &amp; routing (P13)</h3>
-<p>Persistent WebSockets on stateful gateways; a Redis registry for routing; rebalance
-and re-register on gateway failure &mdash; see <a href="../primitives/p13.html">P13</a>.</p>
-<h3>Ordering &amp; delivery</h3>
-<p>Per-conversation sequence numbers (global ordering is impossible and unnecessary).
-Delivery state (sent/delivered/read) is a <em>separate</em> event stream, not embedded
-in the message. Client-side dedup handles retried sends (<a href="../primitives/p9.html">P9</a>).</p>
-<h3>Storage &amp; offline</h3>
-<p>Messages persisted (store-and-forward) so offline users get them on reconnect; some
-systems (WhatsApp historically) delete server copies once delivered.</p>
-<h3>Presence</h3>
-<p>Online/last-seen is a high-frequency aggregation of heartbeats &mdash; expensive at
-scale, often approximate.</p>
+<h2 class="sec">8 &middot; Offline delivery, groups & history</h2>
+<p><b>Store-and-forward:</b> if B is offline, the message sits in B's durable inbox queue and is pushed when B reconnects (the client sends its last-seen seq; the server streams everything after it). Some systems (WhatsApp historically) <b>delete the server copy once delivered</b> to all recipients, minimizing storage &mdash; the message store is a transient buffer, not an archive. Others (Slack/Discord) keep full history for search and multi-device sync, trading storage for features.</p>
+<p><b>Groups</b> are a <a href="../primitives/p5.html">P5</a> fan-out: one send expands to up to N member deliveries, each routed individually (and inboxed if offline). For small groups (chat caps are typically hundreds&ndash;~1024) fan-out-on-write is fine; the celebrity-style explosion of <a href="../systems/s9.html">S9</a> doesn't arise because groups are bounded. Each member still gets the same per-conversation seq, so everyone sees one consistent order.</p>
+<p><b>Multi-device</b> turns one user into several sockets/inboxes that must converge: deliver to all of a user's devices and sync read state across them (a per-(user,device) cursor over the conversation seq).</p>
 
-<h2 class="sec">5 &middot; Real-world example</h2>
+<h2 class="sec">9 &middot; Presence (the hidden scaling trap)</h2>
+<div class="newprob"><b>New bottleneck &mdash; presence is a firehose.</b> 400M online users heartbeating every 30&nbsp;s is ~13M updates/s, and naive presence means every status change fans out to everyone who has that user's chat open &mdash; an O(users &times; contacts) broadcast that can dwarf actual messaging. Relief: make presence <b>approximate and pull-on-demand</b> (compute "online" lazily from last-heartbeat when a contact opens the chat, rather than pushing every change), debounce/batch updates, and only publish presence to currently-interested subscribers (people viewing that conversation), not the whole contact graph. "Last seen" is just <code>now &minus; last_heartbeat &lt; threshold</code>.</div>
+
+<h2 class="sec">10 &middot; Scaling, tradeoffs & alternatives</h2>
+<p>Gateways scale horizontally (sockets are the unit); the registry shards by user. <b>WebSocket</b> (bidirectional, low overhead) vs <b>SSE/long-poll</b> (simpler, one-way, better through old proxies). <b>Keep vs delete server history</b> trades storage/cost for multi-device sync and search. <b>Erlang/Go-style lightweight concurrency</b> (one cheap process/goroutine per connection) vs thread-per-connection (doesn't reach 1M/box). Strong per-conversation ordering is cheap; global ordering is expensive and pointless. End-to-end encryption (Signal protocol) is orthogonal to routing &mdash; the server routes ciphertext it can't read, which also forces "delete after delivery" since the server can't index content anyway.</p>
+
+<h2 class="sec">11 &middot; Real-world example</h2>
 <div class="example">
 <span class="tag">WhatsApp</span>
-<p>WhatsApp famously served tens of millions of users with a tiny team by building on
-<b>Erlang/OTP</b> running on FreeBSD &mdash; a runtime designed for millions of
-lightweight concurrent processes, one per connection. They reported pushing a single
-server to very high simultaneous connection counts (on the order of a million-plus),
-which is the whole game for chat: the scarce resource is open sockets and the routing
-between them, not message storage. Messages were store-and-forward and deleted from
-servers after delivery. Slack and Discord solve the same routing/presence problem with
-a gateway tier (<a href="../primitives/p13.html">P13</a>).</p>
+<p>WhatsApp famously served tens of millions of users with a tiny engineering team by building on <b>Erlang/OTP</b> on FreeBSD &mdash; a runtime designed for millions of lightweight concurrent processes, one per connection &mdash; and reported driving a single server to very high simultaneous connection counts (on the order of a million-plus). That is the whole game for chat: the scarce resource is open sockets and the routing between them, not message storage. Messages were <b>store-and-forward and deleted from servers after delivery</b>. Slack and Discord solve the same routing/presence problem with a stateful gateway tier and a registry (<a href="../primitives/p13.html">P13</a>), keeping history for search and multi-device sync.</p>
 </div>
 
-<h2 class="sec">6 &middot; Tradeoffs &amp; alternatives</h2>
-<p>WebSocket (bidirectional) vs SSE/long-poll (simpler, one-way). Keeping vs deleting
-server-side history trades storage/cost vs multi-device sync. Strong per-conversation
-ordering is cheap; global ordering is not and isn&rsquo;t needed.</p>
+<h2 class="sec">12 &middot; Interview follow-ups (Q&amp;A)</h2>
+<p><b>Q: How does A's server find B among hundreds of gateways?</b> A routing registry (<code>user_id &rarr; gateway</code>) written on connect, TTL'd by heartbeat, deleted on disconnect. A's gateway looks up B's gateway and forwards. Consistent hashing can hint where B <em>should</em> be, but the registry is the source of truth because users connect wherever the LB places them.</p>
+<p><b>Q: A gateway holding 1M sockets crashes &mdash; what happens?</b> Its registry entries TTL out (don't rely on clean disconnects); its clients detect the drop and reconnect to other gateways, re-registering as they go &mdash; recovery is one reconnect interval, bounded by jittered backoff. No messages are lost because they were persisted before ack.</p>
+<p><b>Q: Why per-conversation sequence numbers instead of a global order?</b> Global ordering needs a single sequencer (a bottleneck) and is imperceptible/unnecessary across unrelated chats. A per-conversation monotonic seq gives the only ordering users actually observe, and lets clients detect gaps and resync.</p>
+<p><b>Q: How do read receipts work without rewriting messages?</b> Receipts are a separate event stream ("delivered/read up to seq N"), coalesced, so the message log stays append-only and immutable instead of being mutated on every status change.</p>
+<p><b>Q: A message is sent twice due to a retry &mdash; how do you avoid a duplicate?</b> The client stamps a <code>client_msg_id</code>; server and receiving client dedup on it (<a href="../primitives/p9.html">P9</a>). At-least-once delivery with idempotent effect, since exactly-once over a flaky network is unaffordable.</p>
+<p><b>Q: Why is presence so expensive and how do you tame it?</b> 13M heartbeats/s plus O(users&times;contacts) change broadcasts can exceed messaging load. Make presence approximate and pull-on-demand (derive from last heartbeat when a chat opens), debounce, and publish only to active subscribers.</p>
+<p><b>Q: How do groups differ from the social-feed celebrity problem?</b> Group size is bounded (hundreds to ~1024), so fan-out-on-write per message is fine &mdash; there's no 100M-follower explosion (<a href="../systems/s9.html">S9</a>). Everyone shares the conversation's seq for one consistent order.</p>
 
-<h2 class="sec">7 &middot; Key talking points</h2>
+<h2 class="sec">13 &middot; Key talking points</h2>
 <ul>
-<li>Persistent connections; the scarce resource is sockets (<a href="../primitives/p13.html">P13</a>).</li>
-<li>Routing registry updated on every connect/disconnect.</li>
-<li>Per-conversation sequence numbers; receipts as a separate stream.</li>
-<li>Store-and-forward for offline; client dedup (<a href="../primitives/p9.html">P9</a>).</li>
-<li>Presence as high-frequency aggregation.</li>
+<li>The scarce resource is <b>sockets</b>, not storage; stateful WebSocket gateways hold ~1M conns each (<a href="../primitives/p13.html">P13</a>).</li>
+<li>The wall is <b>routing</b>: a registry (user&rarr;gateway), TTL'd by heartbeat, rebuilt from clients on failover.</li>
+<li>Order <b>per conversation</b> with a monotonic seq, never globally; clients detect gaps and resync.</li>
+<li>Delivery state (sent/delivered/read) is a <b>separate receipt stream</b>, keeping the message log append-only.</li>
+<li>At-least-once + <b>client_msg_id dedup</b> (<a href="../primitives/p9.html">P9</a>); store-and-forward for offline, delete-after-delivery to save storage.</li>
+<li><b>Presence</b> is a firehose &mdash; make it approximate, debounced, pull-on-demand to interested subscribers only.</li>
 </ul>
 
-<h2 class="sec">8 &middot; Further reading</h2>
+<h2 class="sec">14 &middot; Further reading</h2>
 <ul>
-<li><a href="https://blog.whatsapp.com/1-million-is-so-2011">WhatsApp engineering &mdash; scaling connections</a></li>
-<li>See <a href="../primitives/p13.html">P13 real-time connections</a>.</li>
+<li><a href="https://blog.whatsapp.com/1-million-is-so-2011">WhatsApp engineering — 1 million connections</a> &middot; <a href="../primitives/p13.html">P13 real-time connections</a></li>
+<li>Slack / Discord engineering — gateway &amp; presence at scale</li>
 </ul>
 
 <div class="prevnext"><a href="s9.html">&larr; S9 &middot; Social feed</a><a href="s11.html">S11 &middot; Notification &rarr;</a></div>

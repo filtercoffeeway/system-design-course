@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>20 Authentication &amp; Authorization — System Design Curriculum</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head><body>
+<div class="wrap">
+<nav class="side" id="side"></nav>
+<main><div class="reading" id="top">
+<div class="crumb"><a href="../index.html">Curriculum</a> / Part III · Systems / Cluster E — Domain-specific</div><h1>20 · Authentication &amp; Authorization</h1>
+<div class="summary"><div class="hard"><b>Hard constraint:</b> verify identity on <em>every</em> request with low latency and no shared bottleneck, while keeping credentials un-stealable and sessions revocable. The central tension is <b>where session state lives</b> — a server-side store (revocable but a lookup per request) vs a stateless token (free to verify but hard to revoke).</div><div class="prims"><b>Primitives exercised:</b> <a href="../primitives/p3.html">P3</a> (session replication/consistency), <a href="../primitives/p4.html">P4</a> (session cache), <a href="s1.html">S1</a> (login rate-limiting), <a href="s3.html">S3</a> (distributed session store), <a href="../primitives/p9.html">P9</a> (idempotent flows).</div><p>Password storage; session vs token (JWT) ladder; refresh-token rotation + revocation; OAuth/OIDC delegated auth; MFA; rate-limiting login attempts. "Design login/auth for a website" — one of the most commonly asked real-interview questions.</p></div>
+
+<hr>
+
+<h2 class="sec">1 &middot; Requirements</h2>
+<p><b>Functional:</b> register and log a user in; verify identity on each subsequent request (<em>authentication</em>); decide what they may do (<em>authorization</em>); support logout, "log out everywhere," password reset, MFA, and third-party login. <b>Non-functional:</b></p>
+<div class="tablewrap"><table>
+<tr><th>Property</th><th>Target</th><th>Consequence</th></tr>
+<tr><td>Per-request latency</td><td>auth adds &lt; ~1 ms</td><td>no slow store on the hot path (&sect;5)</td></tr>
+<tr><td>Credential safety</td><td>a DB breach must not reveal passwords</td><td>slow salted hashing (&sect;4)</td></tr>
+<tr><td>Revocability</td><td>a compromised session dies fast</td><td>the session-state tension (&sect;5)</td></tr>
+<tr><td>Abuse resistance</td><td>survive credential stuffing</td><td>rate-limit + MFA (&sect;7)</td></tr>
+<tr><td>Scale</td><td>stateless app servers, any can serve any user</td><td>no sticky sessions; shared/no state</td></tr>
+</table></div>
+<p>Two ideas separate a strong answer from a memorized one: <b>login is rare but verification is constant</b> (you authenticate once, then verify a token on every one of thousands of later requests), and <b>the security comes from making the right operation slow</b> (hashing) while keeping the hot path fast.</p>
+
+<h2 class="sec">2 &middot; Capacity estimation</h2>
+<div class="estimate">100,000,000 users; ~10% re-auth/day -> ~116 logins/s avg (bursty at 9am)
+but EVERY API request must verify auth -> if 50,000 req/s, that's 50,000 verifications/s
+  -> verification must be ~free; login can afford ~250 ms (hashing)
+
+password hash (bcrypt cost 12): ~250 ms/hash by design
+  attacker with a stolen DB: ~4 guesses/s/core  vs  unsalted MD5 ~ billions/s
+JWT: ~300-800 B, sent on every request (header)
+server-side session: 1 cache lookup ~0.5-1 ms per request
+</div>
+
+<h2 class="sec">3 &middot; API design</h2>
+<div class="estimate">register(email, password)        -> 201
+login(email, password, mfa?)     -> { access_token, refresh_token }
+verify(access_token)             -> { user_id, scopes }   // on every request (cheap)
+refresh(refresh_token)           -> { access_token, refresh_token }  // rotates
+logout(refresh_token)            // revoke this session
+logout_all(user_id)             // revoke all sessions
+
+OAuth/OIDC:
+GET  /authorize?client_id&redirect_uri&scope&code_challenge   -> redirect w/ code
+POST /token  (code + code_verifier)                           -> tokens
+</div>
+
+<h2 class="sec">4 &middot; Password storage (ladder)</h2>
+<div class="hard"><p>Assume the database <em>will</em> be breached. The design must ensure that even then, attackers can't recover users' passwords. So storage is derived against an attacker who has your whole user table.</p></div>
+<h3>Rung 0 &mdash; plaintext</h3>
+<p>Store the password as-is. <b>Breaks instantly:</b> one breach reveals every password, and users reuse passwords across sites. Catastrophic.</p>
+<h3>Rung 1 &mdash; a fast hash (MD5/SHA-256)</h3>
+<p>Store <code>hash(password)</code>. <b>Breaks on:</b> (a) <b>rainbow tables</b> &mdash; precomputed hash&rarr;password dictionaries crack common passwords instantly; (b) fast hashes are the problem &mdash; a GPU does billions of SHA-256/s, so brute force is trivial; (c) identical passwords produce identical hashes (visible in the table).</p>
+<h3>Rung 2 &mdash; salted hash</h3>
+<p>Store <code>(salt, hash(salt + password))</code> with a unique random salt per user. Salts defeat rainbow tables (the attacker must crack each user separately) and hide identical passwords. <b>Breaks on:</b> the hash is still <em>fast</em> &mdash; per-user brute force is still billions/s on a GPU.</p>
+<h3>Rung 3 &mdash; a slow, tunable KDF: bcrypt / scrypt / Argon2 (the answer)</h3>
+<p>Use a password hashing function with a <b>cost factor</b> that makes each hash deliberately expensive. bcrypt's cost <em>c</em> runs 2<sup>c</sup> key-expansion rounds; at cost 12 that's ~250&nbsp;ms per hash &mdash; negligible for one login, but it caps an attacker to ~4 guesses/s/core instead of billions. As hardware improves you raise the cost. <b>Argon2id</b> additionally is <b>memory-hard</b> (each hash needs lots of RAM), which neutralizes GPU/ASIC parallelism that bcrypt doesn't.</p>
+<div class="estimate">store: argon2id(password, salt, m=64MB, t=3, p=1)  -> {salt, params, hash}
+login: recompute with stored params, constant-time compare
+tune: pick cost so a single hash ~ 200-300 ms on YOUR hardware
+  -> 1 login = 250 ms (fine);  1M-guess attack = ~70 hours/core (not seconds)
+</div>
+<div class="tablewrap"><table>
+<tr><th>Rung</th><th>Defeats</th><th>Still breaks on</th></tr>
+<tr><td>Plaintext</td><td>nothing</td><td>any breach</td></tr>
+<tr><td>Fast hash</td><td>casual reading</td><td>rainbow tables + GPU brute force</td></tr>
+<tr><td>Salted hash</td><td>rainbow tables</td><td>fast per-user brute force</td></tr>
+<tr><td>Argon2/bcrypt (cost)</td><td>brute force (slow + memory-hard)</td><td>&mdash; (raise cost over time)</td></tr>
+</table></div>
+<p>Pepper (a secret key, stored separately from the DB and mixed in) adds defense-in-depth: a DB-only breach without the pepper can't be cracked at all.</p>
+
+<h2 class="sec">5 &middot; Where session state lives (the core ladder)</h2>
+<div class="hard"><p>After login, every later request must prove "I am this logged-in user." Where you keep that proof &mdash; on the server or in the token &mdash; is the central tradeoff between <b>revocability</b> and <b>statelessness</b>.</p></div>
+<h3>Rung 1 &mdash; server-side session, sticky to one server</h3>
+<p>On login, create a random <code>session_id</code>, store <code>session_id &rarr; user</code> in that server's memory, send the id as a cookie. <b>Breaks on:</b> the session lives on <em>one</em> server, so a load balancer must pin the user there (sticky sessions) &mdash; which breaks horizontal scaling and loses sessions when that server dies.</p>
+<h3>Rung 2 &mdash; server-side session in a shared store (revocable, the safe default)</h3>
+<p>Move sessions to a shared, replicated store (Redis / <a href="s3.html">S3</a>-style KV) that any app server can read. Verification is a single ~1&nbsp;ms cache lookup (<a href="../primitives/p4.html">P4</a>). <b>Revocation is trivial</b> &mdash; delete the row and the session is instantly dead, so "log out everywhere" and forced logout on compromise are easy. <b>Breaks on:</b> a store lookup on <em>every</em> request &mdash; at very high RPS the session store becomes a shared hot dependency and a latency floor.</p>
+<h3>Rung 3 &mdash; stateless token (JWT): no lookup at all</h3>
+<p>Issue a signed <b>JWT</b> containing the claims (<code>user_id</code>, scopes, <code>exp</code>). The app server <em>verifies the signature</em> with the issuer's public key &mdash; <b>no store lookup</b>, fully stateless, any server can verify offline. Perfect for latency and scale. <b>Breaks on revocation:</b> a JWT is valid until it expires; you can't un-issue it. A stolen token works until <code>exp</code>, and "log out everywhere" is impossible without adding state back.</p>
+<h3>Rung 4 &mdash; short-lived access JWT + refresh token (the production synthesis)</h3>
+<p>Combine the two: a <b>short-lived access JWT</b> (e.g. 15&nbsp;min, stateless, verified with no lookup on the hot path) plus a <b>long-lived refresh token</b> (e.g. 30&nbsp;days, opaque, stored server-side and thus revocable). The access token's short TTL bounds the damage window; the refresh token is the revocable handle.</p>
+<div class="estimate">hot path (most requests): verify access JWT signature locally -> ~0 lookup
+every 15 min: client calls refresh(refresh_token) -> new access + ROTATED refresh
+revoke: delete the refresh token; access dies within <= 15 min automatically
+</div>
+<div class="tablewrap"><table>
+<tr><th>Approach</th><th>Verify cost</th><th>Revoke</th><th>Breaks on</th></tr>
+<tr><td>Sticky server session</td><td>local</td><td>easy</td><td>no horizontal scale</td></tr>
+<tr><td>Shared session store</td><td>~1 ms lookup</td><td>instant</td><td>store is a hot dependency</td></tr>
+<tr><td>Stateless JWT</td><td>signature only</td><td><b>impossible</b> before exp</td><td>revocation, stolen token</td></tr>
+<tr><td>Short JWT + refresh</td><td>signature only</td><td>refresh revocable; access &le; TTL</td><td>complexity; refresh theft (&sect;6)</td></tr>
+</table></div>
+
+<h2 class="sec">6 &middot; Refresh-token rotation & revocation</h2>
+<p>A long-lived refresh token is a juicy theft target, so it must <b>rotate</b>: each refresh issues a <em>new</em> refresh token and invalidates the old one. This enables <b>reuse detection</b> &mdash; if an old (already-rotated) refresh token is ever presented again, that means someone has a stolen copy, so the system <b>revokes the entire token family</b> (logs the user out everywhere) and forces re-login.</p>
+<div class="estimate">refresh(rt_old):
+  if rt_old is unknown or already-used:  // theft signal
+      revoke entire family(user, device) ; require re-login
+  else: issue (access_new, rt_new) ; mark rt_old used, link rt_new -> family
+</div>
+<p>For the rare need to kill an <em>access</em> JWT before its TTL (e.g. account compromise), keep a small <b>revocation/deny-list</b> of token ids (jti) checked on the hot path &mdash; this reintroduces a lookup, but only for the short access-TTL window, so the list stays tiny. The honest tradeoff: pure statelessness and instant revocation are fundamentally at odds; short TTL + refresh is how production splits the difference.</p>
+
+<h2 class="sec">7 &middot; Login abuse, MFA & high-level architecture</h2>
+<pre class="mermaid">
+graph LR
+  U[user] --> LB[load balancer]
+  LB --> APP[stateless app servers]
+  APP -->|login: verify argon2| UDB[(user store: salted argon2 hashes)]
+  APP -->|issue/rotate| RT[(refresh-token store: revocable, S3/Redis)]
+  APP -->|verify access JWT signature| KEYS[(public keys / JWKS)]
+  APP -->|rate limit login| RL[S1 rate limiter]
+</pre>
+<p><b>Rate-limiting login</b> (<a href="s1.html">S1</a>) is essential against <b>credential stuffing</b> (attackers replaying breached email/password pairs): limit per-account (e.g. 5 fails / 15&nbsp;min &rarr; backoff/lockout), per-IP, and globally (anomaly detection on a spike of failures). Add CAPTCHA after N failures and exponential backoff. <b>MFA</b> (TOTP, WebAuthn/passkeys, SMS as a weak last resort) means even a correct password isn't enough &mdash; the dominant defense against stuffing, since the attacker lacks the second factor. <b>Constant-time comparison</b> of hashes/tokens avoids timing side-channels, and the login error must be generic ("invalid email or password") so it doesn't reveal which emails are registered (account enumeration).</p>
+
+<h2 class="sec">8 &middot; OAuth 2.0 / OIDC: delegated auth</h2>
+<p>"Log in with Google" is <b>delegated authentication</b>: your app never sees the user's Google password. The <b>Authorization Code flow with PKCE</b> is the modern standard:</p>
+<ol>
+<li>App redirects the user to the provider's <code>/authorize</code> with a <code>code_challenge</code> (the hash of a secret <code>code_verifier</code> the app keeps).</li>
+<li>User authenticates <em>at the provider</em> and consents; provider redirects back with a one-time <b>authorization code</b>.</li>
+<li>App exchanges the code + <code>code_verifier</code> at <code>/token</code> for tokens. PKCE proves the app redeeming the code is the same one that started the flow, defeating code interception.</li>
+</ol>
+<p>The distinction: <b>OAuth 2.0</b> is about <em>authorization</em> (granting an app scoped access to resources); <b>OIDC</b> layers <em>authentication</em> on top via an <b>ID token</b> (a JWT asserting "this is who the user is"). Use OIDC's ID token to establish identity, OAuth access tokens to call APIs on the user's behalf. The redirect dance exists precisely so the password stays with the identity provider.</p>
+
+<h2 class="sec">9 &middot; Authorization (authz) & scaling</h2>
+<p>Authentication says <em>who</em>; authorization says <em>what they may do</em>. Models escalate by complexity: <b>RBAC</b> (roles &rarr; permissions; simple, coarse) &rarr; <b>ABAC</b> (policies over attributes; flexible) &rarr; <b>ReBAC</b> (relationship graphs, e.g. Google Zanzibar: "is user X an editor of doc Y?" resolved over a globally-replicated permission graph) for fine-grained, shared-resource permissions at scale. Put coarse scopes in the access token (no lookup) and resolve fine-grained checks against an authz service. <b>Scaling auth</b> is mostly about keeping verification stateless (JWT signature, public keys distributed via JWKS) so app servers add linearly, while the few stateful pieces (refresh store, revocation list) stay small and cacheable (<a href="../primitives/p4.html">P4</a>, <a href="../primitives/p3.html">P3</a>).</p>
+
+<h2 class="sec">10 &middot; Tradeoffs & alternatives</h2>
+<p>Stateless JWT (fast, scalable, hard to revoke) vs server sessions (instantly revocable, a lookup per request) &mdash; short-TTL access + revocable refresh is the standard compromise. Cookies (with <code>HttpOnly</code> + <code>Secure</code> + <code>SameSite</code>, automatically sent, XSS-resistant for storage) vs <code>Authorization: Bearer</code> headers (explicit, needed for cross-origin APIs, but token storage in JS is XSS-exposed). Passkeys/WebAuthn are increasingly replacing passwords entirely (phishing-resistant public-key auth, nothing crackable to steal). SMS MFA is better than nothing but vulnerable to SIM-swap; prefer TOTP/WebAuthn.</p>
+
+<h2 class="sec">11 &middot; Real-world example</h2>
+<div class="example">
+<span class="tag">Auth0 / Okta · Google</span>
+<p>Managed identity providers (<b>Auth0</b>, <b>Okta</b>, AWS Cognito) implement exactly this shape: argon2/bcrypt password hashing, short-lived access JWTs verified statelessly via published <b>JWKS</b> public keys, revocable rotating refresh tokens, OAuth2/OIDC flows with PKCE, MFA, and login-anomaly rate limiting. Google's <b>Zanzibar</b> is the canonical large-scale <em>authorization</em> system &mdash; a globally-distributed, consistent permission graph (ReBAC) answering billions of "can user X do Y on object Z?" checks with low latency, the model behind Google Docs sharing. The recurring lesson matches the constraint: keep verification stateless and cheap, keep the revocable state small, and make the credential-storage operation deliberately slow.</p>
+</div>
+
+<h2 class="sec">12 &middot; Interview follow-ups (Q&amp;A)</h2>
+<p><b>Q: Why is a <em>slow</em> hash good?</b> Login happens once and can afford ~250&nbsp;ms; an attacker with a stolen DB must hash billions of guesses, so a slow, memory-hard KDF (Argon2/bcrypt) turns a seconds-long crack into years. The cost factor is raised as hardware improves.</p>
+<p><b>Q: JWT vs server-side sessions &mdash; which and why?</b> JWT for stateless, lookup-free verification at scale; server sessions for instant revocation. The tension is real, so production uses a <b>short-lived access JWT + revocable refresh token</b>: stateless on the hot path, revocable via the refresh handle, with damage bounded by the short access TTL.</p>
+<p><b>Q: How do you "log out everywhere" with JWTs?</b> You can't revoke the access JWTs directly, but you delete all the user's refresh tokens (so no new access tokens issue) and the existing ones expire within the short TTL. For immediate kill, add the token ids to a small deny-list checked on the hot path.</p>
+<p><b>Q: A refresh token is stolen &mdash; how do you detect it?</b> Rotate refresh tokens on every use; if an already-used (rotated) token reappears, that's a theft signal &mdash; revoke the whole token family and force re-login.</p>
+<p><b>Q: How do you stop credential stuffing?</b> Rate-limit logins per account/IP/global (<a href="s1.html">S1</a>), add CAPTCHA and backoff after failures, and require MFA &mdash; the breached password alone is then useless. Generic error messages prevent account enumeration.</p>
+<p><b>Q: What does "Log in with Google" actually prove, and where's the password?</b> The user authenticates <em>at Google</em>; your app only receives an authorization code it exchanges (with PKCE) for an OIDC ID token asserting identity. The password never leaves Google &mdash; that's the point of the redirect flow.</p>
+<p><b>Q: Where do you store the token client-side?</b> Prefer an <code>HttpOnly</code>+<code>Secure</code>+<code>SameSite</code> cookie (not readable by JS, so XSS can't exfiltrate it; pair with CSRF protection). Bearer tokens in JS-accessible storage are exposed to XSS.</p>
+
+<h2 class="sec">13 &middot; Key talking points</h2>
+<ul>
+<li>Login is rare (can be slow); <b>verification is constant</b> (must be ~free) &mdash; design around that asymmetry.</li>
+<li>Password storage ladder: plaintext &rarr; fast hash &rarr; salted &rarr; <b>Argon2/bcrypt with a cost factor</b> (slow + memory-hard); assume the DB will leak.</li>
+<li>Session-state ladder: sticky &rarr; shared store (revocable) &rarr; stateless JWT (no lookup, hard to revoke) &rarr; <b>short access JWT + revocable refresh</b>.</li>
+<li><b>Refresh-token rotation</b> + reuse detection revokes a stolen family; short access TTL bounds the window.</li>
+<li><b>Rate-limit + MFA</b> (<a href="s1.html">S1</a>) defeat credential stuffing; constant-time compare + generic errors close side channels.</li>
+<li><b>OAuth2/OIDC + PKCE</b> keeps the password with the IdP; authz scales via stateless scopes + a permission service (RBAC&rarr;ReBAC/Zanzibar).</li>
+</ul>
+
+<h2 class="sec">14 &middot; Further reading</h2>
+<ul>
+<li><a href="https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html">OWASP — Password Storage Cheat Sheet</a> &middot; <a href="https://cheatsheetseries.owasp.org/cheatsheets/Authentication_Cheat_Sheet.html">OWASP Authentication Cheat Sheet</a></li>
+<li><a href="https://datatracker.ietf.org/doc/html/rfc6749">OAuth 2.0 (RFC 6749)</a> &middot; <a href="https://openid.net/specs/openid-connect-core-1_0.html">OpenID Connect Core</a> &middot; <a href="https://research.google/pubs/pub48190/">Google Zanzibar (authorization)</a></li>
+</ul>
+
+<div class="prevnext"><a href="s19.html">&larr; S19 &middot; Search autocomplete</a><a href="s21.html">S21 &middot; Booking / reservation &rarr;</a></div>
+</div></main>
+</div>
+<a href="#top" class="backtop" title="Back to top">&uarr;</a>
+<script type="module">
+  import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+  mermaid.initialize({ startOnLoad: true, theme: 'neutral' });
+</script>
+<script>window.SITE_BASE="../";</script>
+<script src="../assets/site.js"></script>
+</body></html>

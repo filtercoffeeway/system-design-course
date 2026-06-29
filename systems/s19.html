@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>19 Search autocomplete / Typeahead — System Design Curriculum</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head><body>
+<div class="wrap">
+<nav class="side" id="side"></nav>
+<main><div class="reading" id="top">
+<div class="crumb"><a href="../index.html">Curriculum</a> / Part III · Systems / Cluster E — Domain-specific</div><h1>19 · Search Autocomplete / Typeahead</h1>
+<div class="summary"><div class="hard"><b>Hard constraint:</b> return ranked completions on <em>every keystroke</em> in a few ms at ~10<sup>6</sup> QPS — so the answer is a <b>precomputed top-k at each prefix</b> served from RAM, with the hot head absorbed at the edge. The matching structure is secondary; the precomputation and the skew are the system.</div><div class="prims"><b>Primitives exercised:</b> <a href="../primitives/p2.html">P2</a> (partitioning / hot-key), <a href="../primitives/p4.html">P4</a> (caching), <a href="../primitives/p11.html">P11</a> (CDN / edge), <a href="../primitives/p1.html">P1</a> (batch + stream), <a href="../primitives/p6.html">P6</a> (search retrieval, sibling system <a href="s7.html">S7</a>).</div><p>This is what &ldquo;how does YouTube/Google search work&rdquo; usually means in an interview: the as-you-type suggestion box, not full retrieval (<a href="s7.html">S7</a>). Trie vs FST; materialize top-k at the node; first-letter sharding is the trap; hash + replicate + edge-cache the head fixes the hot key; a streaming speed layer keeps trending queries fresh.</p></div>
+
+<hr>
+
+<h2 class="sec">1 &middot; Requirements</h2>
+<p><b>Functional.</b> (1) <code>suggest(prefix)</code> returns the top <em>k</em> (≈5–10) completions for a prefix, ranked by popularity/relevance; (2) it fires as the user types each character; (3) tolerate minor typos (&ldquo;netflox&rdquo; → &ldquo;netflix&rdquo;); (4) reflect <b>trending</b>/breaking queries within minutes, not a day. <b>Out of scope</b> for the core design: executing the actual search and ranking result documents — that&rsquo;s the search engine (<a href="s7.html">S7</a>); mention the boundary, then set it aside.</p>
+<p><b>Non-functional</b> — these shape everything:</p>
+<div class="tablewrap"><table>
+<tr><th>Property</th><th>Target</th><th>Why it matters</th></tr>
+<tr><td>Latency</td><td>p99 &lt; ~100&nbsp;ms end-to-end; lookup itself a few ms</td><td>It fires on every keystroke; a slow suggestion is worse than none and is discarded by the client.</td></tr>
+<tr><td>Read:write ratio</td><td>overwhelmingly reads</td><td>Popularity is aggregated offline/streaming, never per request → optimise the read path above all.</td></tr>
+<tr><td>Traffic shape</td><td>extreme Zipfian skew</td><td>A tiny set of short, popular prefixes is most of the load → caching the head is the architecture, not an add-on.</td></tr>
+<tr><td>Freshness</td><td>trending visible in minutes</td><td>A daily batch can&rsquo;t surface a term that started spiking an hour ago.</td></tr>
+<tr><td>Consistency</td><td>eventually-consistent ranking is fine</td><td>It&rsquo;s a hint list; being a few minutes stale on the tail is invisible to users.</td></tr>
+</table></div>
+
+<h2 class="sec">2 &middot; Capacity estimation</h2>
+<p>Numbers first — they decide where the design lands. Assume Google scale: ~5&nbsp;billion searches/day, and the suggest endpoint fires on (debounced) keystrokes, ≈6 calls per search.</p>
+<div class="estimate">QUERY VOLUME
+  5,000,000,000 searches/day x 6 suggest calls   = 3.0e10 suggest q/day
+  3.0e10 / 86,400 s                               &asymp; 347,000 QPS average
+  peak ~3x                                        &asymp; 1,040,000 QPS
+
+INDEX CORPUS  (head + torso of distinct queries we index)
+  ~5e9 distinct query strings x ~20 chars
+  trie that materializes top-k at EVERY node      &asymp; 2 TB
+    -> too big for one box; fits across a small fleet in RAM
+    -> an FST (suffix-shared, bit-packed) cuts this several-fold
+
+TRAFFIC SKEW  (why caching dominates)
+  top ~10,000 prefixes  &asymp;  50-70% of ALL suggest traffic
+    -> a tiny edge cache absorbs the majority of requests
+    -> the sharded fleet only serves the well-distributed long tail
+
+SERVING
+  ~1.04M peak QPS / ~50k QPS per RAM box  &asymp; ~21 boxes for raw QPS
+    -> so the real constraint is MEMORY FOOTPRINT + SKEW, not aggregate QPS
+
+LATENCY BUDGET
+  p99 < ~100 ms end-to-end; serving lookup a few ms (walk + return cached list)</div>
+<p>The takeaways that drive the rest: it&rsquo;s a <b>read/caching problem</b> with a 2&nbsp;TB in-memory index; aggregate QPS is small (~21 boxes), so what actually hurts is <b>fitting the index</b> and <b>surviving the skew</b>; and freshness can&rsquo;t come from batch alone.</p>
+
+<h2 class="sec">3 &middot; API design</h2>
+<div class="estimate">GET /suggest?q=net&amp;k=8&amp;lang=en&amp;ctx=...
+  200 : { "suggestions": [
+           {"text":"netflix","score":0.99},
+           {"text":"netflix login","score":0.71},
+           {"text":"net worth","score":0.55}, ... ] }
+
+Client rules (offload work to the edge of the system):
+  - debounce ~50-150 ms so not every keystroke hits the server
+  - cancel the in-flight request when a newer character is typed
+  - cache per-prefix results locally for the session</div>
+<p>The endpoint is a bare keyed <code>GET</code> so it is trivially cacheable by a CDN. Debounce + request-cancellation on the client cut a large fraction of calls before they leave the browser — the cheapest rung of all.</p>
+
+<h2 class="sec">4 &middot; The matching structure — derive it, don&rsquo;t assert &ldquo;trie&rdquo;</h2>
+<p>The serve-time job: <code>prefix → top-k completions</code> in a few ms. Enumerate the family and the axis that picks between them, rather than naming one and stopping:</p>
+<div class="tablewrap"><table>
+<tr><th>Structure</th><th>How it does prefix→top-k</th><th>Cost / when it wins</th></tr>
+<tr><td>Sorted term array + binary search</td><td>Prefix defines a contiguous range; scan it, sort by score</td><td>Dead simple (rung-0 baseline); range is huge for short prefixes and you re-rank per query.</td></tr>
+<tr><td>Trie (prefix tree), <b>top-k cached at each node</b></td><td>Walk <code>len(prefix)</code> nodes, return the node&rsquo;s precomputed list</td><td>O(prefix length), <em>no</em> serve-time sort. The canonical answer. Cost: memory + rebuild of cached lists.</td></tr>
+<tr><td>Ternary search tree</td><td>Trie with 3-way nodes</td><td>More memory-efficient than a fat 256-way trie; slightly slower walk.</td></tr>
+<tr><td>FST / FSA (finite-state transducer)</td><td>Shares <em>suffixes</em> too; maps string→weight compactly</td><td>5–10× smaller than a pointer trie — how you actually fit ~2&nbsp;TB in RAM. This is what Lucene uses. Harder to mutate in place.</td></tr>
+<tr><td>Succinct trie (LOUDS)</td><td>Same traversal, bit-packed</td><td>Smallest footprint; read-mostly, rebuilt rather than edited.</td></tr>
+</table></div>
+<div class="hard"><p>The decisive move is independent of which structure you pick: <b>materialize the top-k completions at each prefix node ahead of time.</b> That converts serve-time work from &ldquo;range-scan + sort&rdquo; into &ldquo;walk to the node, return a cached list of 5&rdquo; — which is the only way to hit a few-ms p99 at this QPS. Trie is the right thing to <em>say</em>; an FST is the right thing to <em>ship</em> (it makes the 2&nbsp;TB fit); the precomputed-top-k idea is the part that actually matters.</p></div>
+<div class="estimate">node "net"  ->  precomputed top-k (sorted by score, computed offline)
+  ["netflix", "net worth", "netflix login", "netgear", "net a porter", ...]
+walk: n -> e -> t   (3 hops)   then return the list. No sort at serve time.</div>
+<p><b>Typo tolerance</b>, when the interviewer asks: run the prefix walk against a <b>Levenshtein automaton</b> (edit-distance ≤1–2) intersected with the FST — the same structure traversed fuzzily, no separate index.</p>
+
+<h2 class="sec">5 &middot; High-level architecture</h2>
+<pre class="mermaid">
+graph LR
+  U[user keystroke] --> EDGE[CDN / edge cache]
+  EDGE -->|hit: hot head| U
+  EDGE -->|miss: long tail| GW[suggest service]
+  GW --> SH[(sharded trie/FST fleet<br/>base ranking, in RAM)]
+  GW --> FR[(fresh top-k layer<br/>streaming, in RAM)]
+  GW -->|merge base + fresh| U
+  LOG[query log stream] --> KAFKA[[Kafka]]
+  KAFKA --> BATCH[batch builder<br/>daily/hourly] --> SH
+  KAFKA --> SPEED[stream proc: CMS + heavy-hitters + decay] --> FR
+</pre>
+<p>Two read tiers feed one merge. The <b>edge</b> answers the hot head outright. On a miss, the <b>suggest service</b> queries the <b>base</b> trie/FST fleet (stable, batch-built) <em>and</em> the small <b>fresh</b> layer (streaming), then merges the two ranked lists. Underneath, the query-log stream forks into a <b>batch</b> path that rebuilds the base and a <b>speed</b> path that maintains approximate trending counts. The user&rsquo;s keystroke never waits on either pipeline.</p>
+
+<h2 class="sec">6 &middot; Partitioning — one box → sharding → the hot-key problem</h2>
+<p>This is the decision Chandra-style answers get wrong by stopping at &ldquo;shard by first letter.&rdquo; Derive it rung by rung.</p>
+
+<h4>Rung 0 — single in-memory trie/FST</h4>
+<p>One process holds the whole structure; every <code>suggest</code> walks it. Correct, and fine at small scale.</p>
+<div class="newprob"><b>Bottleneck:</b> the materialized index (~2&nbsp;TB) won&rsquo;t fit in one machine&rsquo;s RAM, and one box can&rsquo;t absorb ~1M QPS. Both force a partition.</div>
+
+<h4>Rung 1 — shard by first letter <span style="font-weight:400">(the trap — raise it, then reject it)</span></h4>
+<p>Route by the leading character: an <code>a…</code> shard, a <code>b…</code> shard, and so on. Simple, but it breaks two ways — both of which a sharp interviewer will name:</p>
+<div class="newprob"><b>Bottleneck — catastrophic skew (the hot-key problem, <a href="../primitives/p2.html">P2</a>):</b> letters and short prefixes are wildly non-uniform. The shard owning <code>s</code>/<code>t</code>/<code>a</code>, or hot prefixes like <code>how…</code>, <code>yo…</code>, <code>the…</code>, takes a huge multiple of an even share. With ~26 buckets you <em>cannot</em> rebalance, and you can&rsquo;t split a hot letter without abandoning the alphabet rule. Worse, <b>short prefixes are simultaneously the hottest and the most expensive</b> (largest candidate sets), so the skew compounds.</div>
+
+<h4>Rung 2 — shard by <code>hash(prefix)</code></h4>
+<p>Map each distinct prefix string to a shard via consistent hashing (<a href="../primitives/p2.html">P2</a>). Now load spreads evenly across <em>distinct</em> prefixes and you can add shards smoothly.</p>
+<div class="newprob"><b>Bottleneck:</b> hashing fixes <em>structural</em> skew (the alphabet) but not <em>popularity</em> skew. Every request for <code>yout</code> still hashes to the <b>same single shard</b> — one viral prefix is still one hot key. Hashing balances the many, not the one.</div>
+
+<h4>Rung 3 — attack popularity skew directly <span style="font-weight:400">(← the real fix)</span></h4>
+<p>Two complementary tools, and the second is the big one:</p>
+<ul>
+<li><b>Replicate hot shards</b> / consistent hashing with bounded loads: detect the heavy prefixes and serve them from N replicas so no single box is the ceiling.</li>
+<li><b>Edge/CDN cache of the head</b> (<a href="../primitives/p11.html">P11</a>, <a href="../primitives/p4.html">P4</a>): the top ~10k prefixes are ~50–70% of all traffic. Cache their completion lists at the edge with a short TTL (seconds–minutes). The hot keys are absorbed <em>before</em> they ever reach a shard, so the sharded fleet only sees the long tail — which is exactly the traffic that <em>is</em> well distributed. The hot-key problem you correctly smelled is <b>mostly solved by caching the head, not by a cleverer shard key.</b></li>
+</ul>
+
+<h4>Rung 4 — two-tier trie</h4>
+<p>Keep the top of the tree (short, super-hot prefixes) in a small, heavily-replicated front layer; shard the deep subtrees (long, rare prefixes) across the fleet. Short-prefix queries — the hot ones — never touch the sharded tail at all.</p>
+<div class="tablewrap"><table>
+<tr><th>Rung</th><th>Good until</th><th>Breaks on</th></tr>
+<tr><td>Single in-memory trie</td><td>index fits one box&rsquo;s RAM</td><td>~2&nbsp;TB index + ~1M QPS exceed one node</td></tr>
+<tr><td>Shard by first letter</td><td>—</td><td>Un-rebalanceable structural skew; hot letters</td></tr>
+<tr><td>Shard by hash(prefix)</td><td>distinct prefixes balance; smooth scale-out</td><td>One viral prefix = one hot shard (popularity skew)</td></tr>
+<tr><td>+ replicate &amp; edge-cache head (← pick)</td><td>head absorbed at edge; tail well-spread</td><td>(accepted) edge TTL vs freshness — bounded to seconds</td></tr>
+<tr><td>Two-tier trie</td><td>hot short prefixes off the shards entirely</td><td>(accepted) extra moving part</td></tr>
+</table></div>
+<div class="note"><b>Net:</b> hash-shard for structural balance, <b>replicate + edge-cache the head</b> for popularity skew, two-tier so hot short prefixes stay off the shards. First-letter sharding is the thing to <em>raise and then reject</em>.</div>
+
+<h2 class="sec">7 &middot; Freshness — pulling from a live stream</h2>
+<p>Where do the popularity scores come from, and how does a trending term appear in minutes instead of tomorrow? This is a <b>lambda / kappa</b> split (<a href="../primitives/p1.html">P1</a>): a stable batch base plus a fast approximate delta, merged at serve time.</p>
+
+<h4>Batch layer — the stable base</h4>
+<p>A daily (or hourly) job over the query logs computes per-prefix top-k and rebuilds the serving trie/FST. Accurate and complete, but <b>stale by up to its rebuild interval</b> — it cannot surface a term that started spiking an hour ago.</p>
+<div class="newprob"><b>Bottleneck:</b> rebuild latency. By itself the batch base is always &ldquo;yesterday&rsquo;s popularity,&rdquo; so breaking/trending queries are invisible until the next rebuild. That gap is what the speed layer fills.</div>
+
+<h4>Speed layer — the fresh delta</h4>
+<p>Query events stream into Kafka; a stream processor (e.g. Flink) maintains <b>approximate</b> popularity online, because keeping an exact count per distinct query at ~1M QPS is infeasible in memory:</p>
+<ul>
+<li><b>Count-Min Sketch</b> for frequency in fixed memory — a few hash-indexed counter arrays; it can over-count a little but never under-counts, in O(1) space per query instead of one counter per distinct string.</li>
+<li><b>Space-Saving / heavy-hitters</b> to keep the top-k per prefix without storing every query that was ever typed.</li>
+<li><b>Exponential time decay</b> on the counts, so &ldquo;trending&rdquo; means <em>rising now</em>, not popular all-time — a term that spikes can outrank an evergreen one within minutes.</li>
+</ul>
+
+<h4>Merge at serve time</h4>
+<p>The suggest service consults the stable base <em>and</em> the fresh top-k layer and merges the two ranked lists before returning. A query that started trending minutes ago shows up via the speed layer; later the batch layer folds it into the base and the speed layer&rsquo;s decayed entry ages out. That two-layer merge is exactly &ldquo;results are close to real-time and pull from a stream to stay fresh.&rdquo;</p>
+<div class="tablewrap"><table>
+<tr><th>Rung</th><th>Good until</th><th>Breaks on</th></tr>
+<tr><td>Daily batch rebuild only</td><td>stable, popular queries</td><td>Can&rsquo;t show anything trending since the last rebuild</td></tr>
+<tr><td>+ streaming speed layer (← pick)</td><td>trending visible in minutes</td><td>(accepted) approximate counts; merge cost — both bounded</td></tr>
+</table></div>
+
+<h2 class="sec">8 &middot; Ranking — beyond raw frequency</h2>
+<p>Popularity is the baseline signal, not the ranker. Production systems re-rank with a model over: query frequency + recency/trend, the user&rsquo;s own history, location/language, session context (the previous query), and — for YouTube specifically — video-side signals like watch-time, freshness, and channel authority. Mechanically it stays cheap: <b>candidate generation</b> produces the ~50–100 completions for a prefix (frequency-ordered, from the trie/FST), then the model <b>re-ranks only that small candidate set</b>. You never run the model over the whole corpus — only over what a prefix already narrowed it to. Personalization is the same shape: candidate-gen stays global, personalization is a re-rank of the small set, so it never blows up the index.</p>
+
+<h2 class="sec">9 &middot; Interview follow-ups (pre-empted)</h2>
+<ul>
+<li><b>&ldquo;Why not <code>LIKE 'pre%'</code> on an indexed column?&rdquo;</b> A B-tree gives you the prefix <em>range</em>, but you still scan + sort by score per query, at ~350k+ QPS, under a few-ms budget. The DB falls over on both QPS and re-ranking cost. Precomputed top-k in RAM is what hits the latency target.</li>
+<li><b>&ldquo;How do you update one node&rsquo;s top-k when a count changes?&rdquo;</b> You don&rsquo;t, per event. Counts flow through the speed layer; the materialized top-k is refreshed by batch rebuild plus the merged fresh layer. In-place trie edits at write-rate are exactly what you avoid.</li>
+<li><b>&ldquo;Why an FST over a plain trie?&rdquo;</b> Suffix sharing + bit-packing makes ~2&nbsp;TB fit in RAM across a small fleet; a pointer trie is several times larger. The cost — it&rsquo;s build-then-serve, not easily mutated — is fine, because freshness lives in the speed layer, not in mutating the base.</li>
+<li><b>&ldquo;Consistent hashing — what about a single viral prefix?&rdquo;</b> Hashing balances <em>distinct</em> prefixes, not a <em>single</em> hot one. That&rsquo;s handled by replicating the hot shard + edge-caching the head (§6, rung 3).</li>
+<li><b>&ldquo;Cache hit rate and TTL?&rdquo;</b> The head is ~50–70% of traffic in ~10k entries → very high hit rate on a tiny cache; a TTL of seconds–minutes keeps trending fresh while still absorbing the hot keys.</li>
+<li><b>&ldquo;Personalized suggestions?&rdquo;</b> Candidate generation stays global (prefix → top-k); personalization is a re-rank of that small candidate set with per-user signals — it doesn&rsquo;t touch the index size.</li>
+<li><b>&ldquo;Multi-language / Unicode?&rdquo;</b> Index per language/locale (separate FSTs) and route by the <code>lang</code> param; normalize (case-fold, strip accents) before the walk so &ldquo;cafe&rdquo; and &ldquo;café&rdquo; share a path.</li>
+</ul>
+
+<h2 class="sec">10 &middot; Real-world example</h2>
+<div class="example">
+<span class="tag">Google / YouTube suggest · Elasticsearch/Lucene</span>
+<p>Google&rsquo;s suggest endpoint returns ranked completions on every keystroke at planet scale, blending all-time popularity with trending and personalized signals — the batch-base-plus-fresh-delta shape above. Lucene/Elasticsearch ship this as concrete machinery: the <b>FST-backed</b> completion suggester stores weighted terms compactly in memory and returns top-k by weight in a prefix walk, with a context suggester for per-category/locale filtering — a production instance of &ldquo;materialize top-k, serve from RAM.&rdquo; The lesson mirrors S14: the interesting engineering is the <b>read/cache and freshness</b> sides; the prefix structure itself is nearly a library call.</p>
+</div>
+
+<h2 class="sec">11 &middot; Key talking points</h2>
+<ul>
+<li>It&rsquo;s a <b>read/caching problem</b>: precompute top-k at each prefix node, serve from RAM; aggregate QPS is small (~21 boxes) — <b>memory footprint and skew</b> are the real constraints.</li>
+<li><b>Trie</b> to teach, <b>FST</b> to ship (fits ~2&nbsp;TB in RAM); the load-bearing idea is <b>materialized top-k</b>, not the structure name.</li>
+<li><b>First-letter sharding is the trap</b> — raise it, reject it for catastrophic skew → hash(prefix) for structural balance → <b>replicate + edge-cache the head</b> for popularity skew (<a href="../primitives/p2.html">P2</a>/<a href="../primitives/p11.html">P11</a>) → two-tier trie.</li>
+<li>The head is tiny and huge: ~10k prefixes ≈ 50–70% of traffic, so a small edge cache solves most of the hot-key problem.</li>
+<li><b>Freshness = lambda/kappa:</b> daily batch base + streaming speed layer (Count-Min Sketch + heavy-hitters + time decay), merged at serve time.</li>
+<li>Ranking is <b>candidate-gen then re-rank the small set</b> — never score the whole corpus.</li>
+<li>Boundary: this is suggestion, not retrieval — the actual search is <a href="s7.html">S7</a>.</li>
+</ul>
+
+<h2 class="sec">12 &middot; Further reading</h2>
+<ul>
+<li><a href="https://www.elastic.co/guide/en/elasticsearch/reference/current/search-suggesters.html">Elasticsearch completion suggester</a> — FST-backed top-k-by-weight prefix completion.</li>
+<li><a href="https://lucene.apache.org/core/9_0_0/suggest/org/apache/lucene/search/suggest/document/package-summary.html">Lucene suggest package</a> — the FST machinery underneath.</li>
+<li>Cormode &amp; Muthukrishnan, <i>Count-Min Sketch</i> — approximate frequency in fixed memory (the speed layer&rsquo;s core).</li>
+</ul>
+
+<div class="prevnext"><a href="s18.html">&larr; S18 &middot; Web crawler</a><a href="s20.html">S20 &middot; Auth &rarr;</a></div>
+</div></main>
+</div>
+<a href="#top" class="backtop" title="Back to top">&uarr;</a>
+<script type="module">
+  import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+  mermaid.initialize({ startOnLoad: true, theme: 'neutral' });
+</script>
+<script>window.SITE_BASE="../";</script>
+<script src="../assets/site.js"></script>
+</body></html>

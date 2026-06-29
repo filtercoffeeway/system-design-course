@@ -1,0 +1,262 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>22 Top-K Trending Topics — System Design Curriculum</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head><body>
+<div class="wrap">
+<nav class="side" id="side"></nav>
+<main><div class="reading" id="top">
+<div class="crumb"><a href="../index.html">Curriculum</a> / Part III · Systems / Cluster E — Domain-specific</div><h1>22 · Top-K Trending Topics (Twitter trends)</h1>
+<div class="summary"><div class="hard"><b>Hard constraint:</b> over a firehose of ~10<sup>5</sup>–10<sup>6</sup> token-events/s, continuously surface the <b>top ~K (10–50)</b> topics for a sliding window — and rank them by <b>surge, not raw volume</b> — using memory that does <em>not</em> grow with the number of distinct topics. So the spine is <b>approximate counting (Count-Min Sketch + heavy-hitter summary) + per-shard top-K with a scatter-gather merge + time-decay/windowing + a baseline-deviation score</b>.</div><div class="prims"><b>Primitives exercised:</b> <a href="../primitives/p7.html">P7</a> (scatter-gather merge of per-shard top-K), <a href="../primitives/p2.html">P2</a> (partition the count stream / hot-key), <a href="../primitives/p1.html">P1</a> (batch base + streaming speed layer), <a href="../primitives/p4.html">P4</a> (cache the tiny result), <a href="../primitives/p8.html">P8</a> (columnar rollup store for windows), <a href="../primitives/p16.html">P16</a> (backpressure on the firehose).</div><p>This is the &ldquo;Twitter trending&rdquo; / &ldquo;top-K viewed&rdquo; / &ldquo;bestseller&rdquo; / &ldquo;most-shared-articles-in-the-last-hour&rdquo; question. The trap is to model it as <code>SELECT topic, COUNT(*) ... ORDER BY 2 DESC LIMIT k</code>. At firehose scale you cannot keep an exact counter per distinct topic, you cannot sort millions of topics per refresh, and — crucially — <b>raw count is the wrong ranking</b>: an evergreen term beats a breaking one every time. We derive each of those three away.</p></div>
+
+<hr>
+
+<h2 class="sec">1 &middot; Requirements</h2>
+<p><b>Functional.</b> (1) <code>getTrending(window, region, k)</code> returns the top <em>k</em> trending topics (hashtags / phrases / entities) for a time window; (2) windows are <b>multiple and rolling</b> — &ldquo;now / last 5&nbsp;min&rdquo;, &ldquo;last hour&rdquo;, &ldquo;last 24&nbsp;h&rdquo;; (3) <b>trending means rising</b> — a topic that is surging relative to its own baseline, not merely high-volume; (4) optionally sliced by region/language and lightly personalized; (5) updated in <b>near-real-time</b> (seconds-to-a-minute lag is fine). <b>Out of scope:</b> the full-text search behind a trend (that&rsquo;s <a href="s7.html">S7</a>) and the as-you-type suggestions (<a href="s19.html">S19</a>) — mention the boundary, then set it aside.</p>
+<p><b>Non-functional</b> — these decide the architecture:</p>
+<div class="tablewrap"><table>
+<tr><th>Property</th><th>Target</th><th>Why it matters</th></tr>
+<tr><td>Write (ingest) volume</td><td>~10<sup>5</sup>–10<sup>6</sup> token-events/s</td><td>The whole tweet firehose, exploded into candidate topics → counting is the bottleneck, not serving.</td></tr>
+<tr><td>Distinct topics</td><td>tens of millions/day, heavy long tail</td><td>An exact counter-per-topic blows the memory budget → forces <b>approximate</b> counting.</td></tr>
+<tr><td>Read shape</td><td>tiny result, read by everyone</td><td>The answer is ~50 strings; identical for a region → trivially cacheable (<a href="../primitives/p4.html">P4</a>). Reads are a non-problem.</td></tr>
+<tr><td>Freshness</td><td>seconds to ~1 min</td><td>Trends are about <em>now</em>; a daily batch can&rsquo;t surface a 10-minute-old spike.</td></tr>
+<tr><td>Accuracy</td><td>approximate is fine</td><td>Nobody can tell #7 from #9; we trade exactness for fixed memory. Errors are bounded, never silent.</td></tr>
+<tr><td>Ranking signal</td><td>surge / anomaly, not volume</td><td>&ldquo;Trending&rdquo; ≠ &ldquo;most popular.&rdquo; The board must reward acceleration vs a baseline.</td></tr>
+</table></div>
+<div class="note"><b>The asymmetry that shapes everything:</b> this is a <b>write-heavy, read-trivial</b> system — the exact mirror image of <a href="s19.html">S19</a> autocomplete (read-heavy). All the engineering is on the ingest/counting side; the serving side is &ldquo;return a cached list of 50.&rdquo;</p></div>
+
+<h2 class="sec">2 &middot; Capacity estimation</h2>
+<p>Numbers first — they decide where the design lands. Assume Twitter-ish scale: ~500&nbsp;million tweets/day, each exploded into ~15 candidate topics (hashtags + a few n-gram phrases + named entities).</p>
+<div class="estimate">INGEST VOLUME
+  500,000,000 tweets/day / 86,400 s        &asymp; 5,800 tweets/s average
+  big-event peak ~10x                       &asymp; 58,000 tweets/s
+  x ~15 candidate topics per tweet
+    avg token-events/s                       &asymp; 87,000 /s
+    peak token-events/s                      &asymp; 870,000 /s
+    token-events/day                          = 7.5e9 /day
+
+DISTINCT TOPICS (the cardinality that kills exact counting)
+  ~5e7 distinct tokens/day (hashtags + phrases + entities, long tail)
+  EXACT hashmap counter: key(~20B)+count(8B)+overhead(~48B) = 76 B/entry
+    5e7 x 76 B                                &asymp; 3.8 GB per node, AND it grows with
+    every new distinct topic -> unbounded.  <-- this is the rung-0 killer
+
+APPROXIMATE counter (Count-Min Sketch), eps=0.001, delta=0.001
+  width  w = ceil(e/eps)  = 2,719
+  depth  d = ceil(ln 1/delta) = 7
+  counters = w x d = 19,033  x 4 B            &asymp; 74 KB   (per window, per shard)
+    -> CONSTANT in cardinality. 3.8 GB -> 74 KB. That is the whole trick.
+
+SERVING
+  result = ~50 topics x ~30 B  &asymp; 1.5 KB, identical per region
+    -> one cached object; read QPS is irrelevant to the design.</div>
+<p>The takeaways that drive the rest: (1) counting is the hard part and an <b>exact per-topic counter is the rung-0 that dies on memory</b> (3.8&nbsp;GB and unbounded); (2) approximate counting collapses that to a fixed ~74&nbsp;KB; (3) the read path is a cached 1.5&nbsp;KB blob — ignore it; (4) freshness must come from a stream, and ranking must come from a <em>baseline comparison</em>, not the count itself.</p>
+
+<h2 class="sec">3 &middot; API design</h2>
+<div class="estimate">GET /trending?window=1h&amp;region=US&amp;k=20
+  200 : { "as_of": "2026-06-21T18:30:05Z",
+          "window": "1h", "region": "US",
+          "trends": [
+            {"topic":"#Election","score":390.2,"volume":42000,"rank":1},
+            {"topic":"Game 7","score":120.7,"volume":31000,"rank":2},
+            ... ] }            # score = surge, volume = raw count (shown separately)
+
+INGEST (internal, not user-facing)
+  produce(tweet) -> tokenizer -> N topic-events -> Kafka(partition by topic)
+  event = {topic, ts, region, weight}     # weight lets you down-rank spam/bots</div>
+<p>The read endpoint is a bare keyed <code>GET</code> (window × region × k) → a CDN/edge cache (<a href="../primitives/p11.html">P11</a>) serves it with a few-seconds TTL, so the serving fleet barely sees traffic. Note the response separates <b>score</b> (surge — what we rank by) from <b>volume</b> (raw count — what we display): they are deliberately different, see §8.</p>
+
+<h2 class="sec">4 &middot; Counting — derive it, don&rsquo;t assert &ldquo;Count-Min Sketch&rdquo;</h2>
+<p>The serve-time job is <code>topic → approximate frequency in this window</code> for the heavy hitters. Walk the ladder; each rung dies on a specific number.</p>
+
+<h4>Rung 0 — per-event increment in a database</h4>
+<p>For each topic in each tweet, <code>UPDATE counts SET c = c+1 WHERE topic = ? AND bucket = ?</code> (or a Redis <code>INCR</code> per topic). Dead simple; correct.</p>
+<div class="newprob"><b>Bottleneck — two of them.</b> (1) <b>Write QPS &amp; hot key:</b> at ~10<sup>5</sup>–10<sup>6</sup> increments/s, and with the <em>single hottest topic</em> taking a large fraction of them, that one counter row is a hot key (<a href="../primitives/p2.html">P2</a>) — row-lock contention serializes the firehose. (2) <b>It&rsquo;s the wrong shape:</b> you only need the top ~50, but you&rsquo;re paying to durably maintain millions of counters you&rsquo;ll never read.</div>
+
+<h4>Rung 1 — in-memory hashmap counter + periodic flush</h4>
+<p>Keep an exact <code>map[topic]→count</code> in RAM per stream-processor; increment is O(1) with no DB round-trip; flush aggregates to a store every few seconds. This is the natural first fix and it&rsquo;s a real rung — at small/medium cardinality it&rsquo;s exactly right.</p>
+<div class="newprob"><b>Bottleneck — memory grows with cardinality.</b> The map holds one entry per <em>distinct</em> topic ever seen in the window: ~5e7/day → <b>3.8&nbsp;GB per node and unbounded</b> (a spam wave of unique junk strings can OOM it). You&rsquo;re spending gigabytes to track millions of one-hit topics so you can return 50. The mismatch — &ldquo;I only want the heavy hitters&rdquo; vs &ldquo;I&rsquo;m paying for the whole tail&rdquo; — is what the next rung removes.</div>
+
+<h4>Rung 2 — approximate counting: Count-Min Sketch + a heavy-hitter summary</h4>
+<p>Two cooperating structures, both with memory <em>independent of cardinality</em>:</p>
+<p><b>(a) Count-Min Sketch (CMS)</b> answers &ldquo;roughly how many times have I seen topic X?&rdquo; in fixed space. It is a <code>d × w</code> grid of counters with <em>d</em> independent hash functions. <b>To add</b> topic X: hash it with each of the <em>d</em> functions and increment the one counter it picks in each row. <b>To query</b> X: read those same <em>d</em> counters and take the <b>minimum</b>. Collisions only ever <em>add</em> mass, so every row is an over-estimate; taking the min picks the least-polluted row. It never under-counts. Worked, with <code>d=3, w=8</code>:</p>
+<div class="estimate">add #WorldCup x900, #Election x400, and rare #t5 x4
+
+         bucket: 0    1    2    3    4    5    6    7
+  row0:        [900,  0,   0,   4,   0,   5,   0,  400]
+  row1:        [400,  0,  900,  4,   0,   0,   0,   0 ]
+  row2:        [ 0,  400,  0,   4,   0,  904,  0,   0 ]   &lt;- #t5 collides w/ #WorldCup here
+
+  query #WorldCup -> rows read [900, 900, 904] -> min = 900   (exact)
+  query #Election -> rows read [400, 400, 400] -> min = 400   (exact)
+  query #t5       -> rows read [  4,   4, 904] -> min =   4   (exact!)
+        in row2 the rare topic collided with #WorldCup and read 904,
+        but rows 0 and 1 were clean, so MIN corrects it back to 4.</div>
+<p>For the sized sketch (ε=0.001, δ=0.001 → w=2719, d=7) the over-count is bounded by <code>ε·N</code> with probability <code>1−δ</code>. Heavy hitters dwarf that bound, so their estimates are essentially exact; the tail is noisy but we don&rsquo;t care about the tail. Total: <b>~74&nbsp;KB, constant no matter how many distinct topics appear.</b></p>
+<p><b>(b) A heavy-hitter / stream-summary</b> (Misra–Gries or Space-Saving) answers &ldquo;<em>which</em> topics are the big ones?&rdquo; — because a CMS tells you a count <em>if you already know the key</em>, but it doesn&rsquo;t enumerate keys. Misra–Gries keeps <em>m</em> counters; a new item takes a free slot, increments an existing slot, or (if all <em>m</em> are full) decrements <em>every</em> counter by one (evicting any that hit zero). Worked, <code>m=3</code>:</p>
+<div class="estimate">stream: A A B C A B A D A A E A   (N=12)
+  final MG counters: { A:5, E:1 }    exact: {A:7, B:2, C:1, D:1, E:1}
+  guarantee: any topic with true freq &gt; N/(m+1) = 3 is GUARANTEED retained.
+  A (true 7) is kept; its counter 5 is a lower bound (true is 5..7).</div>
+<p>So the pair is: <b>Misra–Gries/Space-Saving gives you the candidate set of heavy hitters; the CMS gives you a sharp frequency estimate for each candidate.</b> Together, fixed memory, no per-topic counter.</p>
+<div class="newprob"><b>Bottleneck:</b> a CMS counts <em>everything since you zeroed it</em> — it has no notion of time. &ldquo;Trending&rdquo; is about the recent window, so an all-time sketch makes evergreen topics permanent winners. That forces windowing/decay (§6). And the count it gives is still <em>volume</em>, not <em>surge</em> (§8).</div>
+
+<div class="tablewrap"><table>
+<tr><th>Rung</th><th>Good until</th><th>Breaks on</th></tr>
+<tr><td>Per-event DB increment</td><td>low rate, few topics</td><td>Write QPS + single hot-topic counter (P2)</td></tr>
+<tr><td>In-memory exact map + flush</td><td>cardinality fits RAM</td><td>~3.8&nbsp;GB &amp; unbounded; spam-cardinality OOM</td></tr>
+<tr><td>CMS + heavy-hitter summary (← pick)</td><td>any cardinality (fixed ~74&nbsp;KB)</td><td>no time-awareness; gives volume not surge</td></tr>
+</table></div>
+
+<h2 class="sec">5 &middot; Top-K maintenance &amp; the distributed merge</h2>
+<p>Given per-topic frequencies, how do you keep the top <em>K</em> without sorting millions of topics every refresh?</p>
+
+<h4>Rung 0 — sort everything on read</h4>
+<p>Collect all topic→count pairs and sort, take the first K. O(N log N) over millions of entries, per refresh.</p>
+<div class="newprob"><b>Bottleneck:</b> sorting tens of millions of topics every few seconds is wasted work — you re-sort a near-static tail to find a near-static head.</div>
+
+<h4>Rung 1 — a min-heap of size K</h4>
+<p>Maintain a bounded min-heap holding the current top-K. On each count update, if the value beats the heap&rsquo;s minimum, push-pop; else skip. O(log K) per update, O(1) to read the head. Worked, <code>K=3</code>:</p>
+<div class="estimate">counts arrive: #a50 #b80 #c30 #d95 #e10 #f70   (K=3)
+  ...fill heap [#a50,#b80,#c30]
+  #d(95) &gt; min(30) -> push, evict #c(30)
+  #e(10) &lt;= min(50) -> skip
+  #f(70) &gt; min(50) -> push, evict #a(50)
+  final top-K = [#d:95, #b:80, #f:70]</div>
+<p>(The Space-Saving summary from §4 already <em>is</em> a bounded top-m structure, so in practice the heavy-hitter summary and the top-K heap are the same idea sized to <code>m ≈ several·K</code>.)</p>
+
+<h4>Rung 2 — per-shard local top-K + scatter-gather merge <span style="font-weight:400">(← the real distributed answer, <a href="../primitives/p7.html">P7</a>)</span></h4>
+<p>One node can&rsquo;t take the whole firehose, so partition the event stream by <code>hash(topic)</code> across <em>S</em> shards (<a href="../primitives/p2.html">P2</a> — every event for a topic lands on one shard, so its count is local and complete). Each shard keeps its own CMS + local top-K. A coordinator periodically gathers the shards&rsquo; local top-K lists and merges them (<a href="../primitives/p7.html">P7</a>). But there is a classic trap:</p>
+<div class="newprob"><b>Bottleneck — the merge can miss a true global heavy hitter.</b> If each shard sends only its <em>local</em> top-K, a topic that is just-below-top on several shards but globally large gets dropped. Worked: true global #2 is <b>#y = 18</b>, spread as 9+9 across two shards but never a shard&rsquo;s #1:</p>
+<div class="estimate">shardA: #x40 #y9  #z8     shardB: #x40 #p10 #q7     shardC: #x40 #y9 #r6
+  true global: #x=120, #y=18, #p=10, #z=8, #q=7, #r=6
+
+  merge per-shard TOP-1:  {#x:120}                      <- #y MISSED
+  merge per-shard TOP-2:  {#x:120, #y:18, #p:10}        <- #y recovered
+  merge per-shard TOP-3:  {#x:120, #y:18, #p:10}</div>
+<p><b>Fix — over-fetch.</b> Each shard returns its top <code>K' = c·K</code> (or its whole heavy-hitter summary), not just K; the coordinator sums per topic and takes the global top-K. Because partitioning is by topic, a shard&rsquo;s count for a topic is <em>complete</em>, so summing the over-fetched candidates is exact for anything that made <em>any</em> shard&rsquo;s K' list. This is the same &ldquo;ask for more than you need, then merge&rdquo; pattern as distributed search&rsquo;s query-then-fetch (<a href="s7.html">S7</a>) and the global-top-N merge in <a href="../primitives/p7.html">P7</a>.</p>
+<div class="note"><b>Why partition-by-topic, not by ingest-node:</b> if you sharded the firehose round-robin, every topic&rsquo;s count would be smeared across all S shards and the merge could never be exact without shipping full per-shard counts. Hashing by topic makes each shard&rsquo;s local count <em>authoritative</em> for its topics — the merge just concatenates disjoint key-spaces, and over-fetch only guards the items that <em>straddle</em> a shard&rsquo;s K cut.</p></div>
+<div class="tablewrap"><table>
+<tr><th>Rung</th><th>Good until</th><th>Breaks on</th></tr>
+<tr><td>Sort-on-read</td><td>few topics, infrequent reads</td><td>re-sorting millions every refresh</td></tr>
+<tr><td>Min-heap size K</td><td>one node holds the stream</td><td>one node can&rsquo;t take ~10<sup>6</sup>/s</td></tr>
+<tr><td>Per-shard top-K + over-fetch merge (← pick)</td><td>shard-by-topic; K&prime;=c·K</td><td>(accepted) merge interval vs freshness — bounded to seconds</td></tr>
+</table></div>
+
+<h2 class="sec">6 &middot; Time windows &amp; decay — &ldquo;last 5 min&rdquo; without rescanning the firehose</h2>
+<p>The board needs several rolling windows (5&nbsp;min / 1&nbsp;h / 24&nbsp;h). Naively you&rsquo;d re-aggregate the raw event log for each window on each refresh — re-reading the firehose repeatedly. Two ways out, used together.</p>
+
+<h4>Tumbling buckets + rollup (exact-ish, multi-window)</h4>
+<p>Aggregate events into small fixed <b>tumbling windows</b> — e.g. one CMS/heavy-hitter snapshot per <b>1-minute bucket</b>. Any larger window is then a <em>sum of buckets</em>: &ldquo;last 5 min&rdquo; = sum the last 5 one-minute snapshots; the rolling update is &ldquo;drop the oldest bucket, add the newest&rdquo; — O(1), never a rescan. Worked (#Election per-minute counts):</p>
+<div class="estimate">per-min buckets: [120, 90, 300, 5000, 4200]   (newest last)
+  last-5-min total = 120+90+300+5000+4200 = 9,710
+  next minute: drop bucket[0]=120, add new bucket -> O(1), no raw rescan
+
+HIERARCHICAL ROLLUP (so 24h doesn't sum 1,440 one-min buckets):
+  60 x 1-min  -> roll up into 1 x 1-hour cell
+  24 x 1-hour -> roll up into 1 x 1-day cell
+  each window reads its OWN grain: 5-min from 1-min cells, 24h from 1-hour cells</div>
+<p>This is a columnar/time-partitioned rollup store (<a href="../primitives/p8.html">P8</a>) — the same pattern as a metrics TSDB (<a href="s6.html">S6</a>): pre-aggregate at write time into the grains you&rsquo;ll query, so no query rescans raw events. Note the CMS is <b>mergeable</b>: summing the per-minute sketches cell-wise gives the window&rsquo;s sketch for free (they share dimensions).</p>
+
+<h4>Exponential decay (a continuously sliding window, O(1) state)</h4>
+<p>For the &ldquo;now&rdquo; board you often want a <em>smooth</em> slide rather than discrete buckets. Keep one decaying score per heavy hitter and update it <b>lazily</b>: when an event arrives at time <code>t</code>, <code>score = score · e^(−λ·Δt) + weight</code>, where <code>Δt</code> is time since the last update and <code>λ = ln2 / half_life</code>. Old mass evaporates; recent mass dominates. Worked (half-life 10&nbsp;min):</p>
+<div class="estimate">half-life = 600 s  ->  lambda = ln2/600
+  t=0s   burst +1 -> score 1.000
+  t=1s   +1       -> 1.999
+  t=2s   +1       -> 2.997     (recent burst piles up)
+  t=300s +1       -> 3.124     (5 min later: old mass half-decayed)
+  t=900s +1       -> 2.562     (15 min: the early burst has mostly evaporated)
+  => a fresh burst outweighs an old steady trickle, with ONE float per topic.</div>
+<p><b>Why lazy decay matters:</b> you never sweep all topics to age them — you apply the decay factor only when a topic is touched or read. That keeps per-event work O(1) and avoids an O(distinct-topics) tick.</p>
+
+<h2 class="sec">7 &middot; High-level architecture</h2>
+<pre class="mermaid">
+graph LR
+  TW[tweet firehose] --> TOK[tokenizer<br/>hashtags + n-grams + entities]
+  TOK --> KAFKA[[Kafka<br/>partition by hash topic]]
+  KAFKA --> SP[stream shards<br/>CMS + heavy-hitters + decay<br/>per 1-min bucket]
+  SP --> ROLL[(rollup store<br/>1-min -> 1h -> 1d, P8)]
+  SP --> COORD[coordinator<br/>scatter-gather merge K'=cK, P7]
+  ROLL --> COORD
+  COORD --> SCORE[surge scorer<br/>observed vs baseline]
+  SCORE --> CACHE[(trending cache<br/>per window x region)]
+  CACHE --> EDGE[CDN / edge, P11] --> U[clients]
+  KAFKA --> BATCH[batch baseline job<br/>long-run rate per topic] --> SCORE
+</pre>
+<p>The firehose is tokenized into topic-events and published to Kafka <b>partitioned by <code>hash(topic)</code></b> so each topic&rsquo;s counting is local to one shard (<a href="../primitives/p2.html">P2</a>). Stream shards maintain approximate counts per 1-minute bucket (§4) and write rollups (§6). A coordinator merges the shards&rsquo; over-fetched top-K (§5), a surge scorer converts volume into a trending score against a batch-computed baseline (§8), and the tiny result is cached per window×region and fronted by the edge. The reader never touches the pipeline.</p>
+
+<h2 class="sec">8 &middot; The ranking signal — &ldquo;trending&rdquo; is surge, not volume</h2>
+<p>This is the part that separates a real trending board from a leaderboard. If you rank by raw count, evergreen terms (#love, good-morning greetings, a perennial sports club) win forever and nothing ever &ldquo;trends.&rdquo; <b>Trending = anomalous acceleration vs the topic&rsquo;s own baseline.</b></p>
+<p>Maintain, per topic, a long-run <b>baseline rate</b> (an EWMA of its historical events/min, computed by the batch path). The score is how far the current window <em>exceeds what we&rsquo;d expect</em>. Model the count as Poisson(expected): standard deviation ≈ √expected, so a z-score <code>(observed − expected)/√expected</code> measures surprise. Worked:</p>
+<div class="estimate">topic         raw(5m)   expected   z-score   ratio
+  #love         26,000    25,000        6      1.04x   <- huge volume, NOT surging
+  #Election      4,000       100      390     40.0x   <- breaking: 40x its baseline
+  #goodmorning   4,200     4,000        3      1.05x   <- diurnal, expected
+
+  rank by RAW COUNT  -> #love wins (boring, always there)
+  rank by SURGE (z)  -> #Election wins (it's actually trending)</div>
+<p>So the board ranks by <b>z-score / baseline ratio</b>, displays raw <em>volume</em> alongside, and typically applies a <b>volume floor</b> (ignore topics below ~a few hundred events so a topic going 2→40 doesn&rsquo;t show a 20× surge from noise). Variants: χ²/G-test of observed-vs-expected, or comparing the current decayed score to the same topic&rsquo;s score one window ago (the discrete derivative). The mechanism is the same: <em>deviation from a baseline, not the count.</em></p>
+
+<h2 class="sec">9 &middot; Scaling, failure &amp; the cross-cutting checks</h2>
+<ul>
+<li><b>Partition key (the scatter-gather check):</b> the count stream is partitioned by <code>hash(topic)</code> so each topic&rsquo;s count is local and complete; the only cross-shard query is the <em>final</em> top-K merge, handled by over-fetch (§5). A single ultra-viral topic is still one hot partition (<a href="../primitives/p2.html">P2</a>) — split it by <code>hash(topic)+salt</code> across a few sub-counters and sum at merge, the standard hot-key split.</li>
+<li><b>Bounded failover of in-memory state:</b> the CMS/heavy-hitter/decay state is in RAM. Don&rsquo;t rebuild it by replaying all of history — checkpoint each shard&rsquo;s sketch to durable store every bucket (it&rsquo;s only ~74&nbsp;KB) and, on failover, reload <b>only the working window&rsquo;s buckets</b> (last few minutes / the current rollup grains). Recovery is ms, not a firehose replay (the same bounded-rebuild discipline as <a href="s12.html">S12</a>).</li>
+<li><b>Backpressure (<a href="../primitives/p16.html">P16</a>):</b> a 10× event spike (exactly when trends matter most) must not topple the counters. Kafka decouples ingest from processing; if shards fall behind, you <b>sample</b> the stream (count 1-in-r and scale up) — approximate counting already tolerates sampling, so shedding load degrades accuracy gracefully instead of dropping the system.</li>
+<li><b>Spam / bot manipulation:</b> raw counts are gameable (a botnet hammering a hashtag). Defenses: per-user/per-IP dedup so one account can&rsquo;t inflate a topic (count <em>distinct users</em>, not raw events — estimated with a <b>HyperLogLog</b> per topic, the cardinality cousin of CMS), event <code>weight</code> down-ranking low-reputation accounts, and the baseline/anomaly model itself (a botnet&rsquo;s unnatural spike is detectable).</li>
+<li><b>Scaling at 10×:</b> ingest scales by adding Kafka partitions + stream shards (counting is embarrassingly partitionable by topic); serving never scales because the result is one cached blob. The thing that gets harder is the <b>merge fan-out</b> (more shards → more partial top-K lists) — bounded by hierarchical merging (shards → regional coordinators → global), the same tree-merge as <a href="../primitives/p7.html">P7</a>.</li>
+</ul>
+
+<h2 class="sec">10 &middot; Tradeoffs &amp; alternatives</h2>
+<p><b>Exact vs approximate.</b> If the &ldquo;top-K&rdquo; is a <em>leaderboard</em> with few entities and money/fairness on the line (game high-scores, a sales bestseller list over thousands of SKUs), drop the sketches: a Redis <b>sorted set</b> (<code>ZADD</code>/<code>ZINCRBY</code> + <code>ZREVRANGE</code>) gives exact, totally-ordered top-K in O(log N) because cardinality is small enough to hold every member. Approximate counting earns its keep <em>only</em> when distinct cardinality is too large to count exactly (millions of topics) — that&rsquo;s the dividing line between &ldquo;leaderboard&rdquo; and &ldquo;trending firehose.&rdquo;</p>
+<p><b>Volume vs surge.</b> A &ldquo;most-viewed in 24h&rdquo; board wants raw volume (no baseline); a &ldquo;trending now&rdquo; board wants surge. Same plumbing, different scorer — keep the scorer pluggable.</p>
+<p><b>Lambda vs kappa.</b> We used a batch baseline (long-run rate) + a streaming hot path. A pure-streaming (kappa) build computes the baseline as a slow-decay EWMA in the same stream job — simpler ops, slightly less stable baseline.</p>
+
+<h2 class="sec">11 &middot; Real-world example</h2>
+<div class="example">
+<span class="tag">Twitter trends · Kafka + Heron/Storm · approximate algorithms</span>
+<p>Twitter&rsquo;s trends pipeline ingests the tweet stream through Kafka and a stream processor (historically Storm, then Heron), extracts candidate entities, and ranks by an <b>anomaly/surge model against a learned baseline</b> with personalization and spam filtering — not by raw count, which is why niche breaking topics out-rank perennial ones. The approximate-counting toolkit here is industry-standard: <b>Count-Min Sketch</b> (Cormode–Muthukrishnan) for frequency in fixed memory, <b>Space-Saving</b> for heavy hitters, and <b>HyperLogLog</b> for distinct-user cardinality — all chosen because exact per-topic state is infeasible at firehose scale. The lesson mirrors <a href="s6.html">S6</a> (metrics) and <a href="s19.html">S19</a> (autocomplete): pre-aggregate into the grains you&rsquo;ll query, and accept bounded approximation to make the memory constant.</p>
+</div>
+
+<h2 class="sec">12 &middot; Interview follow-ups (pre-empted)</h2>
+<ul>
+<li><b>&ldquo;Why not just <code>GROUP BY topic ORDER BY count DESC LIMIT k</code>?&rdquo;</b> At ~10<sup>6</sup> events/s you can&rsquo;t durably increment per event, can&rsquo;t hold an exact counter per distinct topic (~3.8&nbsp;GB &amp; unbounded), and re-sorting millions per refresh is wasted. CMS + heavy-hitters + per-shard top-K replaces all three with fixed memory.</li>
+<li><b>&ldquo;CMS over-counts — doesn&rsquo;t that corrupt the ranking?&rdquo;</b> It only ever over-estimates, bounded by ε·N, and only for items that collide with heavy ones; the heavy hitters themselves are essentially exact because their true count dwarfs the bound. The min across <em>d</em> rows corrects most collisions (see the #t5 example). We rank heavy hitters, where the error is negligible.</li>
+<li><b>&ldquo;How does a topic on no single shard&rsquo;s top-K still make the global top-K?&rdquo;</b> Over-fetch: each shard returns K&prime;=c·K candidates (or its full summary), the coordinator sums per topic. Since partitioning is by topic, a shard&rsquo;s count is complete, so the sum is exact for anything in any shard&rsquo;s K&prime; list (the #y example).</li>
+<li><b>&ldquo;How do you do &lsquo;last 5 minutes&rsquo; vs &lsquo;last 24 hours&rsquo; cheaply?&rdquo;</b> Tumbling 1-min buckets summed into the window; hierarchical rollup (1-min→1h→1d) so a 24h query reads ~24 hour-cells, not 1,440 minute-cells. Mergeable sketches make the per-bucket sum free.</li>
+<li><b>&ldquo;What stops #love being #1 forever?&rdquo;</b> Rank by surge (z-score / ratio vs a per-topic baseline) plus a volume floor — not by raw count. #Election at 40× baseline beats #love at 1.04× even though #love has 6× the raw volume.</li>
+<li><b>&ldquo;A botnet is spamming a hashtag — how do you not trend it?&rdquo;</b> Count distinct <em>users</em> (HyperLogLog) not raw events, weight by account reputation, and lean on the anomaly model — an unnatural spike from few accounts is detectable and floored out.</li>
+<li><b>&ldquo;Leader/shard dies mid-window — do you lose the trend?&rdquo;</b> No: checkpoint the ~74&nbsp;KB sketch per bucket; on failover reload only the working window&rsquo;s buckets → ms recovery, not a firehose replay.</li>
+<li><b>&ldquo;Exactly-once counting?&rdquo;</b> Unaffordable and unnecessary — approximate counting already tolerates the occasional double/dropped event; we choose at-least-once ingest with sampling-friendly sketches, and the ranking is robust to small count errors by construction.</li>
+</ul>
+
+<h2 class="sec">13 &middot; Key talking points</h2>
+<ul>
+<li><b>Write-heavy, read-trivial</b> (mirror of <a href="s19.html">S19</a>): all engineering is on counting; the result is a cached 1.5&nbsp;KB blob.</li>
+<li><b>Counting ladder:</b> per-event DB increment (hot key) → exact in-RAM map (~3.8&nbsp;GB, unbounded) → <b>CMS + heavy-hitter summary</b> (~74&nbsp;KB, constant in cardinality).</li>
+<li><b>CMS</b> = d×w counters, add to one per row, query = <b>min</b> across rows (never under-counts); <b>Misra–Gries/Space-Saving</b> finds <em>which</em> topics are heavy.</li>
+<li><b>Distributed top-K:</b> partition by <code>hash(topic)</code>, per-shard local top-K, scatter-gather merge with <b>K&prime;=c·K over-fetch</b> (<a href="../primitives/p7.html">P7</a>) to not miss a straddling heavy hitter.</li>
+<li><b>Windows</b> via tumbling 1-min buckets + hierarchical rollup (no rescans); <b>&ldquo;now&rdquo;</b> via lazy <b>exponential decay</b> (one float/topic).</li>
+<li><b>Trending = surge, not volume:</b> rank by z-score/ratio vs a per-topic baseline + a volume floor; count distinct users (HLL) to resist spam.</li>
+<li>Boundary: this is detection/ranking — the search behind a trend is <a href="s7.html">S7</a>; the typeahead is <a href="s19.html">S19</a>; small-cardinality exact ranking is a Redis sorted set, not sketches.</li>
+</ul>
+
+<h2 class="sec">14 &middot; Further reading</h2>
+<ul>
+<li>Cormode &amp; Muthukrishnan, <i>An Improved Data Stream Summary: the Count-Min Sketch and its Applications</i> — the frequency sketch at the core of §4.</li>
+<li>Metwally, Agrawal &amp; El Abbadi, <i>Efficient Computation of Frequent and Top-k Elements in Data Streams</i> — the Space-Saving heavy-hitter algorithm.</li>
+<li>Flajolet et al., <i>HyperLogLog</i> — distinct-cardinality estimation (the spam-resistant distinct-user count in §9).</li>
+<li>Twitter Engineering — trends / Heron streaming (the real-world pipeline in §11). Cross-links: <a href="../primitives/p7.html">P7</a> scatter-gather, <a href="../primitives/p8.html">P8</a> rollup store, <a href="s6.html">S6</a> metrics TSDB.</li>
+</ul>
+
+<div class="prevnext"><a href="s21.html">&larr; S21 &middot; Booking / reservation</a><span></span></div>
+</div></main>
+</div>
+<a href="#top" class="backtop" title="Back to top">&uarr;</a>
+<script type="module">
+  import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+  mermaid.initialize({ startOnLoad: true, theme: 'neutral' });
+</script>
+<script>window.SITE_BASE="../";</script>
+<script src="../assets/site.js"></script>
+</body></html>

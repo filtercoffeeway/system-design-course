@@ -8,84 +8,134 @@
 <nav class="side" id="side"></nav>
 <main><div class="reading" id="top">
 <div class="crumb"><a href="../index.html">Curriculum</a> / Part III · Systems / Cluster B — Read, search, analytics</div><h1>7 · Search Engine (Elasticsearch / Lucene)</h1>
-<div class="summary"><div class="hard"><b>Hard constraint:</b> distributed relevance — each shard has only local term stats, so global IDF needs a separate pass or approximation.</div><div class="prims"><b>Primitives exercised:</b> <a href="../primitives/p6.html">P6</a>, <a href="../primitives/p2.html">P2</a>, <a href="../primitives/p7.html">P7</a>, <a href="../primitives/p12.html">P12</a>.</div><p>Inverted index construction (tokenize/stem/posting lists); TF-IDF/BM25; immutable segments + merge; near-real-time gap; sharded scatter-gather ranking with fetch-then-enrich.</p></div>
+<div class="summary"><div class="hard"><b>Hard constraint:</b> distributed relevance — each shard sees only <em>local</em> term statistics, so a globally-correct BM25 score (which needs global document frequency) isn't directly comparable across shards without an extra pass.</div><div class="prims"><b>Primitives exercised:</b> <a href="../primitives/p6.html">P6</a> (inverted index), <a href="../primitives/p2.html">P2</a> (sharding), <a href="../primitives/p7.html">P7</a> (scatter-gather), <a href="../primitives/p12.html">P12</a> (tail latency), <a href="../primitives/p1.html">P1</a> (refresh/segment batching).</div><p>Inverted-index construction (tokenize/stem/posting lists); BM25 ranking; immutable segments + background merge; the near-real-time refresh gap; sharded query-then-fetch with global top-K merge.</p></div>
 
 <hr>
 
-<h2 class="sec">1 &middot; Requirements &amp; scale</h2>
-<p><b>Functional:</b> full-text and faceted search over a large corpus, ranked by
-relevance, near-real-time. <b>Non-functional:</b> low query latency, high indexing
-throughput, horizontal scale.</p>
-<div class="estimate">Back-of-envelope
-1,000,000,000 docs x 5 KB                    = 5 TB corpus (text)
-inverted index                               ~ fraction of corpus, vocabulary-bound
-shards                                        corpus / per-shard capacity (e.g. 20-50 GB/shard)
-query                                         scatter to all shards, merge top-K
+<h2 class="sec">1 &middot; Requirements</h2>
+<p><b>Functional:</b> full-text search over a large corpus, ranked by <em>relevance</em> (not just matching), with phrase queries, filters/facets, and near-real-time visibility of new documents. <b>Non-functional:</b></p>
+<div class="tablewrap"><table>
+<tr><th>Property</th><th>Target</th><th>Consequence</th></tr>
+<tr><td>Query latency</td><td>p99 &lt; ~100&ndash;200 ms</td><td>scatter-gather + tail control (<a href="../primitives/p12.html">P12</a>)</td></tr>
+<tr><td>Relevance</td><td>best docs first, not just hits</td><td>BM25 with global stats (&sect;4, the wall)</td></tr>
+<tr><td>Freshness</td><td>new docs searchable in ~1 s</td><td>periodic refresh &rarr; new segments</td></tr>
+<tr><td>Index throughput</td><td>sustained writes while serving</td><td>immutable segments + async merge</td></tr>
+<tr><td>Scale</td><td>corpus &raquo; one machine</td><td>shard the index (<a href="../primitives/p2.html">P2</a>)</td></tr>
+</table></div>
+<p>Search is the <em>retrieval</em> sibling of <a href="../systems/s19.html">S19 autocomplete</a> (prefix prediction) and shares the inverted-index machinery with <a href="../systems/s6.html">S6</a>'s log search. The thing that makes it hard isn't finding matches &mdash; it's <b>ranking</b> them correctly when the index is split across many machines.</p>
+
+<h2 class="sec">2 &middot; Capacity estimation</h2>
+<div class="estimate">1,000,000,000 docs x ~5 KB text          = ~5 TB raw corpus
+inverted index (compressed postings)     ~ 20-30% of text   = ~1.3 TB
+shard target ~30 GB/shard (Lucene works well in tens of GB)
+  -> ~1.3 TB / 30 GB                      ~ 43 primary shards
+query target ~50,000 QPS                  -> each shard replicated for read fan-out + HA
+a query scatters to all ~43 shards        -> tail latency is the enemy (&sect;9)
+</div>
+<p>Two facts shape everything: the index is big enough to need ~40+ shards (so every query is a <b>scatter-gather</b>, and the slowest shard sets latency), and posting lists are large enough that the read path must avoid touching whole documents until the very end (<b>query-then-fetch</b>).</p>
+
+<h2 class="sec">3 &middot; API & data model</h2>
+<div class="estimate">index(doc_id, fields{title, body, tags, ts})   -> ok      (async; visible after refresh)
+search(q, filters, from, size, sort)           -> [{doc_id, score, highlights}]
+suggest(prefix)                                -> typeahead   (see S19)
+
+inverted index (P6):
+  term -> posting list: [ (doc_id, tf, [positions]), ... ]   sorted by doc_id, delta+varint compressed
+  per term: document frequency df ;  per doc: length dl
 </div>
 
-<h2 class="sec">2 &middot; High-level architecture</h2>
+<h2 class="sec">4 &middot; The inverted index & scoring (built up)</h2>
+<h3>4.1 Building the index (P6)</h3>
+<p>Indexing each document: <b>tokenize</b> (split into terms) &rarr; <b>normalize</b> (lowercase, fold accents) &rarr; <b>stem/lemmatize</b> ("running"&rarr;"run") &rarr; drop or keep stop-words &rarr; append <code>(doc_id, tf, positions)</code> to each term's posting list. Positions enable phrase queries ("new york" = york at position+1 after new). See <a href="../primitives/p6.html">P6</a> for the full byte-level treatment (delta + varint compression, BM25 worked example).</p>
+
+<h3>4.2 Relevance: BM25, derived</h3>
+<p>Why not just count keyword matches? Because a term that appears in <em>every</em> document (e.g. "the") is worthless for ranking, and a 10,000-word document will out-match a focused 300-word one purely by length. BM25 fixes both with two ideas:</p>
+<ul>
+<li><b>IDF (inverse document frequency)</b> &mdash; rare terms are worth more. <code>idf = ln(1 + (N &minus; df + 0.5)/(df + 0.5))</code>. With N = 1e9 docs: a term in 10M docs has idf &asymp; 4.6; a term in 1,000 docs has idf &asymp; 13.8 &mdash; the rare term carries ~3&times; the weight.</li>
+<li><b>TF saturation + length normalization</b> &mdash; more occurrences help, but with diminishing returns (the 10th "jaguar" adds little over the 3rd), and long documents are penalized so they can't win by sheer size.</li>
+</ul>
+<div class="estimate">BM25 term score = idf * ( tf*(k1+1) ) / ( tf + k1*(1 - b + b*dl/avgdl) )    k1=1.2, b=0.75
+  rare term (df=1000, idf=13.8), tf=3, avgdl=500:
+    short doc (dl=300):  score ~ 23.7
+    long  doc (dl=2000): score ~ 13.2     <- same tf, but length-penalized
+</div>
+<p>A query's score is the sum of its terms' BM25 contributions, plus optional <b>field boosts</b> (a match in <code>title</code> counts more than in <code>body</code>). This is the default Lucene/Elasticsearch ranker.</p>
+
+<h3>4.3 Immutable segments + the refresh gap (P1)</h3>
+<p>Posting lists can't be edited in place cheaply, so Lucene writes <b>immutable segments</b>: new/updated docs accumulate in an in-memory buffer and are flushed as a new small segment on <b>refresh</b> (default ~1&nbsp;s) &mdash; that's the near-real-time gap, a document isn't searchable until the next refresh. A delete is a tombstone marking the doc id dead; an update is delete + re-add. Background <b>merge</b> compacts many small segments into fewer large ones (and physically drops tombstoned docs), keeping the per-query segment count low. This is <a href="../primitives/p1.html">P1</a> batching (buffer writes, flush periodically) and mirrors the LSM compaction story (<a href="../primitives/p17.html">P17</a>).</p>
+<div class="newprob"><b>New bottleneck &mdash; segment proliferation.</b> A 1-second refresh creates ~86,400 tiny segments/day; a query must consult <em>every</em> segment, so search slows as segments pile up. The merge policy is the relief valve: too-aggressive merging burns I/O and write-amplifies; too-lazy merging slows queries. Tune refresh interval up (e.g. 30&nbsp;s) for write-heavy/log workloads where 1&nbsp;s freshness isn't needed.</div>
+
+<h2 class="sec">5 &middot; High-level architecture</h2>
 <pre class="mermaid">
 graph TD
-  W[writes] --> IDX[index: immutable segments]
-  Q[query coordinator] --> S1[shard 1] & S2[shard 2] & S3[shard 3]
-  S1 --> M[merge top-K]
-  S2 --> M
-  S3 --> M
-  M --> F[fetch full docs for winners]
+  W[writes] --> CO[coordinator] --> P1s[primary shard] --> R1[replica]
+  Q[query] --> COQ[query coordinator]
+  COQ -->|scatter: query phase| S1[shard 1]
+  COQ --> S2[shard 2]
+  COQ --> S3[shard 3 ... 43]
+  S1 -->|top-K ids + scores| MG[merge -> global top-K]
+  S2 --> MG
+  S3 --> MG
+  MG -->|fetch phase: full docs for K winners| FE[fetch + highlight] --> RES[result]
 </pre>
 
-<h2 class="sec">3 &middot; The hard constraint, in depth</h2>
-<div class="hard"><p>Relevance in a distributed index is the deep problem: each shard
-holds only <b>local term statistics</b>, but a correct TF-IDF/BM25 score needs
-<b>global</b> document frequency (IDF). So scores from different shards aren&rsquo;t
-directly comparable &mdash; you either run a distributed-frequency pass, accept an
-approximation, or use enough docs per shard that local stats approximate global. This
-is why relevance looks off on small or skewed indexes.</p></div>
-
-<h2 class="sec">4 &middot; Component deep dives</h2>
-<h3>Inverted index + segments (P6)</h3>
-<p>Tokenize/stem &rarr; posting lists with tf + positions; written as immutable
-segments, merged in the background; new docs searchable after a ~1s refresh &mdash; see
-<a href="../primitives/p6.html">P6</a>.</p>
-<h3>Distributed query: query-then-fetch (P7)</h3>
-<p>The coordinator scatters to all shards; each returns its top-K IDs + scores; the
-coordinator merges to a global top-K, then fetches full documents for only those
-winners (<a href="../primitives/p7.html">P7</a>). The slowest shard sets latency (<a href="../primitives/p12.html">P12</a>).</p>
-<h3>Scoring</h3>
-<p>BM25 by default; relevance is not keyword matching but a tuned ranking of term
-importance, document length, and field boosts.</p>
-
-<h2 class="sec">5 &middot; Real-world example</h2>
-<div class="example">
-<span class="tag">Elasticsearch (Lucene)</span>
-<p>Elasticsearch shards an index across nodes; each shard is a full Lucene index of
-immutable segments. A search runs Lucene&rsquo;s <b>query-then-fetch</b> across shards as
-above. To tame distributed IDF, Elasticsearch defaults to per-shard scoring (good
-enough when shards are large and uniform) but offers a <code>dfs_query_then_fetch</code>
-mode that first gathers global term statistics across shards for accurate scoring at
-the cost of an extra round trip &mdash; the exact tradeoff the hard constraint predicts.
-Near-real-time comes from the ~1s refresh creating new segments.</p>
+<h2 class="sec">6 &middot; The query path &mdash; query-then-fetch (ladder)</h2>
+<h3>Rung 1 &mdash; ask each shard for full top-K documents</h3>
+<p>Coordinator scatters the query; each shard returns its top-K <em>full documents</em>; coordinator merges. <b>Breaks on:</b> shipping full documents from every shard for results you'll throw away &mdash; if K=10 and there are 43 shards, you move 430 full docs to keep 10. Huge waste of bandwidth.</p>
+<h3>Rung 2 &mdash; query-then-fetch (the standard)</h3>
+<p><b>Query phase:</b> each shard scores its matches locally and returns only the <em>top-K (doc_id, score)</em> &mdash; tiny. <b>Merge:</b> coordinator merges the 43&times;K candidates into one global top-K (<a href="../primitives/p7.html">P7</a>). <b>Fetch phase:</b> coordinator fetches the <em>full documents</em> only for the K global winners, from the shards that own them, and builds highlights. Two round trips, but only K full docs move regardless of shard count.</p>
+<div class="estimate">query phase:  43 shards x K=10  ->  430 (id,score) pairs ~ KBs
+merge:        pick global top-10
+fetch phase:  10 full docs fetched  ->  vs 430 in the naive rung
 </div>
 
-<h2 class="sec">6 &middot; Tradeoffs &amp; alternatives</h2>
-<p>More shards = more parallelism but worse tail latency and worse local-IDF
-approximation; fewer shards = better relevance but less scale. For pure analytics over
-structured data a <a href="../systems/s8.html">columnar SQL engine</a> beats search; for vector
-similarity you&rsquo;d add an ANN index alongside the inverted index.</p>
-
-<h2 class="sec">7 &middot; Key talking points</h2>
+<h2 class="sec">7 &middot; The hard constraint: distributed relevance (the wall)</h2>
+<div class="hard"><p>BM25 needs <b>global</b> document frequency (df = how many of <em>all</em> N docs contain the term). But each shard only knows its <em>local</em> df. So the idf a shard uses to score is wrong, and scores from different shards aren't directly comparable &mdash; a rare-overall term might look common on one shard and rare on another, skewing the merged ranking. This is why relevance looks off on small or unevenly-filled indexes.</p></div>
+<p>The relief ladder:</p>
 <ul>
-<li>Inverted index + immutable segments + ~1s refresh (<a href="../primitives/p6.html">P6</a>).</li>
-<li>Query-then-fetch: ship top-K IDs, fetch docs last (<a href="../primitives/p7.html">P7</a>).</li>
-<li>Distributed IDF is the relevance wall; name the dfs tradeoff.</li>
-<li>BM25 ranking, not keyword matching.</li>
-<li>Shard count trades scale vs relevance vs tail latency.</li>
+<li><b>Approximate (default):</b> if shards are large and documents are randomly distributed, local df &asymp; global df / shard_count, so local scoring ranks <em>almost</em> right. Cheap, one round trip. This is Elasticsearch's default <code>query_then_fetch</code>.</li>
+<li><b>Exact (<code>dfs_query_then_fetch</code>):</b> add a preliminary <b>DFS phase</b> that gathers term statistics (df, total docs) from all shards, computes global idf, and distributes it so every shard scores with the same global stats. Correct, at the cost of an <em>extra</em> round trip &mdash; the exact tradeoff the constraint predicts.</li>
+<li><b>Route to avoid the problem:</b> route documents so each shard is a representative random sample (don't shard by a field that correlates with the query), which keeps the approximation honest.</li>
 </ul>
 
-<h2 class="sec">8 &middot; Further reading</h2>
+<h2 class="sec">8 &middot; Sharding & routing</h2>
+<p>Shard by <code>hash(doc_id) % shards</code> (<a href="../primitives/p2.html">P2</a>) so documents spread evenly &mdash; this both balances storage and keeps local-df a fair sample of global-df (&sect;7). Each shard has replicas for read fan-out and HA; a search can hit any replica. <b>Custom routing</b> (route all of one tenant's docs to one shard via a routing key) makes that tenant's queries hit a single shard instead of scattering &mdash; great for multi-tenant latency, but it concentrates load and worsens the df approximation, so it's a deliberate tradeoff.</p>
+
+<h2 class="sec">9 &middot; Scaling, tail latency & two-phase ranking</h2>
+<div class="newprob"><b>New bottleneck &mdash; tail amplification.</b> A query is only as fast as its <em>slowest</em> shard (<a href="../primitives/p12.html">P12</a>). With 43 shards each 99% likely to be fast, the chance all 43 respond promptly is 0.99<sup>43</sup> &asymp; 66% &mdash; so ~1 in 3 queries waits on a straggler. More shards = more parallelism per shard but <em>worse</em> tail. Fixes: <b>hedged requests</b> (query a second replica after p95 and take the first answer), adaptive replica selection (route to the least-loaded replica), and capping shard count.</p></div>
+<p><b>Two-phase ranking for quality at scale:</b> BM25 retrieves a few hundred cheap candidates per shard; a second, expensive <b>re-ranker</b> (learning-to-rank model, or a neural/semantic model using click signals) re-scores only the top candidates the coordinator gathered. This is the same candidate-generation &rarr; re-rank shape as <a href="../systems/s19.html">S19</a> and <a href="../systems/s9.html">S9</a> &mdash; never run the expensive model over the whole corpus, only over a recalled shortlist.</p>
+
+<h2 class="sec">10 &middot; Tradeoffs & alternatives</h2>
+<p>More shards trade scale and per-shard speed against worse tail latency and worse local-IDF approximation; fewer shards trade scale for better relevance. For pure analytics over <em>structured</em> data a <a href="../systems/s8.html">columnar SQL engine (S8)</a> beats search (scans, no relevance). For <b>semantic / "find similar"</b> search you add a <b>vector ANN index</b> (HNSW) alongside the inverted index and combine lexical BM25 with vector similarity (hybrid search) &mdash; BM25 is exact-term, vectors capture meaning; modern engines run both and blend the scores. For freshness-vs-throughput, raise the refresh interval on log/append workloads where 1&nbsp;s visibility isn't needed.</p>
+
+<h2 class="sec">11 &middot; Real-world example</h2>
+<div class="example">
+<span class="tag">Elasticsearch (Apache Lucene)</span>
+<p>Elasticsearch shards an index across nodes; each shard is a full <b>Lucene</b> index of immutable segments. A search runs Lucene's <b>query-then-fetch</b> across shards exactly as in &sect;6. To tame distributed IDF it defaults to per-shard scoring (good enough when shards are large and uniform) but offers <code>dfs_query_then_fetch</code>, which first gathers global term statistics across shards for accurate scoring at the cost of an extra round trip &mdash; the exact tradeoff &sect;7 predicts. Near-real-time comes from the ~1&nbsp;s <b>refresh</b> flushing the in-memory buffer to a new segment; background <b>merge</b> compacts segments and purges tombstoned deletes. Recent versions add native <b>vector (kNN/HNSW) search</b> for hybrid lexical+semantic ranking.</p>
+</div>
+
+<h2 class="sec">12 &middot; Interview follow-ups (Q&amp;A)</h2>
+<p><b>Q: Why query-then-fetch instead of fetching docs in one pass?</b> To avoid shipping full documents from every shard for results you'll discard. The query phase moves tiny (id, score) pairs; only the K global winners' full docs are fetched. Bandwidth is independent of shard count.</p>
+<p><b>Q: Why are scores inconsistent across a small index?</b> Local per-shard df diverges from global df when shards are small or skewed, so idf (hence BM25) is computed on wrong statistics. Use <code>dfs_query_then_fetch</code> for global stats, or ensure shards are large random samples.</p>
+<p><b>Q: A new document isn't showing up immediately &mdash; why?</b> The refresh interval (default ~1&nbsp;s) controls when buffered writes become a searchable segment. It's a deliberate batching tradeoff (<a href="../primitives/p1.html">P1</a>); lower it for freshness, raise it for write throughput.</p>
+<p><b>Q: How do you do a phrase query like "new york"?</b> Posting lists store term <em>positions</em>; a phrase match requires the terms to appear at consecutive positions in the same doc. It's more expensive than a bag-of-words match, so engines often use a faster term match to recall candidates and verify positions only on those.</p>
+<p><b>Q: How do you keep relevance good at huge corpus size?</b> Two-phase ranking: cheap BM25 recall of a few hundred candidates, then an expensive learning-to-rank / semantic re-ranker over only that shortlist (same shape as <a href="../systems/s9.html">S9</a>/<a href="../systems/s19.html">S19</a>). Never score the whole corpus with the expensive model.</p>
+<p><b>Q: Pagination to page 1000 (<code>from=10000</code>) is slow &mdash; why?</b> Deep pagination forces each shard to return <code>from+size</code> candidates so the coordinator can skip correctly &mdash; cost grows with the offset. Use <b>search-after</b> (a cursor on the last sort value) instead of large <code>from</code> offsets.</p>
+
+<h2 class="sec">13 &middot; Key talking points</h2>
 <ul>
-<li><a href="https://www.elastic.co/guide/en/elasticsearch/reference/current/search-your-data.html">Elasticsearch search internals</a></li>
-<li><a href="https://lucene.apache.org/">Apache Lucene</a></li>
+<li>Inverted index + immutable segments + ~1&nbsp;s refresh + background merge (<a href="../primitives/p6.html">P6</a>, <a href="../primitives/p1.html">P1</a>).</li>
+<li>Relevance is <b>BM25</b> (IDF + TF-saturation + length norm + field boosts), not keyword matching.</li>
+<li><b>Query-then-fetch</b>: scatter top-K (id, score), merge global top-K, fetch only winners' docs (<a href="../primitives/p7.html">P7</a>).</li>
+<li>The wall is <b>distributed IDF</b>: local df &ne; global df &rarr; approximate (default) vs exact DFS pass (extra round trip).</li>
+<li>Latency = slowest shard (<a href="../primitives/p12.html">P12</a>); more shards = more parallelism but worse tail &rarr; hedged requests.</li>
+<li>Two-phase ranking (BM25 recall &rarr; LTR/semantic re-rank); add a vector ANN index for hybrid semantic search.</li>
+</ul>
+
+<h2 class="sec">14 &middot; Further reading</h2>
+<ul>
+<li><a href="https://www.elastic.co/guide/en/elasticsearch/reference/current/search-your-data.html">Elasticsearch search internals</a> &middot; <a href="https://lucene.apache.org/">Apache Lucene</a></li>
+<li><a href="https://nlp.stanford.edu/IR-book/">Manning et al., Introduction to Information Retrieval</a> (inverted index, BM25)</li>
 </ul>
 
 <div class="prevnext"><a href="s6.html">&larr; S6 &middot; Datadog</a><a href="s8.html">S8 &middot; Distributed SQL &rarr;</a></div>

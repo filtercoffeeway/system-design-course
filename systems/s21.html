@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>21 Booking / Reservation — System Design Curriculum</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head><body>
+<div class="wrap">
+<nav class="side" id="side"></nav>
+<main><div class="reading" id="top">
+<div class="crumb"><a href="../index.html">Curriculum</a> / Part III · Systems / Cluster E — Domain-specific</div><h1>21 · Booking / Reservation System</h1>
+<div class="summary"><div class="hard"><b>Hard constraint:</b> never double-book a finite resource (a seat, a room, an inventory unit) under high concurrency — while keeping availability search fast. The split that makes it tractable: <b>availability reads may be stale; the booking write must be linearizable.</b></div><div class="prims"><b>Primitives exercised:</b> <a href="../primitives/p3.html">P3</a> (consistency), <a href="../primitives/p10.html">P10</a> (locks/leases), <a href="../primitives/p9.html">P9</a> (idempotent confirm), <a href="../primitives/p2.html">P2</a> (inventory sharding), <a href="../primitives/p4.html">P4</a> (availability cache), <a href="../primitives/p14.html">P14</a> (saga).</div><p>"Design hotel booking / ticket-seat reservation." Inventory contention under concurrency: overbooking-prevention ladder; hold/expire TTL state machine; the double-booking race; search-vs-book consistency split.</p></div>
+
+<hr>
+
+<h2 class="sec">1 &middot; Requirements</h2>
+<p><b>Functional:</b> search availability for a resource over a date/time range; place a temporary <em>hold</em> while the user pays; confirm the booking; cancel/modify; never sell the same unit twice. <b>Non-functional:</b></p>
+<div class="tablewrap"><table>
+<tr><th>Property</th><th>Target</th><th>Consequence</th></tr>
+<tr><td>Correctness</td><td>NEVER double-book a unit</td><td>linearizable write on the inventory (&sect;4)</td></tr>
+<tr><td>Search latency</td><td>browse results in &lt; ~200 ms</td><td>cache availability; reads can be stale (&sect;6)</td></tr>
+<tr><td>Concurrency</td><td>survive 1M users racing for 50k seats</td><td>hot-row contention handling (&sect;5)</td></tr>
+<tr><td>Fairness/UX</td><td>hold a unit while the user pays</td><td>hold + TTL state machine (&sect;7)</td></tr>
+<tr><td>Idempotency</td><td>a retried confirm books once</td><td>idempotency key (<a href="../primitives/p9.html">P9</a>)</td></tr>
+</table></div>
+<p>The load-bearing realization: <b>reads and writes have opposite consistency needs.</b> Browsing "is this hotel available?" can be slightly stale (worst case the user finds it's gone at checkout). But the actual booking write is a <em>correctness</em> operation &mdash; two confirms for the last seat must not both succeed. Designing those two paths differently is the whole problem.</p>
+
+<h2 class="sec">2 &middot; Capacity estimation</h2>
+<div class="estimate">hotel inventory: 1M hotels x ~5 room-types x 365 days ~ 1.8B inventory rows
+read:write ratio ~ 1000:1   (many browse, few book) -> cache the reads (P4)
+
+flash sale (concert): 50,000 seats, 1,000,000 users hit "buy" in the first minute
+  -> ~833 successful bookings/s, BUT ~20:1 contention on the SAME hot rows
+  -> the problem is not throughput; it's concurrent contention on scarce units
+
+hold TTL: 5-15 min payment window; an expirer returns un-paid holds to the pool
+</div>
+
+<h2 class="sec">3 &middot; API & data model</h2>
+<div class="estimate">searchAvailability(resource, date_range, qty) -> [units]      // cacheable, may be stale
+hold(unit_id, user, qty, idem_key)            -> {hold_id, expires_at}
+confirm(hold_id, payment_token, idem_key)     -> {booking_id}
+release(hold_id) / cancel(booking_id)
+
+inventory:   (resource_id, unit_id, date) -> {state: available|held|booked, version, hold_id?, hold_expires?}
+  partition key = resource_id (or unit) so a booking hits ONE partition (P2)
+bookings:    booking_id -> {unit_id, user, dates, status, idem_key}
+</div>
+<p>Partitioning <b>by resource/unit</b> (<a href="../primitives/p2.html">P2</a>) is deliberate: a booking touches one unit, so it lands on one partition and can be made atomic there &mdash; you never need a cross-partition transaction to sell a seat. This is the "every write needs a partition key" check.</p>
+
+<h2 class="sec">4 &middot; The overbooking-prevention ladder (the heart)</h2>
+<div class="hard"><p>Two users click "book the last room" within milliseconds. Both read "available," both write "booked." Now it's double-booked. Every rung below is a way to make that write sequence safe under concurrency.</p></div>
+<h3>Rung 0 &mdash; read-then-write (no concurrency control)</h3>
+<p><code>if available: set booked</code>. <b>Breaks immediately:</b> the classic check-then-act race &mdash; both transactions read "available" before either writes. Double-booked.</p>
+<h3>Rung 1 &mdash; optimistic concurrency (version / compare-and-set)</h3>
+<p>Read the row with its <code>version</code>; write conditionally: <code>UPDATE ... SET state='booked', version=version+1 WHERE unit_id=? AND version=? AND state='available'</code>. Exactly one update matches; the loser sees 0 rows affected and retries/fails. No locks held. <b>Good until:</b> <em>high contention</em> on a hot unit &mdash; under a flash sale, most writers lose the CAS and retry in a storm, wasting work (though correctness holds).</p>
+<div class="estimate">A: UPDATE seat SET state=booked,version=6 WHERE id=42 AND version=5 AND state=available  -> 1 row  (wins)
+B: UPDATE seat SET state=booked,version=6 WHERE id=42 AND version=5 AND state=available  -> 0 rows (version moved; loses)
+  -> B retries, sees state=booked, gives up cleanly. No double-book.
+</div>
+<h3>Rung 2 &mdash; pessimistic row lock (<code>SELECT ... FOR UPDATE</code>)</h3>
+<p>Lock the row inside a transaction so the second writer <em>waits</em> rather than failing: <code>BEGIN; SELECT ... FOR UPDATE; if available UPDATE; COMMIT</code>. Better when contention is high and you'd rather queue than retry-storm. <b>Breaks on:</b> a hot row serializes all contenders (a lock convoy), lock hold time includes app latency, and it doesn't span databases &mdash; if inventory is sharded across nodes, a single DB lock can't coordinate them.</p>
+<h3>Rung 3 &mdash; distributed lock / lease (cross-node) </h3>
+<p>When inventory spans nodes, take a short <b>lease</b> on the unit via a consensus store (<a href="../primitives/p10.html">P10</a> / <a href="s13.html">S13</a>), with a <b>fencing token</b> so a slow holder can't confirm after its lease expired. Use this only when a single-DB transaction can't (genuinely distributed inventory). <b>Breaks on:</b> the lock service is a dependency and adds latency; over-using distributed locks where a row lock would do is a common over-engineering smell.</p>
+<h3>Rung 4 &mdash; partition the contention away</h3>
+<p>For extreme contention (a 50k-seat on-sale), reduce contention structurally: shard inventory so different units are independent rows/partitions (<a href="../primitives/p2.html">P2</a>) &mdash; a million users contend across 50k <em>independent</em> rows, not one counter. For pooled/fungible inventory (N identical rooms), avoid a single hot counter by splitting it into per-shard sub-counters and decrementing a random shard (the inverse of <a href="../systems/s1.html">S1</a>'s distributed counter); a virtual waiting room throttles the herd before it reaches inventory at all.</p>
+<div class="tablewrap"><table>
+<tr><th>Rung</th><th>Good under</th><th>Breaks on</th></tr>
+<tr><td>Read-then-write</td><td>nothing</td><td>check-then-act race</td></tr>
+<tr><td>Optimistic (version CAS)</td><td>low&ndash;moderate contention</td><td>retry storm on hot units</td></tr>
+<tr><td>Pessimistic row lock</td><td>high single-DB contention</td><td>lock convoy; one DB only</td></tr>
+<tr><td>Distributed lease + fence</td><td>inventory across nodes</td><td>extra dependency/latency</td></tr>
+<tr><td>Partition/shard contention</td><td>flash-sale scale</td><td>only for divisible inventory</td></tr>
+</table></div>
+
+<h2 class="sec">5 &middot; The double-booking race, traced</h2>
+<p>Why the naive path fails, concretely, and why rung 1 fixes it:</p>
+<div class="estimate">t0  user A reads seat 42 -> available (version 5)
+t0  user B reads seat 42 -> available (version 5)     // both saw "available"
+t1  A: UPDATE ... WHERE version=5 AND available -> OK, version=6   // A booked
+t1  B: UPDATE ... WHERE version=5 AND available -> 0 rows           // version moved -> B fails
+t2  B retries read -> state=booked -> show "just taken", offer alternatives
+RESULT: exactly one booking. The conditional WHERE is the atomic check-and-set.
+</div>
+<p>The principle generalizes: make the inventory mutation a single <b>atomic conditional write</b> (CAS, row lock, or a Redis <code>DECR</code> that can't go below zero), never a separate read and write &mdash; that closes the window where two readers both see availability.</p>
+
+<h2 class="sec">6 &middot; The search/book consistency split</h2>
+<div class="hard"><p>Search must be fast and is read-heavy (~1000:1); booking must be correct. Forcing search to be linearizable would make browsing slow and hammer the inventory store; allowing booking to be eventually consistent would double-sell. So split them.</p></div>
+<p><b>Availability search</b> reads from a cached/replicated, possibly-stale view (<a href="../primitives/p4.html">P4</a>, read replicas) &mdash; it's fine if a room shown as available was just taken; the user simply discovers it at the hold step. <b>The hold/confirm write</b> goes to the authoritative inventory partition with one of the concurrency-control rungs above &mdash; <em>linearizable on that unit</em> (<a href="../primitives/p3.html">P3</a>). The hold step is the consistency boundary: search is best-effort; the moment money/commitment is involved, you switch to the strongly-consistent path. This is <a href="../primitives/p3.html">P3</a>'s "tunable consistency per operation" applied within one system.</p>
+
+<h2 class="sec">7 &middot; The hold / expire state machine</h2>
+<p>Users need time to pay, but a held-forever unit that's never paid for is lost inventory. So a hold is a <b>time-boxed lease</b>:</p>
+<pre class="mermaid">
+graph LR
+  AVAIL[available] -->|hold, set TTL| HELD[held]
+  HELD -->|confirm + payment| BOOKED[booked]
+  HELD -->|TTL expires / release| AVAIL
+  BOOKED -->|cancel| AVAIL
+</pre>
+<p>A hold writes <code>state=held, hold_expires=now+15min</code> atomically (same CAS as &sect;4). Confirm transitions <code>held&rarr;booked</code> only if the hold is still valid and matches the holder. An <b>expirer</b> returns lapsed holds to the pool. Crucially, the expiry must be checked at confirm time, not trusted from a background sweep alone &mdash; the confirm's conditional write includes <code>AND hold_expires &gt; now AND hold_id = ?</code>, so a confirm arriving after expiry fails cleanly even if the sweeper hasn't run yet (this is the <a href="../primitives/p10.html">P10</a>/<a href="../systems/s12.html">S12</a> "lease ages from grant time" check &mdash; never act on a lease you only assume is still valid).</p>
+
+<h2 class="sec">8 &middot; Idempotent confirm & the payment saga</h2>
+<p>Confirm involves an external payment, so it's a distributed action that can fail or be retried halfway. Two protections: (1) <b>idempotency key</b> (<a href="../primitives/p9.html">P9</a>) on confirm so a retried request (user double-clicks, network retries after a charge succeeded) returns the <em>existing</em> booking rather than booking/charging twice. (2) A <b>saga</b> (<a href="../primitives/p14.html">P14</a>) for the multi-step "reserve &rarr; charge &rarr; confirm" flow: if payment fails after the hold, release the hold (compensation); if confirm fails after charge, refund. There's no cheap distributed transaction across the inventory DB and the payment provider, so you use at-least-once steps + idempotency + compensation, exactly as <a href="../systems/s17.html">S17</a> does for money movement.</p>
+
+<h2 class="sec">9 &middot; Scaling, deliberate overbooking & failure</h2>
+<p>At flash-sale scale, the levers are: a <b>virtual waiting room</b> that admits users to the inventory at a controlled rate (so 1M users don't hit the DB at once &mdash; <a href="../primitives/p16.html">P16</a> backpressure), inventory <b>sharding</b> so contention spreads across independent rows, and an in-memory authoritative inventory (Redis with atomic <code>DECR</code>) backed by durable writes for the hottest events. <b>Deliberate overbooking</b> is a twist worth naming: airlines and hotels <em>intentionally</em> oversell by a few percent because a predictable fraction no-shows &mdash; so the "inventory" is a business-tuned number above physical capacity, with a bump/compensation policy for the rare over-capacity event. That's a product decision layered on the correctness machinery, not a bug. On failover, the authoritative inventory must be rebuilt from durable state, and in-flight holds either persisted or allowed to expire (bounded recovery, <a href="../systems/s12.html">S12</a> check).</p>
+
+<h2 class="sec">10 &middot; Tradeoffs & alternatives</h2>
+<p>Optimistic (no locks, retries on conflict) suits low contention and scales reads; pessimistic locks suit high single-node contention but serialize and don't cross shards; distributed leases handle cross-node inventory at the cost of a dependency. Longer hold TTLs improve UX but lock up inventory (and enable hold-then-flip scalping); shorter TTLs free inventory but rush users. Strong consistency on the booking path costs latency but is non-negotiable for correctness; the win is confining it to the write while serving search from cheap stale reads. Pooled/fungible inventory (rooms) uses counters; assigned inventory (seat 14C) uses per-unit rows &mdash; different contention shapes.</p>
+
+<h2 class="sec">11 &middot; Real-world example</h2>
+<div class="example">
+<span class="tag">Ticketmaster · Booking.com · OpenTable</span>
+<p>High-demand ticketing (Ticketmaster-style on-sales) uses <b>virtual waiting rooms</b> to throttle the herd, short <b>seat holds</b> with TTLs during checkout, and per-seat atomic state transitions so a seat is sold exactly once &mdash; the assigned-inventory pattern. Hotel/lodging platforms (Booking.com, Expedia) keep a huge, mostly-read availability index served from caches/replicas (stale-tolerant search), and switch to a strongly-consistent reservation write at booking time, often with overbooking allowances tuned to no-show rates. Restaurant reservations (OpenTable) are the same hold&rarr;confirm machinery on table-time slots. Across all of them the spine is identical: cheap stale availability reads, one atomic conditional write per unit, a TTL'd hold, and an idempotent confirm wrapped in a payment saga.</p>
+</div>
+
+<h2 class="sec">12 &middot; Interview follow-ups (Q&amp;A)</h2>
+<p><b>Q: Two users book the last seat at the same instant &mdash; how do you guarantee one wins?</b> Make the booking a single atomic conditional write (version CAS, <code>SELECT FOR UPDATE</code>, or a bounded <code>DECR</code>), never a separate read then write. Exactly one conditional update matches; the other gets 0 rows and is told it's taken.</p>
+<p><b>Q: Optimistic vs pessimistic locking &mdash; which?</b> Optimistic (version CAS) for low/moderate contention &mdash; no locks, just retry on conflict. Pessimistic row locks for sustained high contention on a single DB where you'd rather queue than retry-storm. Distributed leases only when inventory genuinely spans nodes.</p>
+<p><b>Q: Why can search be eventually consistent but booking can't?</b> Search is read-heavy and a stale "available" only costs a failed hold attempt; double-selling a real unit is a correctness violation. So search reads from caches/replicas while the booking write is linearizable on the unit (<a href="../primitives/p3.html">P3</a>).</p>
+<p><b>Q: How do holds expire without leaking inventory or double-confirming?</b> A TTL'd hold plus a confirm whose conditional write requires <code>hold_expires &gt; now</code> and a matching <code>hold_id</code> &mdash; so an expired hold can't be confirmed even before the background sweeper reclaims it (never trust a lease you only assume is valid).</p>
+<p><b>Q: A user's payment retried and they got charged/booked twice &mdash; prevention?</b> Idempotency key on confirm (<a href="../primitives/p9.html">P9</a>): the retry returns the existing booking. The reserve&rarr;charge&rarr;confirm flow is a saga (<a href="../primitives/p14.html">P14</a>) with compensations (release hold / refund) since there's no cheap cross-system transaction.</p>
+<p><b>Q: 1M users for 50k seats &mdash; how do you not melt the DB?</b> A virtual waiting room admits users at a controlled rate (<a href="../primitives/p16.html">P16</a>), inventory is sharded so contention spreads across 50k independent rows, and the hottest on-sales use an in-memory atomic counter/row backed by durable writes.</p>
+<p><b>Q: Is overbooking always a bug?</b> No &mdash; airlines/hotels deliberately oversell by a few percent expecting no-shows; "capacity" is a business-tuned number with a bump/compensation policy. That's a product layer over the same correctness machinery, distinct from an accidental double-book.</p>
+
+<h2 class="sec">13 &middot; Key talking points</h2>
+<ul>
+<li>Core split: <b>availability reads stale-OK; booking write linearizable</b> on the unit (<a href="../primitives/p3.html">P3</a>).</li>
+<li>Overbooking ladder: read-then-write &rarr; <b>optimistic version CAS</b> &rarr; row lock &rarr; distributed lease+fence &rarr; partition the contention (<a href="../primitives/p2.html">P2</a>, <a href="../primitives/p10.html">P10</a>).</li>
+<li>Make the mutation one <b>atomic conditional write</b>; never check-then-act.</li>
+<li><b>Hold &rarr; TTL &rarr; confirm/expire</b> state machine; confirm re-checks expiry (lease ages from grant time).</li>
+<li><b>Idempotent confirm</b> (<a href="../primitives/p9.html">P9</a>) + payment <b>saga</b> (<a href="../primitives/p14.html">P14</a>) so retries don't double-book/charge.</li>
+<li>Flash sales: waiting room (<a href="../primitives/p16.html">P16</a>) + sharded inventory; deliberate overbooking is a tuned business policy, not a bug.</li>
+</ul>
+
+<h2 class="sec">14 &middot; Further reading</h2>
+<ul>
+<li><a href="https://martinfowler.com/eaaCatalog/optimisticOfflineLock.html">Optimistic vs Pessimistic Offline Lock (Fowler)</a></li>
+<li><a href="../primitives/p3.html">P3 replication/consistency</a> &middot; <a href="../primitives/p14.html">P14 saga/compensation</a> &middot; <a href="../systems/s17.html">S17 payments</a></li>
+</ul>
+
+<div class="prevnext"><a href="s20.html">&larr; S20 &middot; Auth</a><a href="s22.html">S22 &middot; Top-K trending &rarr;</a></div>
+</div></main>
+</div>
+<a href="#top" class="backtop" title="Back to top">&uarr;</a>
+<script type="module">
+  import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+  mermaid.initialize({ startOnLoad: true, theme: 'neutral' });
+</script>
+<script>window.SITE_BASE="../";</script>
+<script src="../assets/site.js"></script>
+</body></html>

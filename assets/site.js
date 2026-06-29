@@ -6,19 +6,31 @@
     "Batching / buffering","Partitioning / hot-key","Replication / consistency","Caching",
     "Write- vs read-time","Inverted index","Scatter-gather","Tiered / columnar","Idempotency",
     "Consensus / fencing","CDN / edge","Tail latency","Real-time / routing","Saga / compensation",
-    "Geospatial","Backpressure","Storage internals"
+    "Geospatial","Backpressure","Storage internals","Distributed sort","CRDTs","Distributed tracing"
   ];
   var systems = [
     "Rate limiter","Kafka","Key-value store","RDBMS scaling","Object store","Datadog",
     "Search engine","Distributed SQL","Social feed","Chat","Notification","Task scheduler",
-    "Distributed lock","URL shortener","Ride-sharing","Video streaming","Payment","Web crawler"
+    "Distributed lock","URL shortener","Ride-sharing","Video streaming","Payment","Web crawler",
+    "Search autocomplete","Auth","Booking / reservation","Top-K trending"
   ];
 
   var here = location.pathname.split("/").pop() || "index.html";
 
   // ---- completion status: the ONLY place to mark a page "complete" ----
   // Add a page's filename here once it's reviewed to full depth.
-  var COMPLETE = { "s12.html": 1, "s14.html": 1 };
+  var COMPLETE = {
+    // Primitives — all at full mechanism-deep-dive depth
+    "p1.html": 1, "p2.html": 1, "p3.html": 1, "p4.html": 1, "p5.html": 1, "p6.html": 1,
+    "p7.html": 1, "p8.html": 1, "p9.html": 1, "p10.html": 1, "p11.html": 1, "p12.html": 1,
+    "p13.html": 1, "p14.html": 1, "p15.html": 1, "p16.html": 1, "p17.html": 1,
+    "p18.html": 1, "p19.html": 1, "p20.html": 1,
+    // Systems — all at full interview-answer depth
+    "s1.html": 1, "s2.html": 1, "s3.html": 1, "s4.html": 1, "s5.html": 1, "s6.html": 1,
+    "s7.html": 1, "s8.html": 1, "s9.html": 1, "s10.html": 1, "s11.html": 1, "s12.html": 1,
+    "s13.html": 1, "s14.html": 1, "s15.html": 1, "s16.html": 1, "s17.html": 1, "s18.html": 1,
+    "s19.html": 1, "s20.html": 1, "s21.html": 1, "s22.html": 1
+  };
   function fileOf(href) { return (href || "").split("#")[0].split("/").pop(); }
   function isDone(file) { return !!COMPLETE[file]; }
 
@@ -88,7 +100,7 @@
       lg.innerHTML =
         'Reading guide: <span class="st st-done">Complete</span> pages are reviewed to full depth. ' +
         '<span class="st st-wip">Draft</span> pages are still work in progress. ' +
-        "Currently complete: <b>S12 Task scheduler</b> and <b>S14 URL shortener</b>.";
+        "All 20 primitives and all 22 systems are now complete to full depth.";
       var ih1 = document.querySelector(".reading h1") || document.querySelector("h1");
       if (ih1) insertAfter(lg, ih1);
     }

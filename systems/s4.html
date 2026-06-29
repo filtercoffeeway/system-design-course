@@ -32,7 +32,19 @@ id, and a reader sees the newest version committed before its snapshot.</p>
 <p>The <b>WAL</b> (<a href="../primitives/p17.html">P17</a>) gives crash durability and feeds
 replication. <b>Indexes</b> (B-tree for ranges, hash for equality, GIN/GiST for text/geo)
 speed reads but each one is a structure every write must also update &mdash; so you can&rsquo;t
-index every column; indexes trade write throughput and space for read speed.</p>
+index every column; indexes trade write throughput and space for read speed. A <b>covering
+index</b> (one that includes every column a query needs) lets the engine answer from the
+index alone &mdash; an "index-only scan" that never touches the heap; that's the lever behind
+fast read paths, and why the right composite/covering index can beat adding a replica.</p>
+<h3>Isolation levels &mdash; the correctness dial</h3>
+<p>ACID's "I" is not all-or-nothing; it's a ladder of guarantees, each preventing more anomalies at more cost. Knowing it cold is half of an RDBMS interview:</p>
+<div class="tablewrap"><table>
+<tr><th>Level</th><th>Prevents</th><th>Still allows</th></tr>
+<tr><td>Read Committed</td><td>dirty reads</td><td>non-repeatable + phantom reads</td></tr>
+<tr><td>Repeatable Read / Snapshot</td><td>+ non-repeatable reads</td><td>phantoms (in standard SQL); write skew under SI</td></tr>
+<tr><td>Serializable</td><td>everything (acts as if txns ran one-at-a-time)</td><td>&mdash; (costs locks / abort-and-retry)</td></tr>
+</table></div>
+<p>MVCC makes <b>snapshot isolation</b> cheap (readers don't block writers), but SI permits <b>write skew</b> &mdash; two transactions each read a shared invariant, both see it satisfied, and both write, jointly breaking it (e.g. two doctors each go off-call seeing the other on-call). True <b>serializable</b> (Postgres SSI, or two-phase locking) closes that by detecting dangerous read/write dependencies and aborting one txn to retry. The interview point: pick the lowest level that's still correct for the workload, and know that SI &ne; serializable.</p>
 
 <h2 class="sec">3 &middot; The scaling ladder</h2>
 <h4>Rung 0 — one tuned primary</h4>
@@ -105,16 +117,25 @@ horizontal writes <em>and</em> distributed transactions, a NewSQL store
 (CockroachDB/Spanner, Raft-replicated ranges) buys that at higher latency. If you need
 massive write scale and can drop joins/ACID, a <a href="../systems/s3.html">KV store</a> fits better.</p>
 
-<h2 class="sec">8 &middot; Key talking points</h2>
+<h2 class="sec">8 &middot; Interview follow-ups (Q&amp;A)</h2>
+<p><b>Q: In what order do you scale a relational DB?</b> Tune the single primary (indexes, RAM) &rarr; add read replicas (reads scale, the 10:1 ratio buys a lot) &rarr; connection pooling + cache &rarr; functional partitioning (split tables/domains) &rarr; horizontal sharding (split rows). Climb only as far as the bottleneck forces; each rung adds operational cost.</p>
+<p><b>Q: Why can't I just add indexes for every slow query?</b> Each index is a structure every write must also maintain, so indexes trade write throughput and space for read speed. Prefer a few well-chosen composite/covering indexes (index-only scans) over many single-column ones.</p>
+<p><b>Q: A user reads a replica right after writing and doesn't see their change &mdash; why, and fix?</b> Replica lag (async WAL streaming): the read hit a replica that hadn't applied the write yet. Route read-after-write to the primary, pin the session to a WAL position the replica must reach, or read your own writes from a cache.</p>
+<p><b>Q: How do you pick a shard key?</b> Co-locate what you read together and spread load evenly: shard <code>orders</code> by <code>user_id</code> so a user's orders + profile share a shard (joins stay local), with enough cardinality to avoid a hot/wide partition. A bad key (low cardinality, or different from the access pattern) forces scatter-gather joins.</p>
+<p><b>Q: Why are cross-shard joins so bad, and what do you do?</b> A local index lookup becomes a fan-out to every shard + a network merge, bounded by the slowest shard (<a href="../primitives/p7.html">P7</a> tail). Denormalize so related rows share a shard, choose the shard key around your joins, and accept scatter-gather for the rare query that still spans shards.</p>
+<p><b>Q: Snapshot isolation vs serializable &mdash; does it matter?</b> Yes: SI (cheap via MVCC) still allows write skew, where two txns each read an invariant and both write, jointly breaking it. Use serializable (SSI / 2PL) when an invariant spans rows that concurrent txns both touch; otherwise SI is the efficient default.</p>
+<p><b>Q: Why avoid 2PC across shards?</b> It holds locks across nodes for the duration of a multi-shard commit, so one slow/failed participant blocks the others &mdash; throughput and availability suffer. Keep each transaction inside one shard (via the shard key), or use a saga (<a href="../primitives/p14.html">P14</a>) for cross-shard workflows.</p>
+
+<h2 class="sec">9 &middot; Key talking points</h2>
 <ul>
 <li>Climb the ladder: tune &rarr; replicas &rarr; cache/pool &rarr; partition &rarr; shard.</li>
 <li>Shard key co-locates data; cross-shard joins are the wall (<a href="../primitives/p2.html">P2</a>, <a href="../primitives/p7.html">P7</a>).</li>
 <li>Replica lag &rarr; read-after-write care (<a href="../primitives/p3.html">P3</a>).</li>
 <li>MVCC for concurrency; connection pooling as a finite resource.</li>
-<li>Avoid 2PC; denormalize instead.</li>
+<li>Avoid 2PC; denormalize instead. Know the isolation ladder (SI &ne; serializable; write skew).</li>
 </ul>
 
-<h2 class="sec">9 &middot; Further reading</h2>
+<h2 class="sec">10 &middot; Further reading</h2>
 <ul>
 <li><a href="https://vitess.io/docs/">Vitess documentation</a></li>
 <li>Kleppmann, <i>DDIA</i> ch. 6 (partitioning), ch. 7 (transactions)</li>

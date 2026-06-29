@@ -8,82 +8,140 @@
 <nav class="side" id="side"></nav>
 <main><div class="reading" id="top">
 <div class="crumb"><a href="../index.html">Curriculum</a> / Part III · Systems / Cluster E — Domain-specific</div><h1>16 · Video Streaming (YouTube / Netflix)</h1>
-<div class="summary"><div class="hard"><b>Hard constraint:</b> you never stream origin→user at scale; every byte must be cached at the edge — the question is always "what populates the CDN?"</div><div class="prims"><b>Primitives exercised:</b> <a href="../primitives/p11.html">P11</a>, <a href="../primitives/p8.html">P8</a>, <a href="../primitives/p1.html">P1</a> (chunked upload + async transcode).</div><p>Encoding pipeline (one upload → N renditions via async workers); adaptive bitrate (HLS/DASH, player switches on static segments); CDN as the entire read path; resumable chunked upload; manifest files.</p></div>
+<div class="summary"><div class="hard"><b>Hard constraint:</b> you never stream origin&rarr;user at scale (~250 Tbps at peak) — every byte must come from a CDN edge near the user. The real question is always "what populates the edge, and when?"</div><div class="prims"><b>Primitives exercised:</b> <a href="../primitives/p11.html">P11</a> (CDN/edge), <a href="../systems/s5.html">S5</a> (object store), <a href="../primitives/p1.html">P1</a> (chunked upload + async transcode), <a href="../primitives/p18.html">P18</a> (parallel transcode/stitch), <a href="../primitives/p12.html">P12</a> (startup latency).</div><p>Encoding pipeline (one upload &rarr; N renditions via async, chunk-parallel workers); adaptive bitrate (HLS/DASH, the player switches on static segments); the CDN as the entire read path; resumable chunked upload; manifest files.</p></div>
 
 <hr>
 
-<h2 class="sec">1 &middot; Requirements &amp; scale</h2>
-<p><b>Functional:</b> upload, transcode, store, and stream video to huge concurrent
-audiences across varying devices and bandwidths. <b>Non-functional:</b> smooth playback
-(adaptive quality), low startup latency, and origin bandwidth that doesn&rsquo;t melt.</p>
-<div class="estimate">Back-of-envelope
-peak: tens of millions of concurrent streams x several Mbps = many Tbps
-one upload -> N renditions (240p..4K) x codecs = large transcode fan-out
-=> you cannot serve this from origin; the CDN is the system
+<h2 class="sec">1 &middot; Requirements</h2>
+<p><b>Functional:</b> upload a source video; transcode it to many qualities/devices; store and stream it to huge concurrent audiences with smooth, adaptive playback; support seeking and resume. <b>Non-functional:</b></p>
+<div class="tablewrap"><table>
+<tr><th>Property</th><th>Target</th><th>Consequence</th></tr>
+<tr><td>Egress</td><td>tens of Tbps at peak</td><td>cannot serve from origin &mdash; CDN <em>is</em> the system (<a href="../primitives/p11.html">P11</a>)</td></tr>
+<tr><td>Startup latency</td><td>video starts in &lt; ~1&ndash;2 s</td><td>tiny first segment + low-bitrate start (&sect;8)</td></tr>
+<tr><td>Smoothness</td><td>no rebuffering as bandwidth varies</td><td>adaptive bitrate in the player (&sect;6)</td></tr>
+<tr><td>Device reach</td><td>240p phone &rarr; 4K TV, many codecs</td><td>one upload &rarr; many renditions (&sect;5)</td></tr>
+<tr><td>Upload reliability</td><td>GB-scale uploads resume after drops</td><td>chunked, indexed upload (&sect;4)</td></tr>
+</table></div>
+<p>The defining split: <b>encoding is a batch problem; serving is a CDN problem.</b> They share almost nothing &mdash; one is write-once compute fan-out, the other is read-mostly bandwidth at planetary scale. Designing the system is designing those two pipelines and the object store between them.</p>
+
+<h2 class="sec">2 &middot; Capacity estimation</h2>
+<div class="estimate">SERVING (the wall):
+  50,000,000 concurrent streams x ~5 Mbps avg = 250,000,000 Mbps = ~250 Tbps peak egress
+  no origin and no commercial backbone serves 250 Tbps -> push it ALL to the edge
+  CDN 95% hit  -> origin sees ~5% = ~12.5 Tbps   (still huge -> tiered + pre-position)
+
+STORAGE per 2-hour title (all renditions):
+  240p 0.3 / 360p 0.7 / 480p 1.5 / 720p 3 / 1080p 6 / 4K 16  Mbps
+  sum over a 2 h (7200 s) movie ~ 25 GB per title (one codec family)
+  x multiple codecs (H.264 / HEVC / AV1) x audio tracks x subtitles -> 50-100+ GB/title
+
+SEGMENTS:
+  4 s segments -> 7200/4 = 1800 segments per rendition; thousands of small files per title
+</div>
+<p>250 Tbps is the number that dictates everything: there is no "serve from the database" rung here. The only viable design caches every byte at the edge, so the entire read path is "fill the CDN intelligently."</p>
+
+<h2 class="sec">3 &middot; API design</h2>
+<div class="estimate">// upload (resumable)
+initUpload(meta) -> upload_id, chunk_size
+putChunk(upload_id, index, bytes) -> ack(index)
+completeUpload(upload_id) -> video_id   (triggers transcode pipeline)
+
+// playback
+getManifest(video_id, device) -> manifest (HLS .m3u8 / DASH .mpd: rendition + segment list)
+GET  https://edge.cdn/.../v123/1080p/seg_0042.ts   (static segment, served by edge)
 </div>
 
-<h2 class="sec">2 &middot; High-level architecture</h2>
+<h2 class="sec">4 &middot; The upload & transcode pipeline (write path)</h2>
+<h3>Resumable chunked upload (P1)</h3>
+<p>A multi-GB upload over a flaky connection can't be one PUT. Split into fixed chunks (e.g. 5&ndash;10&nbsp;MB) uploaded by <b>index</b>; the server acks each, and a dropped connection resumes from the first un-acked index rather than restarting. Chunks land in a staging area of the <a href="../systems/s5.html">object store (S5)</a>; <code>completeUpload</code> assembles them and enqueues the transcode job.</p>
+<h3>Transcoding &mdash; one upload &rarr; N renditions</h3>
+<p>The source is transcoded into a matrix of <b>renditions</b> (resolution &times; bitrate &times; codec) so any device/bandwidth has a fit. This is embarrassingly parallel batch compute. The key trick is to not transcode a 2-hour file serially:</p>
+<ul>
+<li><b>Chunk-parallel transcode</b> (<a href="../primitives/p18.html">P18</a> map/shuffle shape): split the source at GOP/keyframe boundaries into independent chunks, transcode each chunk on a different worker in parallel, then stitch the outputs back in order. A 2-hour encode that would take hours serially finishes in minutes across a fleet. Splitting on keyframe boundaries is essential so each chunk decodes independently.</li>
+<li><b>Per-title / per-scene encoding:</b> instead of one fixed bitrate ladder for all content, analyze the title's complexity and assign bitrates per title (a cartoon needs far fewer bits than an action scene for the same quality). Netflix's per-title and per-shot encoding saves large amounts of bandwidth at equal quality.</li>
+</ul>
+<p>Each rendition is then <b>segmented</b> into short (2&ndash;10&nbsp;s) files plus a manifest, and written to the object store. The packaging step also produces multiple container/codec variants (fMP4/CMAF for DASH, TS/CMAF for HLS) so one set of media serves both protocols.</p>
+<div class="newprob"><b>New bottleneck &mdash; transcode cost & storage explosion.</b> Every extra rendition/codec multiplies both compute and storage (50&ndash;100+ GB/title). The relief: encode the <em>full</em> matrix only for popular titles; for the long tail, encode a smaller ladder and add renditions on demand the first time they're requested. AV1 saves ~30% bandwidth over H.264 but costs far more to encode &mdash; a classic compute-now vs bandwidth-later tradeoff, worth it only for high-view titles.</div>
+
+<h2 class="sec">5 &middot; High-level architecture</h2>
 <pre class="mermaid">
 graph LR
-  UP[upload] --> CH[chunked store]
-  CH --> TR[transcode workers: N renditions]
-  TR --> OBJ[(object store: segments + manifests)]
-  OBJ --> CDN[CDN edge]
+  UP[client upload] -->|chunks| ST[staging object store]
+  ST --> ASM[assemble] --> TRQ[(transcode queue)]
+  TRQ --> TW[transcode workers: chunk-parallel]
+  TW --> PKG[segment + package + manifest]
+  PKG --> OBJ[(object store: segments + manifests, S5)]
+  OBJ -->|fill on miss / pre-position| CDN[CDN edge appliances]
   CDN --> PLY[player: adaptive bitrate]
 </pre>
 
-<h2 class="sec">3 &middot; The hard constraint, in depth</h2>
-<div class="hard"><p>You <b>never stream origin&rarr;user at scale</b>. Every video byte
-must be served from a CDN edge near the user; the origin only fills the edge. So the real
-design question is always <em>"what populates the CDN, and when?"</em> &mdash; not "how do
-I serve the video?" (<a href="../primitives/p11.html">P11</a>).</p></div>
-
-<h2 class="sec">4 &middot; Component deep dives</h2>
-<h3>Encoding pipeline</h3>
-<p>One upload becomes many <b>renditions</b> (resolutions/bitrates/codecs) produced by
-async transcode workers &mdash; an embarrassingly parallel batch job. Each rendition is cut
-into short <b>segments</b> (2&ndash;10s).</p>
-<h3>Adaptive bitrate (ABR)</h3>
-<p><b>HLS/DASH</b>: the server publishes a <b>manifest</b> listing segment URLs per
-rendition; the <em>player</em> measures bandwidth and switches quality segment-by-segment.
-The server just serves static files &mdash; intelligence lives in the client.</p>
-<h3>CDN &amp; fill (P11)</h3>
-<p>Segments live in an <a href="../systems/s5.html">object store</a> and are cached at the edge; popular
-titles are pre-positioned (<a href="../primitives/p11.html">P11</a>). Origin sees only misses.</p>
-<h3>Resumable upload</h3>
-<p>Large files upload in chunks by index so a dropped connection resumes mid-file.</p>
-
-<h2 class="sec">5 &middot; Real-world example</h2>
-<div class="example">
-<span class="tag">Netflix</span>
-<p>Netflix transcodes each title into a large matrix of renditions (per resolution,
-bitrate, codec, and even per-title/per-scene optimized encodes) ahead of time, cuts them
-into segments, and serves everything via its own CDN, <b>Open Connect</b>
-(<a href="../primitives/p11.html">P11</a>), whose appliances sit inside ISPs. During off-peak it
-<b>pre-positions</b> predicted-popular content onto those boxes, so at peak the user
-streams from an edge appliance on their own ISP and Netflix&rsquo;s origin serves almost
-nothing. The player runs adaptive bitrate over the segment manifest. Encoding is a batch
-problem; serving is a CDN problem.</p>
+<h2 class="sec">6 &middot; The read path: adaptive bitrate (HLS/DASH)</h2>
+<p>The genius of streaming at scale is that <b>the server serves dumb static files; all intelligence is in the player.</b> The server publishes a <b>manifest</b> (HLS <code>.m3u8</code> / DASH <code>.mpd</code>) listing, per rendition, the URL of each segment. The player:</p>
+<ol>
+<li>Fetches the manifest, picks a starting rendition (usually low, for fast start).</li>
+<li>Downloads segments into a buffer, <b>measuring throughput</b> on each.</li>
+<li>If measured bandwidth &gt; the next-higher rendition's bitrate (with headroom) and the buffer is healthy, it requests the <em>next</em> segment at higher quality; if bandwidth drops or the buffer drains, it steps down.</li>
+</ol>
+<p>Because segments are aligned across renditions (same start times, keyframe-aligned), the player can switch quality at any segment boundary seamlessly. The server never decides quality &mdash; it just serves whichever segment URL the player asks for, which is why it scales: it's pure static-file delivery over HTTP, ideal for caching.</p>
+<div class="estimate">ABR control loop (per segment):
+  est_bw = segment_bytes / download_time   (EWMA-smoothed)
+  if buffer > target and est_bw > bitrate(next_up)*1.2: level up
+  if buffer < min   or est_bw < bitrate(current):       level down
+  -> the SAME 4s wall-clock segment exists at every bitrate; switch at boundaries
 </div>
 
-<h2 class="sec">6 &middot; Tradeoffs &amp; alternatives</h2>
-<p>More renditions = better quality/efficiency per device but more transcode cost and
-storage. Pre-positioning wastes storage on titles that flop but guarantees peak
-performance; on-demand fill is cheaper but risks origin load. Own-CDN (Netflix) vs
-commercial CDN (most others) trades capex/control for simplicity.</p>
+<h2 class="sec">7 &middot; The CDN: what fills the edge (ladder)</h2>
+<div class="hard"><p>At 250 Tbps, origin&rarr;user is impossible. Every byte is served from a CDN edge near the user; origin only fills the edge. The whole design question is <em>"what populates the CDN, and when?"</em> (<a href="../primitives/p11.html">P11</a>).</p></div>
+<h3>Rung 1 &mdash; on-demand (pull) fill</h3>
+<p>Edge caches a segment on first request (a miss fetches from origin, then serves all later viewers locally). Simple, storage-efficient. <b>Breaks on:</b> a brand-new blockbuster release &mdash; the <em>first</em> viewers in every region all miss simultaneously, hammering origin (a thundering herd of misses), and the cold-start viewers see poor startup. Also a viral spike can saturate origin before the edge warms.</p>
+<h3>Rung 2 &mdash; pre-position (push) popular content</h3>
+<p>Predict tomorrow's popular titles and <b>copy their segments to edge appliances during off-peak hours</b> (overnight, when the network is idle). At peak, those titles are already at the edge &rarr; ~100% hit, origin serves almost nothing. <b>Breaks on:</b> wasted storage for titles that flop, and you can't pre-position everything (the long tail). So combine: pre-position the predicted-popular head, pull-fill the tail.</p>
+<h3>Rung 3 &mdash; tiered CDN + ISP-embedded edges</h3>
+<p>Put edge appliances <em>inside ISP networks</em> (Netflix Open Connect) so the bytes never even traverse the public internet backbone &mdash; the user streams from a box on their own ISP. Add a mid-tier cache between edge and origin to absorb misses, so origin sees only the misses-of-misses. This is how ~12.5 Tbps of origin load (the 5% miss rate) is further cut by orders of magnitude.</p>
+<div class="tablewrap"><table>
+<tr><th>Rung</th><th>Good until</th><th>Breaks on</th></tr>
+<tr><td>On-demand pull fill</td><td>steady catalog traffic</td><td>new-release/viral miss storm at origin</td></tr>
+<tr><td>+ pre-position popular</td><td>predictable hits</td><td>flops waste storage; can't cover the tail</td></tr>
+<tr><td>+ tiered / ISP-embedded</td><td>planet scale</td><td>&mdash; (the destination: origin ~ idle at peak)</td></tr>
+</table></div>
 
-<h2 class="sec">7 &middot; Key talking points</h2>
+<h2 class="sec">8 &middot; Startup latency & seeking</h2>
+<p>Time-to-first-frame is a conversion metric, so the player starts at a <b>low bitrate</b> (small first segment downloads fast) and ramps up once the buffer is healthy &mdash; better to start instantly at 480p and climb than to stall at 4K. Some systems ship a tiny dedicated first segment. <b>Seeking</b> works because segments are independently decodable (each starts on a keyframe): jumping to 1:23:00 just requests the segment covering that time, no need to decode from the start. Rebuffering is the enemy metric; the ABR algorithm trades quality for buffer health to avoid it.</p>
+
+<h2 class="sec">9 &middot; Scaling, live, & DRM</h2>
+<p><b>Live streaming</b> changes the math: you can't pre-encode, so the pipeline must transcode and package in near-real-time with a small latency budget; low-latency HLS/DASH shrink segment size (or use chunked-transfer) to cut glass-to-glass delay. <b>DRM</b> (Widevine/FairPlay/PlayReady) encrypts segments; the player fetches a license/key separately &mdash; this is orthogonal to delivery (encrypted segments still cache fine at the edge). <b>Thumbnails/scrubbing</b> use a sprite sheet of low-res frames. At 10&times; scale the levers are: more edge capacity, better popularity prediction for pre-positioning, and more aggressive per-title encoding to shave bitrate.</p>
+
+<h2 class="sec">10 &middot; Tradeoffs & alternatives</h2>
+<p>More renditions/codecs = better quality and bandwidth efficiency per device but more transcode cost and storage. Pre-positioning wastes storage on flops but guarantees peak performance; on-demand fill is cheaper but risks origin load &mdash; so the real systems do both. <b>Own CDN</b> (Netflix Open Connect: capex, control, ISP embedding) vs <b>commercial CDN</b> (Akamai/Cloudfront: simplicity, pay-as-you-go) is the classic build-vs-buy at the scale where bandwidth is your dominant cost. AV1/HEVC vs H.264 trades encode compute for delivery bandwidth.</p>
+
+<h2 class="sec">11 &middot; Real-world example</h2>
+<div class="example">
+<span class="tag">Netflix</span>
+<p>Netflix transcodes each title into a large matrix of renditions ahead of time, using <b>per-title and per-shot encoding</b> to assign bitrates by content complexity (saving significant bandwidth at equal quality), cuts them into segments, and serves everything through its own CDN, <b>Open Connect</b> (<a href="../primitives/p11.html">P11</a>), whose appliances sit <em>inside ISP</em> networks. During off-peak it <b>pre-positions</b> predicted-popular content onto those boxes, so at peak a user streams from an edge appliance on their own ISP and Netflix's origin serves almost nothing. The player runs adaptive bitrate over the segment manifest. Encoding is a batch problem; serving is a CDN problem &mdash; the two halves of this system.</p>
+</div>
+
+<h2 class="sec">12 &middot; Interview follow-ups (Q&amp;A)</h2>
+<p><b>Q: Why is all the adaptive-quality logic in the player, not the server?</b> So the server serves only static, cacheable files. If the server picked quality it would need per-viewer state and dynamic responses &mdash; uncacheable, and impossible at 250 Tbps. Dumb static segments + a manifest let the CDN do all the heavy lifting.</p>
+<p><b>Q: How do you transcode a 2-hour 4K source fast?</b> Split it at keyframe boundaries into independent chunks, transcode them in parallel across a worker fleet, then stitch in order (<a href="../primitives/p18.html">P18</a> map/merge shape). Keyframe alignment is what makes the chunks independently decodable.</p>
+<p><b>Q: A new title launches globally at midnight &mdash; how do you avoid an origin meltdown?</b> Pre-position its segments to the edge during the preceding off-peak window so peak demand is ~100% edge hits. For unexpected virality, a tiered cache absorbs the miss storm and request coalescing (single-flight) collapses concurrent misses for the same segment into one origin fetch (<a href="../primitives/p4.html">P4</a>).</p>
+<p><b>Q: How does seeking to the middle work without downloading the whole video?</b> Segments are independently decodable (each begins on a keyframe), so the player just requests the segment covering the target timestamp. The manifest maps time ranges to segment URLs.</p>
+<p><b>Q: How do you keep startup fast?</b> Start at a low bitrate (tiny first segment), play immediately, and ramp quality once the buffer fills &mdash; instant 480p beats a stall at 4K. The metric to protect is rebuffering, not peak resolution.</p>
+<p><b>Q: Where do encryption/DRM and live streaming fit?</b> DRM encrypts segments and delivers keys via a separate license server &mdash; orthogonal to delivery, since encrypted segments still cache at the edge. Live can't pre-encode, so it transcodes/packages in near-real-time with small/low-latency segments; everything else (ABR, CDN) is the same.</p>
+
+<h2 class="sec">13 &middot; Key talking points</h2>
 <ul>
-<li>The CDN is the system; origin only fills it (<a href="../primitives/p11.html">P11</a>).</li>
-<li>One upload &rarr; many renditions via async transcode.</li>
-<li>ABR (HLS/DASH): static segments + manifest, smarts in the player.</li>
-<li>Pre-position popular content; segments in object store (<a href="../systems/s5.html">S5</a>, <a href="../primitives/p8.html">P8</a>).</li>
-<li>Chunked resumable upload.</li>
+<li>The CDN <b>is</b> the system; origin only fills it (<a href="../primitives/p11.html">P11</a>). 250 Tbps peak makes origin serving impossible.</li>
+<li>Two pipelines: <b>encoding = batch</b> (one upload &rarr; N renditions, chunk-parallel transcode, per-title bitrates) and <b>serving = CDN</b>.</li>
+<li><b>ABR (HLS/DASH)</b>: static keyframe-aligned segments + a manifest; the player measures bandwidth and switches quality per segment.</li>
+<li>Fill ladder: on-demand pull &rarr; pre-position popular off-peak &rarr; tiered + ISP-embedded edges (origin idle at peak).</li>
+<li>Startup latency: low-bitrate fast start + ramp; seeking works because segments are independently decodable.</li>
+<li>Renditions/codecs trade transcode+storage cost for quality and delivery bandwidth (AV1/HEVC vs H.264).</li>
 </ul>
 
-<h2 class="sec">8 &middot; Further reading</h2>
+<h2 class="sec">14 &middot; Further reading</h2>
 <ul>
-<li><a href="https://openconnect.netflix.com/en/">Netflix Open Connect</a> &middot; <a href="https://netflixtechblog.com/">Netflix Tech Blog (per-title encoding)</a></li>
+<li><a href="https://openconnect.netflix.com/en/">Netflix Open Connect</a> &middot; <a href="https://netflixtechblog.com/per-title-encode-optimization-7e99442b62a2">Netflix Tech Blog — per-title encoding</a></li>
+<li><a href="https://netflixtechblog.com/optimized-shot-based-encodes-now-streaming-4b9464204830">Per-shot encoding</a> &middot; HLS / MPEG-DASH specifications</li>
 </ul>
 
 <div class="prevnext"><a href="s15.html">&larr; S15 &middot; Ride-sharing</a><a href="s17.html">S17 &middot; Payment &rarr;</a></div>

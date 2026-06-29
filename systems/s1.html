@@ -8,113 +8,129 @@
 <nav class="side" id="side"></nav>
 <main><div class="reading" id="top">
 <div class="crumb"><a href="../index.html">Curriculum</a> / Part III · Systems / Cluster A — Foundations</div><h1>1 · Rate Limiter</h1>
-<div class="summary"><div class="hard"><b>Hard constraint:</b> must add near-zero latency to the hot path. If checking the limit costs more than the request, you solved the wrong problem.</div><div class="prims"><b>Primitives exercised:</b> <a href="../primitives/p16.html">P16</a> backpressure, <a href="../primitives/p3.html">P3</a> consistency (counters), <a href="../primitives/p4.html">P4</a> caching (Redis).</div><p>Token bucket vs sliding vs fixed window (and their failure modes); distributed counter coordination (local accuracy vs global latency); Redis as fast-but-not-perfectly-consistent state; fail-open vs fail-closed when the store is down.</p></div>
+<div class="summary"><div class="hard"><b>Hard constraint:</b> the check sits on the hot path of <em>every</em> request, so it must add near-zero latency. If checking the limit costs more than the request it protects, you solved the wrong problem — that rules out anything chatty or strongly-coordinated per call.</div><div class="prims"><b>Primitives exercised:</b> <a href="../primitives/p16.html">P16</a> (backpressure), <a href="../primitives/p3.html">P3</a> (counter consistency), <a href="../primitives/p4.html">P4</a> (Redis state), <a href="../primitives/p2.html">P2</a> (sharded counters).</div><p>Fixed window / sliding log / sliding-window counter / token bucket / GCRA (and their failure modes); distributed counter coordination (local accuracy vs global latency); Redis as fast-but-not-perfectly-consistent state; fail-open vs fail-closed when the store is down; multi-dimensional limiting.</p></div>
 
 <hr>
 
-<h2 class="sec">1 &middot; Requirements &amp; scale</h2>
-<p><b>Functional:</b> allow N requests per window per identity (user, IP, API key);
-reject or queue the rest; ideally tell the client when to retry. <b>Non-functional:</b>
-the check must be near-instant and add negligible latency, work across many app
-servers, and fail sensibly when its own store is down.</p>
-<div class="estimate">Back-of-envelope
-1,000,000 req/s across 1,000 app servers   = 1,000 req/s/server
-limit check budget                          &lt; ~1 ms (must be cheaper than the request)
-state per identity                          ~ a counter + timestamp (tens of bytes)
-10,000,000 active identities x ~50 B        ~ 500 MB -> fits in Redis memory
+<h2 class="sec">1 &middot; Requirements</h2>
+<p><b>Functional:</b> allow N requests per window per identity (user, IP, API key, endpoint), reject or queue the rest, and tell the client when to retry (<code>429</code> + <code>Retry-After</code>). Support multiple, simultaneous limit dimensions and tiers. <b>Non-functional:</b></p>
+<div class="tablewrap"><table>
+<tr><th>Property</th><th>Target</th><th>Consequence</th></tr>
+<tr><td>Latency</td><td>check &lt; ~1 ms (cheaper than the request)</td><td>one O(1) atomic op against memory (&sect;4&ndash;5)</td></tr>
+<tr><td>Distribution</td><td>one limit across 1000s of app servers</td><td>shared counter or coordinated local (&sect;5)</td></tr>
+<tr><td>Accuracy</td><td>enforce the rate without big over/under-admit</td><td>algorithm choice (&sect;4); accuracy/latency dial</td></tr>
+<tr><td>Resilience</td><td>sane behavior if the limiter's store is down</td><td>fail-open vs fail-closed (&sect;6)</td></tr>
+<tr><td>Memory</td><td>state per identity stays tiny</td><td>O(1)-per-identity algorithms</td></tr>
+</table></div>
+<p>The defining tension: a rate limiter is pure overhead on the happy path, yet it must enforce a <em>global</em> limit across a fleet &mdash; and global state is exactly what's slow. The whole design is reconciling "near-zero latency" with "one shared count."</p>
+
+<h2 class="sec">2 &middot; Capacity estimation</h2>
+<div class="estimate">1,000,000 req/s across 1,000 app servers  = 1,000 req/s/server
+limit-check budget                         < ~1 ms (must be cheaper than the work it guards)
+state per identity                         ~ a counter + timestamp (tens of bytes)
+10,000,000 active identities x ~50 B       ~ 500 MB  -> fits in Redis memory on one node
+  (shard by identity across Redis nodes if hotter; see P2)
 </div>
 
-<h2 class="sec">2 &middot; High-level architecture</h2>
-<pre class="mermaid">
-graph LR
-  C[client] --> MW[rate-limit middleware]
-  MW -->|atomic incr+expire| R[(Redis)]
-  MW -->|allow| APP[service]
-  MW -->|deny 429 + Retry-After| C
-</pre>
-<p>Every app server runs the same check against a shared fast store (Redis) using an
-atomic operation so concurrent requests don&rsquo;t race. Denied requests get
-<code>429</code> with <code>Retry-After</code>.</p>
+<h2 class="sec">3 &middot; API design</h2>
+<div class="estimate">allow(key, limit, window) -> { allowed: bool, remaining: int, retry_after: sec }
+  key = "user:123" | "ip:1.2.3.4" | "apikey:abc:endpoint:/charge"
+on deny: HTTP 429 + headers
+  Retry-After: 3
+  X-RateLimit-Limit / X-RateLimit-Remaining / X-RateLimit-Reset
+</div>
+<p>Returning <code>remaining</code> and <code>reset</code> lets well-behaved clients self-throttle <em>before</em> hitting the wall &mdash; cheaper for everyone than reactive 429s.</p>
 
-<h2 class="sec">3 &middot; The hard constraint, in depth</h2>
-<div class="hard"><p>The limiter sits on the hot path of <em>every</em> request, so the
-check must cost less than the work it protects. That rules out anything chatty or
-strongly-coordinated per request; you want one O(1) atomic op against memory, and you
-must decide what happens if Redis is unreachable &mdash; <b>fail-open</b> (allow,
-protect availability) or <b>fail-closed</b> (deny, protect the backend).</p></div>
-
-<h2 class="sec">4 &middot; The algorithm ladder</h2>
-<h4>Rung 0 — fixed window</h4>
-<p>One counter per clock window: <code>INCR limit:user:12:00</code>, reject past N, reset
-each minute. Dead simple &mdash; but it allows a <b>2&times; burst</b> across the boundary:</p>
+<h2 class="sec">4 &middot; The algorithm ladder (full family)</h2>
+<h4>Rung 0 &mdash; fixed window</h4>
+<p>One counter per clock window: <code>INCR limit:user:12:00</code>, reject past N, key expires each minute. Dead simple, O(1) memory. <b>Breaks on the boundary burst</b> &mdash; it allows 2&times; the rate across a window edge:</p>
 <div class="estimate">limit 100/min:
   12:00:59 -> 100 requests (fills the 12:00 window)
   12:01:00 -> 100 requests (fresh 12:01 window)
-  => 200 requests in ~1 second, twice the intended rate</div>
-<div class="newprob"><b>Bottleneck:</b> edge bursts double the real rate.</div>
-<h4>Rung 1 — sliding window log</h4>
-<p>Store the timestamp of every request; count those within the last 60&nbsp;s. <b>Exact</b>
-&mdash; no edge burst &mdash; but it stores one entry per request, so a heavy client costs a
-lot of memory.</p>
-<div class="newprob"><b>Bottleneck:</b> memory grows with request volume.</div>
-<h4>Rung 2 — sliding window counter</h4>
-<p>Approximate the sliding window by weighting the current and previous fixed windows by
-overlap &mdash; O(1) memory, no hard edge burst. The usual sweet spot for a pure rate cap.</p>
-<h4>Rung 3 — token bucket ← the default</h4>
-<p>Store <code>(tokens, last_refill)</code>; each request refills <code>tokens += rate &times;
-elapsed</code> (capped at <code>b</code>) and spends one. It bounds the long-run rate
-<em>and</em> permits a controlled burst up to <code>b</code> &mdash; good UX:</p>
+  => 200 requests in ~1 second, twice the intended rate
+</div>
+<h4>Rung 1 &mdash; sliding window log</h4>
+<p>Store the timestamp of <em>every</em> request (a sorted set); count those within the last 60&nbsp;s, evicting older. <b>Exact</b>, no edge burst. <b>Breaks on memory:</b> it stores one entry per request, so a client doing 1,000 req/min costs 1,000 timestamps &mdash; expensive, and the eviction work grows with volume.</p>
+<h4>Rung 2 &mdash; sliding window counter (the approximation sweet spot)</h4>
+<p>Keep just two fixed-window counters (current + previous) and weight the previous one by how much of it still falls inside the rolling window. O(1) memory, no hard edge burst:</p>
+<div class="estimate">limit 100/min; at 12:01:15 (15 s into current window):
+  prev (12:00) count = 80,  current (12:01) count = 30
+  weight_prev = (60 - 15)/60 = 0.75
+  estimate = 30 + 80*0.75 = 90  < 100  -> ALLOW
+  (smoothly decays the previous window instead of dropping it at the boundary)
+</div>
+<p>The cost is a small approximation (it assumes the previous window's requests were uniform), which is fine for almost all rate-cap use cases &mdash; the usual default for a pure cap.</p>
+<h4>Rung 3 &mdash; token bucket (default when bursts should be allowed)</h4>
+<p>Store <code>(tokens, last_refill)</code>; each request refills <code>tokens = min(b, tokens + rate &times; elapsed)</code> and spends one. Bounds the long-run rate <em>and</em> permits a controlled burst up to bucket size <code>b</code> &mdash; the best UX for APIs (a client idle for a while can spike briefly):</p>
 <div class="estimate">bucket b=10, refill r=1/s:
-  t=0  tokens=10 -> 10 requests burst -> tokens=0   (burst allowed, up to b)
-  t=0..5  no requests -> tokens refill to 5
-  t=5  request -> tokens=4    long-run rate bounded to r, bursts to b</div>
-<p>(Leaky bucket is the queueing variant &mdash; drains at a fixed rate, smoothing output at
-the cost of added delay.)</p>
+  t=0   tokens=10 -> 10-request burst -> tokens=0      (burst up to b allowed)
+  t=0..5 idle -> tokens refill to 5
+  t=5   request -> tokens=4   long-run rate bounded to r, bursts to b
+</div>
+<p><b>Leaky bucket</b> is the queueing dual: requests enter a fixed-size queue that drains at rate r, <em>smoothing</em> bursty input into a steady output at the cost of added delay (and drops when the queue is full). Use token bucket to <em>allow</em> bursts, leaky bucket to <em>absorb and smooth</em> them.</p>
+<h4>Rung 4 &mdash; GCRA (generic cell rate algorithm)</h4>
+<p>The token bucket's elegant equivalent that stores a <em>single</em> number: a "theoretical arrival time" (TAT). Each request checks whether now is past TAT minus the allowed burst tolerance, and advances TAT by the inter-request interval. Same behavior as token bucket (rate + burst) with one timestamp and no separate refill step &mdash; popular in libraries (e.g. Redis rate-limit modules) precisely because it's O(1) state and exact.</p>
+<div class="tablewrap"><table>
+<tr><th>Algorithm</th><th>Memory</th><th>Burst behavior</th><th>Use when</th></tr>
+<tr><td>Fixed window</td><td>1 counter</td><td>2&times; edge burst (bad)</td><td>never for strict caps</td></tr>
+<tr><td>Sliding log</td><td>1 per request</td><td>exact</td><td>low volume, exactness required</td></tr>
+<tr><td>Sliding counter</td><td>2 counters</td><td>approx, smooth</td><td>default pure cap</td></tr>
+<tr><td>Token bucket</td><td>2 values</td><td>controlled burst to b</td><td>API limits w/ burst UX</td></tr>
+<tr><td>GCRA</td><td>1 value</td><td>= token bucket</td><td>same, minimal state</td></tr>
+</table></div>
 
 <h2 class="sec">5 &middot; Making it distributed &mdash; the counter ladder</h2>
-<p>1M req/s spread over 1,000 servers means the counter is shared state. Another ladder:</p>
+<p>1M req/s over 1,000 servers means the count is shared state. Another ladder, trading accuracy against hot-path latency:</p>
 <div class="tablewrap"><table>
 <tr><th>Rung</th><th>Mechanism</th><th>Breaks on</th></tr>
-<tr><td>Per-node local counters</td><td>each server limits its own slice</td><td>loose global limit (N&times; servers can each allow the full quota)</td></tr>
-<tr><td>Global counter in Redis</td><td>one atomic <code>INCR</code>+expire (or a Lua script for token-bucket) per request</td><td>a round trip on the hot path; Redis is now a dependency</td></tr>
-<tr><td>Redis + local pre-check (← typical)</td><td>cheap local guard, periodic sync to Redis</td><td>slight over-admit, acceptable</td></tr>
+<tr><td>Per-node local counters</td><td>each server limits its own slice (limit/N each)</td><td>loose global limit; uneven load means some nodes reject while others have headroom</td></tr>
+<tr><td>Global counter in Redis</td><td>one atomic <code>INCR</code>+expire, or a Lua script for token-bucket/GCRA, per request</td><td>a round trip on the hot path; Redis is now a dependency &amp; a hotspot</td></tr>
+<tr><td>Redis + local pre-check (typical)</td><td>cheap local guard admits up to a local lease, syncs to Redis periodically</td><td>slight over-admit (bounded by the lease) &mdash; acceptable</td></tr>
 </table></div>
-<p>The atomicity matters: read-then-write races under concurrency, so the increment-and-check
-must be one atomic op &mdash; a single <code>INCR</code> or a <b>Lua script</b> that Redis runs
-atomically. And decide the failure mode up front: if Redis is unreachable, <b>fail-open</b>
-(allow &mdash; protect availability) or <b>fail-closed</b> (deny &mdash; protect the backend).</p>
+<div class="newprob"><b>Atomicity is non-negotiable.</b> A read-then-write (<code>GET</code>; check; <code>SET</code>) races under concurrency &mdash; two requests both read 99, both allow, count hits 101. The increment-and-check must be <em>one</em> atomic operation: a single <code>INCR</code> (fixed/sliding window) or a <b>Lua script</b> Redis runs atomically (token bucket / GCRA need read-modify-write of <code>tokens</code>+<code>last_refill</code>). This is <a href="../primitives/p3.html">P3</a> consistency on the counter.</div>
+<div class="newprob"><b>The hot counter.</b> A single global key for a popular tenant is itself a hotspot. Relief: shard the counter into <code>key#0..key#k</code> sub-counters across Redis nodes (<a href="../primitives/p2.html">P2</a>), each holding 1/k of the budget, and sum/borrow as needed &mdash; the inverse of <a href="../systems/s22.html">S22</a>'s counting problem. The local-pre-check rung is the common production answer: each node holds a small lease of the budget and only talks to Redis when its lease is exhausted, bounding both latency and over-admit.</div>
 
-<h2 class="sec">6 &middot; Real-world example</h2>
+<h2 class="sec">6 &middot; Failure mode: fail-open vs fail-closed</h2>
+<div class="hard"><p>The limiter has its own dependency (Redis). When it's unreachable you must have already decided: <b>fail-open</b> (allow the request &mdash; protect <em>availability</em>, accept that the backend is briefly unprotected) or <b>fail-closed</b> (deny &mdash; protect the <em>backend</em>, accept that you're rejecting legitimate traffic). The right choice depends on what the limiter guards: a public read API usually fails open (don't take the site down because Redis blipped); a fragile or abuse-prone endpoint (login, expensive write) fails closed. A local in-memory fallback that enforces a conservative per-node limit during the outage is a good middle ground.</p></div>
+
+<h2 class="sec">7 &middot; Multi-dimensional & layered limiting</h2>
+<p>Real APIs don't have one limit; they enforce several at once, and a request must pass <em>all</em>: per-user (fairness), per-IP (abuse), per-API-key (billing tier), per-endpoint (protect an expensive route), and a global limit (protect the whole backend). Each is its own counter keyed differently; the check evaluates the relevant set and denies if any is exhausted. Beyond rate, two other limiter <em>kinds</em> matter: a <b>concurrency limiter</b> (cap simultaneous in-flight requests so one slow client can't hog all workers &mdash; a semaphore, not a counter) and <b>load shedding</b> (under stress, reject low-priority traffic to keep capacity for critical traffic). "Rate limiting" at scale is really a small portfolio of limiters defending different resources.</p>
+
+<h2 class="sec">8 &middot; Scaling & where the limiter lives</h2>
+<p>The check runs at the edge &mdash; API gateway / reverse proxy / middleware &mdash; so it rejects before a request consumes app resources. At higher scale the Redis tier shards by identity (<a href="../primitives/p2.html">P2</a>) and the local-pre-check rung cuts round trips. The limiter is also a <a href="../primitives/p16.html">P16</a> backpressure mechanism: it converts "too much load" into explicit, early, cheap rejections (with <code>Retry-After</code>) rather than letting the backend collapse. It's a building block of larger systems &mdash; login rate-limiting in <a href="../systems/s20.html">S20</a>, provider pacing in <a href="../systems/s11.html">S11</a>, the flash-sale waiting room in <a href="../systems/s21.html">S21</a>.</p>
+
+<h2 class="sec">9 &middot; Tradeoffs & alternatives</h2>
+<p>Local-only counters scale infinitely but enforce limits loosely; a global Redis counter is accurate but a hot-path dependency (mitigate with local pre-check + fail-open). Exact sliding-log costs memory; the sliding-window-counter approximation is the usual sweet spot; token bucket/GCRA win when bursts are desirable. Reject (429) is cheap and honest; queueing (leaky bucket) smooths bursts but adds latency and hides overload. The deepest call is fail-open vs fail-closed &mdash; it encodes whether availability or backend protection matters more for the thing being guarded.</p>
+
+<h2 class="sec">10 &middot; Real-world example</h2>
 <div class="example">
 <span class="tag">Stripe</span>
-<p>Stripe documented running <b>multiple layers</b> of rate limiters in front of its
-API rather than one. They distinguish a <b>request-rate limiter</b> (token-bucket
-style, the steady-state cap), a <b>concurrency limiter</b> (cap simultaneous in-flight
-requests so one client can&rsquo;t hog workers), and load-shedding tiers that
-prioritize critical traffic (e.g. live charges) over less-critical traffic (e.g. test
-or batch calls) when the system is under stress. The limiters are implemented in Redis
-with atomic operations. The lesson: at scale "rate limiting" is several different
-limiters defending different resources, not one counter.</p>
+<p>Stripe documented running <b>multiple layers</b> of rate limiters in front of its API rather than one. They distinguish a <b>request-rate limiter</b> (token-bucket style, the steady-state cap), a <b>concurrency limiter</b> (cap simultaneous in-flight requests so one client can't hog workers), and load-shedding tiers that prioritize critical traffic (e.g. live charges) over less-critical traffic (e.g. test or batch calls) when the system is under stress. The limiters are implemented in Redis with atomic operations (Lua scripts for the read-modify-write algorithms). The lesson matches &sect;7: at scale "rate limiting" is several different limiters defending different resources, not one counter.</p>
 </div>
 
-<h2 class="sec">7 &middot; Tradeoffs &amp; alternatives</h2>
-<p>Local-only counters scale infinitely but enforce limits loosely; a global Redis
-counter is accurate but a dependency on the hot path (mitigate with fail-open). Exact
-sliding windows cost memory; the sliding-window-counter approximation is usually the
-sweet spot.</p>
+<h2 class="sec">11 &middot; Interview follow-ups (Q&amp;A)</h2>
+<p><b>Q: Why not just use a fixed window &mdash; it's simplest?</b> The boundary burst: a client can send the full quota at the end of one window and again at the start of the next, doubling the real rate for ~1&nbsp;s. Sliding-window-counter or token bucket fixes it with the same O(1) memory.</p>
+<p><b>Q: Token bucket vs leaky bucket?</b> Token bucket <em>allows</em> a burst up to b and bounds the average &mdash; good API UX. Leaky bucket <em>smooths</em> bursty input into a steady drain (queue), adding latency and dropping on overflow. Choose by whether you want to permit bursts or absorb them.</p>
+<p><b>Q: How do you enforce one global limit across 1,000 servers cheaply?</b> A shared atomic counter in Redis (single <code>INCR</code> or a Lua script for token bucket), fronted by a per-node local pre-check that holds a small lease of the budget so most requests never make a network call &mdash; bounding both latency and over-admit.</p>
+<p><b>Q: Why does the increment have to be atomic?</b> Read-then-write races: two concurrent requests both read 99 and both allow, exceeding the limit. A single atomic <code>INCR</code> or a server-side Lua script makes increment-and-check indivisible.</p>
+<p><b>Q: Redis is down &mdash; allow or deny?</b> A pre-decided policy per use case: fail-open for availability-critical read paths (with a conservative local fallback), fail-closed for abuse-prone or fragile endpoints. There's no universal right answer; it encodes which risk you'd rather take.</p>
+<p><b>Q: A single hot key (one huge tenant) overloads one Redis node &mdash; fix?</b> Shard the counter into k sub-counters across nodes (<a href="../primitives/p2.html">P2</a>), each with 1/k of the budget, and aggregate/borrow &mdash; the same hot-key split used elsewhere in the course.</p>
+<p><b>Q: How do you handle bursts from many keys vs one key?</b> Per-key token buckets bound each identity's burst independently; a separate global limiter and a concurrency limiter protect the shared backend from the <em>aggregate</em> even when no single key misbehaves.</p>
 
-<h2 class="sec">8 &middot; Key talking points</h2>
+<h2 class="sec">12 &middot; Key talking points</h2>
 <ul>
-<li>Lead with: <i>"the check must be cheaper than the request &mdash; one atomic Redis op."</i></li>
-<li>Token bucket by default; name the burst-vs-smoothness tradeoff.</li>
-<li>Global vs local counter = accuracy vs latency (<a href="../primitives/p3.html">P3</a>).</li>
-<li>Fail-open vs fail-closed when the store is down.</li>
-<li>Return <code>429</code> + <code>Retry-After</code>; consider per-tier limits.</li>
+<li>Lead with the constraint: <i>"the check must be cheaper than the request &mdash; one atomic Redis op."</i></li>
+<li>Algorithm ladder: fixed window (edge burst) &rarr; sliding log (memory) &rarr; sliding counter &rarr; <b>token bucket</b>/GCRA (burst + O(1) state).</li>
+<li>Distributed ladder: local-only (loose) &rarr; global Redis (accurate, a dependency) &rarr; <b>Redis + local pre-check</b> (the sweet spot); increment must be atomic (<a href="../primitives/p3.html">P3</a>).</li>
+<li><b>Fail-open vs fail-closed</b> when the store is down &mdash; decided per endpoint.</li>
+<li>Multi-dimensional (user/IP/key/endpoint/global) + concurrency limiter + load shedding; it's a portfolio, not one counter.</li>
+<li>Return <code>429</code> + <code>Retry-After</code>/remaining so clients self-throttle; it's a <a href="../primitives/p16.html">P16</a> backpressure tool.</li>
 </ul>
 
-<h2 class="sec">9 &middot; Further reading</h2>
+<h2 class="sec">13 &middot; Further reading</h2>
 <ul>
-<li><a href="https://stripe.com/blog/rate-limiters">Stripe &mdash; Scaling your API with rate limiters</a></li>
+<li><a href="https://stripe.com/blog/rate-limiters">Stripe — Scaling your API with rate limiters</a></li>
+<li>Cloudflare — sliding-window rate limiting &middot; GCRA (Generic Cell Rate Algorithm)</li>
 </ul>
 
 <div class="prevnext"><span></span><a href="s2.html">S2 &middot; Kafka &rarr;</a></div>

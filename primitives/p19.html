@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>P19 CRDTs — System Design Curriculum</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head><body>
+<div class="wrap">
+<nav class="side" id="side"></nav>
+<main><div class="reading" id="top">
+<div class="crumb"><a href="../index.html">Curriculum</a> / Part II · Primitives / P19</div><h1>P19 · CRDTs (conflict-free replicated data types)</h1>
+<div class="summary"><div class="field"><b>What it is:</b> data structures whose replicas can be updated independently and <em>always</em> merge to the same value with no coordination — concurrent writes resolve automatically and deterministically.</div>
+<div class="field"><b>Reach for it when:</b> multi-master / multi-region writes, offline-first apps, collaborative editing, shopping carts — anywhere you want availability under partition (AP) without lost updates.</div>
+<div class="field"><b>The lever:</b> design the merge to be <b>commutative, associative, and idempotent</b>, so order and duplication of updates don't matter — convergence is mathematically guaranteed.</div>
+<div class="newprob"><b>New problem it hands you:</b> metadata growth (tombstones, version tags); the merge semantics may not match business intent (a "removed" item can resurrect); not every type has a sensible CRDT (you can't CRDT an account balance with a hard floor).</div>
+<div class="prims"><b>Exemplified by:</b> <a href="../systems/s3.html">Dynamo-style KV conflict resolution</a> (the "→ CRDT" rung), Redis CRDT, Riak, collaborative editors.</div></div>
+
+<hr>
+
+<h2 class="sec">1 &middot; The problem it solves</h2>
+<p>In a multi-leader / AP system (<a href="../primitives/p3.html">P3</a>), two replicas accept writes to the same key during a network partition. When they reconcile, whose write wins? <b>Last-write-wins</b> silently <em>discards</em> a concurrent update (lost data); requiring coordination to avoid conflicts sacrifices availability (the CP side of <a href="../primitives/p3.html">CAP</a>). A <b>CRDT</b> sidesteps the dilemma: it's a type whose concurrent updates <em>merge</em> deterministically with no coordination, so every replica that has seen the same set of updates &mdash; in any order, with any duplicates &mdash; computes the <em>same</em> value. This is the concrete mechanism behind <a href="../systems/s3.html">S3</a>'s conflict-resolution ladder ending "→ CRDT," unpacked here.</p>
+
+<h2 class="sec">2 &middot; The one rule: merge must be commutative, associative, idempotent</h2>
+<p>Convergence is guaranteed if (and essentially because) the merge function forms a <b>join-semilattice</b> &mdash; three properties:</p>
+<ul>
+<li><b>Commutative:</b> <code>merge(a,b) = merge(b,a)</code> &mdash; order of arrival doesn't matter (networks reorder).</li>
+<li><b>Associative:</b> <code>merge(merge(a,b),c) = merge(a,merge(b,c))</code> &mdash; grouping doesn't matter (you can merge in any batches).</li>
+<li><b>Idempotent:</b> <code>merge(a,a) = a</code> &mdash; receiving the same update twice changes nothing (networks redeliver).</li>
+</ul>
+<p>Together these mean updates can flow over an unreliable, reordering, duplicating gossip network and every replica still converges. <b>The cautionary counter-example:</b> a "just add the deltas" counter is <em>not</em> a CRDT &mdash; redelivery double-counts and replicas diverge. The whole craft is finding a representation whose merge has these three properties.</p>
+<div class="estimate">BROKEN: counter = counter + delta on each received update
+  replica gossips "+1"; the message is redelivered -> counted twice -> diverges (NOT idempotent)
+FIXED (G-counter, below): track per-node totals, merge = elementwise MAX (idempotent)
+</div>
+
+<h2 class="sec">3 &middot; The catalog, worked</h2>
+<h3>G-Counter (grow-only counter)</h3>
+<p>Represent the counter as a <b>vector of per-node sub-counters</b>; a node only increments <em>its own</em> entry; the value is the sum; <b>merge is elementwise max</b>.</p>
+<div class="estimate">replica A: {a:3, b:1, c:0}   value = 4
+replica B: {a:2, b:1, c:5}   value = 8
+merge (elementwise max): {a:3, b:1, c:5}   value = 9
+re-merge with A again -> still {a:3,b:1,c:5}   (idempotent: max(3,3)=3)
+</div>
+<p>Max is commutative, associative, and idempotent &mdash; so this converges. Why per-node? Because a node's own count only ever grows monotonically, so max correctly recovers the latest count each node has reached, immune to reorder/duplication. (A <b>PN-counter</b> that also decrements is just <em>two</em> G-counters, P and N; value = sumP &minus; sumN.)</p>
+<h3>LWW-Register (last-write-wins register)</h3>
+<p>Store <code>(value, timestamp)</code>; merge keeps the higher timestamp; ties broken by a deterministic rule (e.g. node id) so the result is the same everywhere.</p>
+<div class="estimate">(x, t=5)  merge  (y, t=7)  ->  (y, t=7)        // higher timestamp wins
+concurrent (x, t=5)@nodeA  vs  (y, t=5)@nodeB ->  tiebreak by node id (deterministic)
+</div>
+<p>Converges, but <em>by design discards</em> the losing write &mdash; acceptable for "user's current status," lossy for "set of items." LWW is what <a href="../systems/s3.html">S3</a>'s conflict ladder starts with, and its weakness (silent lost updates, dependence on clock skew &mdash; a fast clock makes one node always win) is exactly what pushes you up the ladder to version vectors and then true CRDTs.</p>
+<h3>OR-Set (observed-remove set)</h3>
+<p>The hard case: a set where you can add <em>and</em> remove concurrently without "remove wins forever" or "add resurrects deleted items." Trick: each <code>add(x)</code> tags the element with a <b>unique id</b>; <code>remove(x)</code> only removes the (x, id) tags it has <em>observed</em>; an element is present if it has at least one un-removed tag.</p>
+<div class="estimate">A: add(x) -> {(x, id1)}
+B: add(x) -> {(x, id2)}        // concurrent, different unique ids
+A: remove(x) -> removes only id1 (the tag A has seen)
+merge -> {(x, id2)} still present  ->  x is in the set
+  -> a concurrent add "wins" over a remove that never saw it (add-wins semantics)
+</div>
+<p>This makes add/remove commute. The cost is <b>tombstones</b>: removed tags must be remembered (or garbage-collected carefully) so a late-arriving stale add doesn't resurrect a deleted element.</p>
+
+<h2 class="sec">4 &middot; State-based vs op-based</h2>
+<div class="tablewrap"><table>
+<tr><th></th><th>State-based (CvRDT)</th><th>Op-based (CmRDT)</th></tr>
+<tr><td>Gossips</td><td>the whole (merged) state</td><td>individual operations</td></tr>
+<tr><td>Needs merge to be</td><td>commutative+associative+idempotent</td><td>operations to commute</td></tr>
+<tr><td>Network requirement</td><td>tolerates loss/dup/reorder (just resend state)</td><td>exactly-once, causal delivery of ops</td></tr>
+<tr><td>Cost</td><td>bandwidth (ships full state)</td><td>cheap ops, but needs reliable delivery</td></tr>
+</table></div>
+<p>State-based is robust over flaky gossip (idempotent merge makes redelivery free) but heavy; op-based is lean but pushes the reliability/ordering burden onto the transport. <b>Delta-state CRDTs</b> are the practical middle: ship only the changed part of the state, keeping idempotent-merge robustness without resending everything.</p>
+
+<h2 class="sec">5 &middot; How it works (diagram)</h2>
+<pre class="mermaid">
+graph LR
+  A[replica A: local update] -->|gossip state/op| B[replica B]
+  B -->|gossip| A
+  A --> MA[merge: commut/assoc/idempotent]
+  B --> MB[merge]
+  MA --> CONV[both converge to same value]
+  MB --> CONV
+</pre>
+
+<h2 class="sec">6 &middot; The new bottleneck it hands you</h2>
+<div class="newprob">
+<p><b>Metadata grows.</b> OR-Sets accumulate tombstones; version vectors grow with the number of replicas; LWW needs synchronized-ish clocks for "last" to mean anything. Garbage-collecting tombstones safely (without resurrecting deleted items when a stale update arrives late) is genuinely hard.</p>
+<p><b>The merge may not match intent.</b> CRDTs guarantee <em>convergence</em>, not <em>correctness for your business rule</em>. An OR-Set's add-wins means a "removed" item can stay if a concurrent add didn't see the remove. You cannot CRDT an invariant like "balance ≥ 0" &mdash; that needs coordination (a reservation/lock, <a href="../systems/s21.html">S21</a>) because two replicas can each independently approve a withdrawal that's jointly invalid. CRDTs trade a global invariant for availability.</p>
+</div>
+
+<h2 class="sec">7 &middot; Variants &amp; when to use each</h2>
+<div class="tablewrap"><table>
+<tr><th>CRDT</th><th>Use for</th><th>Watch out</th></tr>
+<tr><td>G-/PN-Counter</td><td>likes, views, metrics, inventory deltas</td><td>vector grows with replica count</td></tr>
+<tr><td>LWW-Register</td><td>"current value" fields (status, profile)</td><td>silently drops concurrent writes; needs clocks</td></tr>
+<tr><td>OR-Set</td><td>shopping cart, tags, membership</td><td>tombstone growth; add-wins semantics</td></tr>
+<tr><td>Sequence (RGA/Logoot)</td><td>collaborative text editing</td><td>complex; id/position metadata</td></tr>
+</table></div>
+
+<h2 class="sec">8 &middot; Real-world example</h2>
+<div class="example">
+<span class="tag">Amazon Dynamo · Riak · Redis</span>
+<p>Amazon's <b>Dynamo</b> shopping cart is the classic motivating case: to stay writable during partitions, concurrent cart updates are merged rather than rejected &mdash; historically by <em>merging</em> the carts (a union), which is why a deleted item could occasionally reappear (an OR-Set-style add-wins artifact). <b>Riak</b> shipped a library of CRDTs (counters, sets, maps, registers) for exactly this AP reconciliation, and <b>Redis Enterprise</b>'s active-active geo-replication is built on CRDTs so writes in multiple regions converge without a coordinator. Collaborative editors (and Automerge/Yjs) use sequence CRDTs so two people typing offline merge to one document. The recurring lesson: CRDTs buy availability and automatic merge, and you pay in metadata and in accepting the merge's semantics.</p>
+</div>
+
+<h2 class="sec">9 &middot; Applying it in a design</h2>
+<p>Reach for a CRDT when you need <b>multi-writer availability without lost updates</b> and the data has a sensible merge. Say: <i>"replicas update independently and merge with a commutative/associative/idempotent function, so they converge with no coordination &mdash; I'll use a PN-counter for the counts and an OR-Set for the cart, and accept add-wins; for the balance invariant I can't use a CRDT, so that path needs coordination."</i> It's the principled answer to <a href="../systems/s3.html">S3</a>'s conflict-resolution rung beyond version vectors.</p>
+
+<h2 class="sec">10 &middot; Pitfalls</h2>
+<ul>
+<li>Assuming a "just add deltas" counter converges &mdash; it isn't idempotent and diverges on redelivery.</li>
+<li>Using LWW where lost concurrent writes matter (it silently discards them).</li>
+<li>Forgetting tombstone growth / GC in remove-capable sets.</li>
+<li>Trying to enforce a hard invariant (balance ≥ 0, unique seat) with a CRDT &mdash; impossible without coordination.</li>
+<li>Op-based CRDTs without exactly-once, causal delivery &mdash; the operations stop commuting safely.</li>
+</ul>
+
+<h2 class="sec">11 &middot; Further reading</h2>
+<ul>
+<li>Shapiro et al., <a href="https://hal.inria.fr/inria-00609399/document">A comprehensive study of Convergent and Commutative Replicated Data Types</a></li>
+<li><a href="https://www.allthingsdistributed.com/2007/10/amazons_dynamo.html">Amazon Dynamo paper</a> &middot; <a href="https://docs.riak.com/riak/kv/latest/developing/data-types/">Riak CRDTs</a> &middot; <a href="../systems/s3.html">S3 conflict resolution</a></li>
+</ul>
+
+<div class="prevnext"><a href="p18.html">&larr; P18 &middot; Distributed sort</a><a href="p20.html">P20 &middot; Distributed tracing &rarr;</a></div>
+</div></main>
+</div>
+<a href="#top" class="backtop" title="Back to top">&uarr;</a>
+<script type="module">
+  import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+  mermaid.initialize({ startOnLoad: true, theme: 'neutral' });
+</script>
+<script>window.SITE_BASE="../";</script>
+<script src="../assets/site.js"></script>
+</body></html>

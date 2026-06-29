@@ -8,84 +8,143 @@
 <nav class="side" id="side"></nav>
 <main><div class="reading" id="top">
 <div class="crumb"><a href="../index.html">Curriculum</a> / Part III · Systems / Cluster B — Read, search, analytics</div><h1>8 · Distributed SQL Engine (Presto / BigQuery-style)</h1>
-<div class="summary"><div class="hard"><b>Hard constraint:</b> shuffle (cross-node redistribution for joins/group-by) is the bottleneck; every optimizer decision reduces to minimizing shuffle.</div><div class="prims"><b>Primitives exercised:</b> <a href="../primitives/p8.html">P8</a> (columnar), <a href="../primitives/p7.html">P7</a>, <a href="../primitives/p12.html">P12</a>, <a href="../primitives/p2.html">P2</a> (pruning).</div><p>Columnar storage; predicate/projection pushdown + partition pruning; cost-based planning; hash vs sort-merge vs broadcast join; exchange/shuffle operators; vectorized execution.</p></div>
+<div class="summary"><div class="hard"><b>Hard constraint:</b> <b>shuffle</b> — moving data across the network so rows that must join or group land on the same worker — dominates. Every optimizer decision reduces to "how do I read and move less data?"</div><div class="prims"><b>Primitives exercised:</b> <a href="../primitives/p8.html">P8</a> (columnar), <a href="../primitives/p7.html">P7</a> (scatter-gather), <a href="../primitives/p12.html">P12</a> (tail/stragglers), <a href="../primitives/p2.html">P2</a> (pruning/partitioning), <a href="../primitives/p18.html">P18</a> (distributed sort).</div><p>Columnar storage; predicate/projection pushdown + partition pruning; cost-based planning; broadcast vs shuffle-hash vs sort-merge joins; exchange/shuffle operators; vectorized execution; stragglers.</p></div>
 
 <hr>
 
-<h2 class="sec">1 &middot; Requirements &amp; scale</h2>
-<p><b>Functional:</b> ad-hoc analytical SQL (joins, group-by, aggregates) over
-petabytes, no pre-built indexes. <b>Non-functional:</b> interactive-ish latency on huge
-scans, elastic parallelism, read-mostly.</p>
-<div class="estimate">Back-of-envelope
-1 PB table, query selects 3 of 200 columns
-row store: read ~all 1 PB                    -> hopeless
-columnar: read 3/200 of data                 ~ 15 TB scanned
-+ partition pruning by date                  ~ only relevant partitions
-distribute scan across 1,000 workers         -> seconds, if shuffle is small
+<h2 class="sec">1 &middot; Requirements</h2>
+<p><b>Functional:</b> run ad-hoc <em>analytical</em> SQL &mdash; multi-table joins, group-by, aggregates, window functions &mdash; over petabytes, with no pre-built secondary indexes. <b>Non-functional:</b></p>
+<div class="tablewrap"><table>
+<tr><th>Property</th><th>Target</th><th>Consequence</th></tr>
+<tr><td>Latency</td><td>interactive-ish (seconds&ndash;minutes) on huge scans</td><td>massive read parallelism; minimize shuffle</td></tr>
+<tr><td>Workload</td><td>read-mostly, scan-heavy, few rows out of many</td><td>columnar, not row store (<a href="../primitives/p8.html">P8</a>)</td></tr>
+<tr><td>Elasticity</td><td>fan a query across 100s&ndash;1000s of workers</td><td>stateless workers, separated storage/compute</td></tr>
+<tr><td>Not required</td><td>point lookups, row updates, transactions</td><td>use OLTP (<a href="../systems/s4.html">S4</a>) for those</td></tr>
+</table></div>
+<p>This is OLAP, the mirror image of <a href="../systems/s4.html">S4</a> (OLTP). OLTP touches a few rows by key and must be transactional; OLAP touches <em>billions</em> of rows but a few <em>columns</em>, and reads dominate. That single difference &mdash; many rows, few columns, no updates &mdash; justifies columnar storage and an MPP (massively parallel processing) engine.</p>
+
+<h2 class="sec">2 &middot; Capacity estimation</h2>
+<div class="estimate">1 PB table, 200 columns, query selects 3 of them
+  row store:  must read ~all 1 PB                          -> hopeless
+  columnar:   read 3/200 of the bytes      = ~15 TB scanned
+  + partition pruning to 7 of 1095 daily partitions  = ~96 GB actually read
+  + row-group min/max skipping              -> often far less
+
+distribute the 15 TB (pre-prune) scan over 1,000 workers
+  -> ~15 GB/worker  -> seconds, IF the shuffle between stages is small
+
+shuffle-hash join: repartition 15 TB by join key across 1,000 workers
+  -> ~15 GB/worker crosses the network          <- this is the cost that matters
+</div>
+<p>The numbers say it all: the engine's leverage is <b>reading less</b> (columnar + pruning takes 1 PB down to ~96 GB) and <b>moving less</b> (the shuffle volume, not the scan, is what makes a query slow). Everything below is in service of those two.</p>
+
+<h2 class="sec">3 &middot; API & query lifecycle</h2>
+<div class="estimate">submit(sql)            -> query_id
+status(query_id)       -> {state, stages[], rows_processed, bytes_scanned}
+results(query_id)      -> stream of rows
+
+lifecycle:  SQL -> parse -> logical plan -> cost-based optimize -> physical plan
+            -> DAG of STAGES -> schedule TASKS on workers -> exchange between stages -> result
 </div>
 
-<h2 class="sec">2 &middot; High-level architecture</h2>
+<h2 class="sec">4 &middot; Storage & the read path &mdash; read less (ladder)</h2>
+<p>The first lever is reading fewer bytes off storage. Derive it.</p>
+<h3>Rung 0 &mdash; row store, full scan</h3>
+<p>Rows stored together; a 3-column query still drags all 200 columns off disk. 1 PB read. <b>Breaks on:</b> I/O &mdash; you read 197 columns you don't need.</p>
+<h3>Rung 1 &mdash; columnar (Parquet/ORC) + projection pushdown</h3>
+<p>Store each column contiguously (<a href="../primitives/p8.html">P8</a>); the scan reads only the 3 projected columns &rarr; ~15 TB instead of 1 PB. Same-type values compress hard (RLE, dictionary, delta). <b>Breaks on:</b> you still scan every <em>row</em> of those 3 columns even when a filter rejects most.</p>
+<h3>Rung 2 &mdash; predicate pushdown + row-group min/max skipping</h3>
+<p>Columnar files store per-row-group <b>min/max stats</b>. Push the <code>WHERE</code> filter into the scan: if a row group's max <code>&lt;</code> the predicate's lower bound, skip the whole group without decoding it. A <code>WHERE amount &gt; 1000</code> over a file where a group's max is 500 reads zero bytes of that group. <b>Breaks on:</b> data not laid out to make stats selective (random order &rarr; every group's min/max spans the predicate).</p>
+<h3>Rung 3 &mdash; partition pruning + clustering/sort</h3>
+<p>Physically partition by a common filter column (e.g. <code>date</code>) so <code>WHERE date BETWEEN</code> touches only matching directories &mdash; 7 of 1095 partitions &rarr; ~96 GB. <b>Cluster/sort</b> within partitions on a second column so min/max skipping becomes highly selective. This is <a href="../primitives/p2.html">P2</a> applied to a warehouse.</p>
+<div class="tablewrap"><table>
+<tr><th>Rung</th><th>Bytes read (1 PB table, 3/200 cols, 7/1095 days)</th><th>Lever</th></tr>
+<tr><td>Row store full scan</td><td>~1 PB</td><td>&mdash;</td></tr>
+<tr><td>Columnar projection</td><td>~15 TB</td><td>read only needed columns</td></tr>
+<tr><td>+ partition pruning</td><td>~96 GB</td><td>skip irrelevant partitions</td></tr>
+<tr><td>+ min/max skipping</td><td>often &lt;10 GB</td><td>skip row groups by stats</td></tr>
+</table></div>
+
+<h2 class="sec">5 &middot; High-level architecture</h2>
 <pre class="mermaid">
 graph TD
-  SQL[query] --> PL[planner / optimizer]
-  PL --> ST1[stage: scan + filter]
-  ST1 -->|exchange / shuffle| ST2[stage: join / aggregate]
-  ST2 --> R[result]
+  SQL[query] --> CO[coordinator: parse + cost-based optimize + schedule]
+  CO --> ST1[stage 1: scan + filter + partial agg]
+  ST1 -->|exchange / shuffle by key| ST2[stage 2: join / final agg]
+  ST2 -->|exchange| ST3[stage 3: sort / limit]
+  ST3 --> CO
+  CO --> R[result]
 </pre>
-<p>The planner compiles SQL into a DAG of stages run by many workers. Scans read only
-projected columns from columnar files; stages exchange data through shuffles for joins
-and group-bys.</p>
+<p>A <b>coordinator</b> compiles SQL into a DAG of <b>stages</b>; each stage runs as many parallel <b>tasks</b> (one per worker per data split). Stages are separated by <b>exchange</b> operators that move (shuffle) data between them. Workers are stateless and read columnar files from shared storage (S3/HDFS/GCS) &mdash; the modern "separation of storage and compute," which lets compute scale elastically and independently.</p>
 
-<h2 class="sec">3 &middot; The hard constraint, in depth</h2>
-<div class="hard"><p><b>Shuffle</b> &mdash; redistributing data across the network so that
-rows that must be joined or grouped land on the same worker &mdash; is the bottleneck.
-The optimizer&rsquo;s real job is not to compute faster but to <em>avoid reading and
-moving data</em>: predicate pushdown, projection pushdown, partition pruning, and
-choosing join strategies that minimize shuffle volume. Every plan decision reduces to
-"how do I move less data?"</p></div>
+<h2 class="sec">6 &middot; The execution model: stages, tasks, exchanges</h2>
+<p>A query becomes a tree of stages. A <b>leaf stage</b> scans a table; its tasks each handle a <b>split</b> (a chunk of files/row groups). An <b>intermediate stage</b> consumes the output of its children through an exchange. The exchange is the only place data crosses the network, and it comes in three flavors:</p>
+<ul>
+<li><b>Repartition (hash) exchange</b> &mdash; route each row to a worker by <code>hash(key) % N</code> so all rows with the same key co-locate (for joins/group-by). This <em>is</em> the shuffle.</li>
+<li><b>Broadcast exchange</b> &mdash; send the entire (small) input to <em>every</em> worker.</li>
+<li><b>Gather exchange</b> &mdash; collect all partial results to one node for the final result/limit (<a href="../primitives/p7.html">P7</a>).</li>
+</ul>
+<p><b>Partial aggregation</b> is the cheapest shuffle-reducer: for <code>GROUP BY country, COUNT(*)</code>, each scan task first aggregates <em>locally</em> (one partial count per country it saw), then shuffles only the small partial-aggregate rows, and a final stage merges them. A billion input rows shuffle as a few hundred partials (<a href="../primitives/p7.html">P7</a> partial aggregation). This is why <code>COUNT</code>/<code>SUM</code>/<code>AVG</code> are nearly free while <code>COUNT(DISTINCT)</code> (which needs the raw values) is expensive &mdash; the latter often uses HyperLogLog sketches to stay cheap.</p>
 
-<h2 class="sec">4 &middot; Component deep dives</h2>
-<h3>Columnar scan + pushdown (P8)</h3>
-<p>Parquet/ORC let you read only needed columns and skip row groups via min/max stats;
-the planner pushes filters and projections down into the scan (<a href="../primitives/p8.html">P8</a>).</p>
-<h3>Join strategies</h3>
-<p><b>Broadcast join</b> (ship the small table to every worker &mdash; no shuffle of the
-big one), <b>hash/shuffle join</b> (repartition both tables by key), <b>sort-merge
-join</b> (for sorted/huge inputs). Cost-based planning estimates row counts to pick.</p>
-<h3>Execution</h3>
-<p>Vectorized, column-at-a-time processing (SIMD) instead of row-at-a-time; exchange
-operators implement the shuffle.</p>
+<h2 class="sec">7 &middot; Join strategies &mdash; minimizing shuffle (ladder)</h2>
+<div class="hard"><p><b>The bottleneck is shuffle.</b> Joining two big tables the naive way repartitions <em>both</em> by the join key across the network &mdash; tens of TB in flight. The optimizer's real job isn't computing faster; it's <em>moving less data</em>. The choice of join algorithm is the single biggest lever.</p></div>
+<h3>Rung 1 &mdash; broadcast join (one side is small)</h3>
+<p>If one table is small (a dimension table, say 50&nbsp;MB), <b>broadcast</b> it to all N workers and stream the big table past it locally &mdash; the huge table is <em>never shuffled</em>.</p>
+<div class="estimate">broadcast 50 MB dim table to 1,000 workers = 50 GB total network
+  vs shuffling a 15 TB fact table = 15,000 GB
+  -> broadcast wins by ~300x WHEN the small side fits in worker memory
+</div>
+<p><b>Breaks on:</b> the "small" side isn't small &mdash; broadcasting a 100&nbsp;GB table to 1,000 workers is 100&nbsp;TB of network and blows worker memory.</p>
+<h3>Rung 2 &mdash; shuffle (partitioned) hash join (both sides large)</h3>
+<p>Repartition <em>both</em> tables by <code>hash(join_key)</code> so matching keys land on the same worker; each worker builds a hash table on its slice of the smaller side and probes with the larger. Cost = shuffling both tables once (~15 GB/worker in our example). <b>Breaks on:</b> <b>data skew</b> &mdash; one hot key (e.g. <code>user_id = guest</code>) sends a huge fraction of rows to one worker, which becomes a straggler. Fix with skew/salt handling: split the hot key across several partitions and replicate its match rows.</p>
+<h3>Rung 3 &mdash; sort-merge join (inputs already sorted / too big to hash)</h3>
+<p>If both sides are sorted on the key (or too large for a hash table to fit in memory), sort each side (a distributed external sort, <a href="../primitives/p18.html">P18</a>) and merge in a single linear pass. Robust to inputs larger than RAM; the cost is the sort. Used when hash tables would spill heavily.</p>
+<div class="tablewrap"><table>
+<tr><th>Join</th><th>Use when</th><th>Network cost</th><th>Weakness</th></tr>
+<tr><td>Broadcast</td><td>one side fits in worker RAM</td><td>small side &times; N workers</td><td>fails if "small" side grows</td></tr>
+<tr><td>Shuffle hash</td><td>both sides large</td><td>both sides shuffled once</td><td>skewed keys &rarr; straggler</td></tr>
+<tr><td>Sort-merge</td><td>sorted/huge inputs</td><td>shuffle + sort</td><td>sort cost; needs spill-to-disk</td></tr>
+</table></div>
+<p>The optimizer picks among these using <b>cost-based planning</b>: it estimates each table's row count and size from statistics (and runtime sampling), then chooses the plan with the least estimated data movement. A wrong estimate (stale stats) is the usual cause of a query that "should be fast" running for an hour &mdash; it broadcast a table that turned out to be huge.</p>
 
-<h2 class="sec">5 &middot; Real-world example</h2>
+<h2 class="sec">8 &middot; Vectorized execution & join order</h2>
+<p>Inside a worker, processing is <b>vectorized</b>: operators work on <em>batches</em> of ~1024 column values at a time rather than row-at-a-time, so the CPU runs tight loops over contiguous arrays that the compiler auto-SIMDs and that stay in cache &mdash; often 10&times;+ over the classic row-at-a-time "Volcano" model. Some engines (e.g. Spark) go further and <b>JIT-compile</b> a whole stage into one fused loop (whole-stage codegen). Separately, for multi-join queries the optimizer chooses <b>join order</b> to keep intermediate results small &mdash; join the most selective pair first so later joins see fewer rows; a bad order can produce an intermediate result orders of magnitude larger than any input.</p>
+
+<h2 class="sec">9 &middot; Scaling, stragglers & failure</h2>
+<div class="newprob"><b>New bottleneck &mdash; the straggler.</b> A query's latency is the <em>slowest</em> worker in each stage (<a href="../primitives/p12.html">P12</a>). With 1,000 tasks each 99% likely to be fast, the chance <em>all</em> finish promptly is 0.99<sup>1000</sup> &asymp; 0.004% &mdash; a slow task is virtually guaranteed. Fixes: <b>speculative execution</b> (launch a duplicate of a lagging task on another worker, take whichever finishes first), even <b>split sizing</b> so no task is much bigger, and skew handling on the shuffle (above). Adding workers helps a <em>scan-bound</em> query but not a <em>shuffle-bound</em> or <em>skewed</em> one &mdash; know which you have.</div>
+<p><b>Failure model:</b> classic MPP (Presto/Trino) keeps intermediate data in memory and streams between stages &mdash; fast, but a worker failure fails the whole query (re-run it). Batch engines (Spark, MapReduce, <a href="../primitives/p18.html">P18</a>) <b>materialize</b> shuffle output to disk between stages, so a failed task re-runs from the last checkpoint, not from scratch &mdash; slower but survivable for hours-long jobs. The tradeoff is interactive-fragile vs batch-resilient; some engines (Trino fault-tolerant execution) now offer both modes.</p>
+
+<h2 class="sec">10 &middot; Tradeoffs & alternatives</h2>
+<p>MPP engines are built for big scans, not point lookups or updates &mdash; use <a href="../systems/s4.html">OLTP (S4)</a> for those, or an HTAP system if you truly need both. <b>Pre-aggregation / materialized views / cubes</b> trade storage and freshness for query speed (compute the rollup once, read it many times) &mdash; the same lever as <a href="../systems/s6.html">S6</a>'s metric rollups. <b>Separation of storage and compute</b> (BigQuery, Snowflake, Trino-on-S3) lets you scale compute elastically and pay per query, at the cost of network latency to object storage (mitigated by caching hot files on worker SSD). More workers help scans, never a shuffle-bound query.</p>
+
+<h2 class="sec">11 &middot; Real-world example</h2>
 <div class="example">
 <span class="tag">Presto / Trino &amp; Google BigQuery</span>
-<p><b>Presto</b> (built at Facebook, now also Trino) is a distributed MPP SQL engine
-that queries data <em>in place</em> (S3, HDFS, etc.) by compiling SQL into stages of
-workers and shuffling between them &mdash; Meta runs it over exabyte-scale warehouses
-for interactive analytics. Google <b>BigQuery</b> (built on Dremel, <a href="../primitives/p8.html">P8</a>)
-separates storage from compute and fans a query across thousands of slots over
-columnar storage; its planner aggressively prunes and pushes down so a multi-TB scan
-returns in seconds. Both live or die by minimizing shuffle.</p>
+<p><b>Presto</b> (built at Facebook, forked as <b>Trino</b>) is an MPP SQL engine that queries data <em>in place</em> (S3, HDFS, Hive, many connectors) by compiling SQL into stages of stateless workers and shuffling between them in memory &mdash; Meta runs it for interactive analytics over exabyte-scale warehouses. Google <b>BigQuery</b> descends from <b>Dremel</b> (<a href="../primitives/p8.html">P8</a>): it separates storage (Colossus, columnar Capacitor format) from compute (a shared pool of "slots"), fans a query across thousands of slots, and shuffles through a distributed in-memory shuffle tier; its planner aggressively prunes and pushes down so a multi-TB scan returns in seconds. Both live or die by minimizing shuffle &mdash; BigQuery's disaggregated shuffle was a landmark precisely because the shuffle is the constraint.</p>
 </div>
 
-<h2 class="sec">6 &middot; Tradeoffs &amp; alternatives</h2>
-<p>MPP engines are built for big scans, not point lookups or updates &mdash; use an
-<a href="../systems/s4.html">OLTP database</a> for those. Pre-aggregation/materialized views trade
-storage and freshness for query speed. More workers help scans but not a
-shuffle-bound query.</p>
+<h2 class="sec">12 &middot; Interview follow-ups (Q&amp;A)</h2>
+<p><b>Q: Why is shuffle the bottleneck and not the scan?</b> Columnar + pruning already cut the scan to a small fraction of the table and it parallelizes linearly with workers. Shuffle moves data <em>across the network</em> between stages and doesn't shrink by adding workers &mdash; a 15 TB repartition is 15 TB no matter how many nodes. So the optimizer optimizes data movement, not CPU.</p>
+<p><b>Q: How do you join a huge fact table to a small dimension without shuffling the fact?</b> Broadcast the small side to every worker and probe locally &mdash; the fact table never moves. Only valid while the "small" side fits in worker memory; the optimizer falls back to a shuffle-hash join when it doesn't.</p>
+<p><b>Q: One join key is wildly hot (skew) &mdash; what happens and how do you fix it?</b> All rows for that key hash to one worker, which becomes a straggler that sets the whole stage's latency. Fix by <b>salting</b>: split the hot key into <code>key#0..key#k</code> across workers and replicate its matching rows on the other side, then union. Some engines detect skew at runtime and do this automatically.</p>
+<p><b>Q: Why does <code>COUNT(*)</code> scale but <code>COUNT(DISTINCT x)</code> hurt?</b> <code>COUNT(*)</code> partial-aggregates locally and shuffles tiny partials; <code>COUNT(DISTINCT)</code> needs the actual distinct values, which can't be merged from counts &mdash; so use an approximate sketch (HyperLogLog) that <em>is</em> mergeable when exactness isn't required (same trick as <a href="../systems/s22.html">S22</a>/<a href="../systems/s6.html">S6</a>).</p>
+<p><b>Q: A worker dies 9 minutes into a 10-minute query &mdash; what happens?</b> In a streaming MPP engine, the query fails and re-runs (intermediate state was in memory). In a batch engine that materializes shuffle to disk, only the lost task re-runs from its checkpoint. Choosing between them is the interactive-vs-resilient tradeoff.</p>
+<p><b>Q: Why is this read-only / no point lookups?</b> Columnar layout makes reading one full row expensive (gather 200 separate column files) and makes updates a rewrite; there are no secondary indexes for key lookups. OLAP optimizes scans of many rows / few columns; OLTP (<a href="../systems/s4.html">S4</a>) optimizes few rows / all columns with transactions. Different layouts, different systems.</p>
 
-<h2 class="sec">7 &middot; Key talking points</h2>
+<h2 class="sec">13 &middot; Key talking points</h2>
 <ul>
-<li>Columnar + pushdown + partition pruning: read less (<a href="../primitives/p8.html">P8</a>).</li>
-<li>Shuffle is the bottleneck; the optimizer minimizes data movement.</li>
-<li>Broadcast vs shuffle vs sort-merge joins by table size.</li>
-<li>Scatter-gather stages; slowest worker sets latency (<a href="../primitives/p7.html">P7</a>, <a href="../primitives/p12.html">P12</a>).</li>
-<li>Vectorized execution.</li>
+<li>OLAP is the mirror of OLTP: many rows, few columns, read-mostly &rarr; <b>columnar</b> (<a href="../primitives/p8.html">P8</a>).</li>
+<li>Two levers: <b>read less</b> (columnar + projection + partition pruning + min/max skipping: 1 PB &rarr; &lt;100 GB) and <b>move less</b> (minimize shuffle).</li>
+<li>Coordinator compiles SQL into a DAG of <b>stages</b>; <b>exchanges</b> (shuffle/broadcast/gather) are the only network hops.</li>
+<li>Join ladder: <b>broadcast</b> (small side) &rarr; <b>shuffle-hash</b> (both large) &rarr; <b>sort-merge</b> (sorted/huge), chosen by cost-based planning.</li>
+<li><b>Partial aggregation</b> shrinks group-by shuffles; skew creates stragglers (salt the hot key).</li>
+<li>Latency = slowest worker (<a href="../primitives/p12.html">P12</a>) &rarr; speculative execution; vectorized/SIMD execution inside workers.</li>
 </ul>
 
-<h2 class="sec">8 &middot; Further reading</h2>
+<h2 class="sec">14 &middot; Further reading</h2>
 <ul>
-<li><a href="https://trino.io/docs/current/">Trino (Presto) docs</a> &middot; <a href="https://research.google/pubs/pub36632/">Dremel paper</a></li>
+<li><a href="https://trino.io/docs/current/">Trino (Presto) documentation</a> &middot; <a href="https://research.google/pubs/pub36632/">Dremel: Interactive Analysis of Web-Scale Datasets</a></li>
+<li><a href="https://cloud.google.com/blog/products/bigquery/in-memory-query-execution-in-google-bigquery">BigQuery in-memory shuffle</a> &middot; <a href="https://15721.courses.cs.cmu.edu/">CMU 15-721 Advanced Database Systems</a></li>
 </ul>
 
 <div class="prevnext"><a href="s7.html">&larr; S7 &middot; Search engine</a><a href="s9.html">S9 &middot; Social feed &rarr;</a></div>

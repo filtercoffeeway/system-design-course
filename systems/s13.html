@@ -8,78 +8,134 @@
 <nav class="side" id="side"></nav>
 <main><div class="reading" id="top">
 <div class="crumb"><a href="../index.html">Curriculum</a> / Part III · Systems / Cluster D — Coordination</div><h1>13 · Distributed Lock / Leader Election (ZooKeeper / etcd)</h1>
-<div class="summary"><div class="hard"><b>Hard constraint:</b> the slow-but-alive holder (GC pause, network blip) — TTL tuning can't make this correct; fencing tokens can.</div><div class="prims"><b>Primitives exercised:</b> <a href="../primitives/p10.html">P10</a> (consensus/fencing).</div><p>Raft/Paxos + majority quorum; fencing tokens (monotonic, reject stale); session/heartbeat TTL for death detection; leader election as a lock with metadata; watch/notify instead of polling.</p></div>
+<div class="summary"><div class="hard"><b>Hard constraint:</b> the slow-but-alive holder (GC pause, network blip) — no TTL value can make a bare lock correct, because the holder can wake up after expiry still believing it holds the lock. Fencing tokens can.</div><div class="prims"><b>Primitives exercised:</b> <a href="../primitives/p10.html">P10</a> (consensus/fencing), <a href="../primitives/p3.html">P3</a> (quorum), <a href="../primitives/p9.html">P9</a> (idempotency).</div><p>Raft/Paxos + majority quorum for the lock state; fencing tokens (monotonic, reject stale) for correctness; session/heartbeat TTL for death detection; leader election as "a lock whose value is the leader's identity"; watch/notify instead of polling.</p></div>
 
 <hr>
 
-<h2 class="sec">1 &middot; Requirements &amp; scale</h2>
-<p><b>Functional:</b> let distributed processes coordinate &mdash; acquire a mutual-
-exclusion lock, or elect a single leader &mdash; correctly despite crashes and network
-faults. <b>Non-functional:</b> safety (never two holders) over liveness, low-ish churn,
-small data.</p>
+<h2 class="sec">1 &middot; Requirements</h2>
+<p><b>Functional:</b> let independent processes coordinate &mdash; <em>acquire</em> a mutual-exclusion lock, <em>release</em> it, and <em>elect a single leader</em> &mdash; correctly despite crashes, GC pauses, and network partitions. Support a <em>watch</em> so a waiter learns of release without polling. <b>Non-functional:</b></p>
+<div class="tablewrap"><table>
+<tr><th>Property</th><th>Target</th><th>Consequence</th></tr>
+<tr><td>Safety</td><td>NEVER two simultaneous holders</td><td>quorum + <b>fencing</b> (TTL alone is insufficient)</td></tr>
+<tr><td>Liveness</td><td>a dead holder's lock is eventually freed</td><td>session TTL + heartbeats</td></tr>
+<tr><td>Fault tolerance</td><td>survive minority node loss</td><td>odd cluster, majority quorum</td></tr>
+<tr><td>Latency</td><td>acquire in ~1 RTT to a majority</td><td>keep the cluster in one region</td></tr>
+<tr><td>Data size</td><td>tiny (keys, not blobs)</td><td>fits in RAM, replicated by consensus</td></tr>
+</table></div>
+<p>The defining stance: <b>safety over liveness</b>. It is acceptable for the lock to be briefly <em>unavailable</em> (no one can acquire during a leader election); it is never acceptable for <em>two</em> clients to believe they hold it.</p>
 
-<h2 class="sec">2 &middot; High-level architecture</h2>
-<pre class="mermaid">
-graph TD
-  C1[client 1] --> Q[(coordination service: Raft/Paxos quorum)]
-  C2[client 2] --> Q
-  Q -->|grants lock + fencing token N| C1
-  C2 -->|blocked / watch for release| Q
-</pre>
-<p>A small, consensus-backed service (ZooKeeper/etcd/Chubby) holds the lock state on a
-quorum so it survives node loss. Clients acquire via ephemeral keys with sessions, and
-<b>watch</b> for release instead of polling.</p>
+<h2 class="sec">2 &middot; Capacity & the shape of the problem</h2>
+<div class="estimate">data:    a handful of small keys (lock name -> {owner, token, lease_until}); KB, not GB
+load:    acquires/releases are rare vs reads; the bottleneck is CORRECTNESS, not QPS
+quorum:  cluster 3 -> majority 2, tolerates 1 failure
+         cluster 5 -> majority 3, tolerates 2 failures   <- common
+         cluster 7 -> majority 4, tolerates 3 failures
+acquire: ~1 RTT to a majority (~1-10 ms same region; cross-region is painful)
+</div>
+<p>This system is unusual: throughput is almost irrelevant; the entire design exists to be <em>correct</em> under the worst partial-failure timing. So we derive the lock by escalating against <em>failure modes</em>, not against load.</p>
 
-<h2 class="sec">3 &middot; The hard constraint, in depth</h2>
-<div class="hard"><p>A lock holder can be <b>slow but not dead</b> &mdash; a GC pause or
-network blip makes it look dead, its lease expires, another client acquires the lock,
-and then the original wakes up <em>still believing it holds the lock</em>. Two holders
-act at once and corrupt state. No TTL value fixes this. The correct fix is a
-<b>fencing token</b>: the lock service hands out a monotonically increasing number with
-each grant, and the protected resource rejects any operation carrying a token lower
-than the highest it has seen (<a href="../primitives/p10.html">P10</a>).</p></div>
+<h2 class="sec">3 &middot; API design</h2>
+<div class="estimate">acquire(lock_name, ttl)          -> { granted: bool, token: int }   // token = fencing token
+release(lock_name, token)        -> ok | rejected(stale token)
+renew(lock_name, token, ttl)     -> ok | lost                       // heartbeat the lease
+watch(lock_name)                 -> stream of {released, acquired_by}
 
-<h2 class="sec">4 &middot; Component deep dives</h2>
-<h3>Consensus core (P10)</h3>
-<p>Raft/Paxos majority quorum makes the lock state itself fault tolerant; leader
-election is "a lock with the leader&rsquo;s identity as the value."</p>
-<h3>Sessions, ephemeral nodes &amp; watches</h3>
-<p>A client holds a session with a heartbeat; its lock is an ephemeral node that
-auto-releases if the session dies (death detection via TTL). Other clients set a
-<b>watch</b> to be notified the instant the lock frees &mdash; no polling.</p>
-<h3>Fencing</h3>
-<p>Monotonic tokens enforce correctness that TTL tuning cannot.</p>
-
-<h2 class="sec">5 &middot; Real-world example</h2>
-<div class="example">
-<span class="tag">Google Chubby, ZooKeeper, etcd</span>
-<p>Google&rsquo;s <b>Chubby</b> (Paxos) is the original coarse-grained lock + naming
-service much of Google coordinates through &mdash; e.g. electing a master for GFS/Bigtable.
-<b>ZooKeeper</b> brought the model to the open-source world (Kafka used it for controller
-election; HBase/Hadoop for coordination), and <b>etcd</b> (Raft) is the coordination
-store and leader-election backbone of Kubernetes. The cautionary tale is the
-<b>Redlock</b> debate: Martin Kleppmann showed that a lock without a fencing token
-isn&rsquo;t safe under GC pauses &mdash; cementing fencing as the non-negotiable piece.</p>
+// leader election is the same primitive:
+campaign(election, candidate_id) -> { leader: bool, term: int }     // term IS the fence
 </div>
 
-<h2 class="sec">6 &middot; Tradeoffs &amp; alternatives</h2>
-<p>A consensus service is the safe choice but adds a dependency and quorum latency; a
-Redis lock is fast but needs fencing to be correct. Coarse locks (one leader) are
-simpler and usually better than many fine-grained locks. Prefer leader-election +
-single-writer over distributed mutual exclusion when you can.</p>
+<h2 class="sec">4 &middot; Deriving the lock (ladder over failure modes)</h2>
 
-<h2 class="sec">7 &middot; Key talking points</h2>
+<h3>Rung 0 &mdash; a row in a single database (<code>SELECT ... FOR UPDATE</code>)</h3>
+<p>Acquire = insert a row <code>(lock_name, owner)</code> with a unique constraint; release = delete it. Correct as long as the DB is up. <b>Breaks on:</b> the DB is a single point of failure &mdash; if it dies, all coordination stops; and if the holder crashes without deleting the row, the lock is held forever (no expiry).</p>
+
+<h3>Rung 1 &mdash; a single Redis key with <code>SET NX PX</code> (TTL)</h3>
+<p><code>SET lock owner NX PX 10000</code> &mdash; set only if absent, auto-expire in 10&nbsp;s, so a crashed holder's lock self-frees. Fast (one node, sub-ms). <b>Breaks on two things:</b> (a) single Redis is a SPOF, and a replica failover can <em>lose</em> the key (async replication) &rarr; two holders; (b) the <b>slow-but-alive holder</b> &mdash; the core hazard below &mdash; which <em>no TTL value fixes</em>.</p>
+
+<div class="hard"><p><b>The central hazard: slow-but-alive.</b> Client A acquires with a 10&nbsp;s TTL and a token. A then suffers a 12&nbsp;s GC pause (or its network drops). The lease expires; client B legitimately acquires. Then A wakes up <em>still believing it holds the lock</em> and writes to the protected resource. <b>Two writers, corruption.</b> Making the TTL longer just widens the window where a truly-dead holder blocks everyone; making it shorter makes false expiry more likely. TTL tuning trades one failure for another &mdash; it cannot be correct.</p></div>
+
+<h3>Rung 2 &mdash; fencing tokens (the correctness fix)</h3>
+<p>The lock service hands out a <b>monotonically increasing token</b> with every grant. The <em>protected resource</em> (the DB, the file store) records the highest token it has seen and <b>rejects any operation carrying a lower token</b>. Now the slow holder is harmless:</p>
+<div class="estimate">A acquires -> token 33 ;  A pauses (GC) ;  lease expires
+B acquires -> token 34 ;  B writes  (resource records highest = 34)
+A wakes, writes with token 33  ->  33 < 34  ->  REJECTED
+</div>
+<p>This is <a href="../primitives/p10.html">P10</a>'s fencing token. Crucially, fencing requires the <em>resource</em> to cooperate (check the token). A lock the resource doesn't fence is only an optimization, never a safety guarantee. In Raft-based systems the <b>term</b> number serves as the fence; in ZooKeeper the znode's <code>zxid</code>/version does.</p>
+
+<h3>Rung 3 &mdash; quorum-replicated lock state (the availability fix)</h3>
+<p>Put the lock state behind a <b>consensus group</b> (Raft/Paxos) of 3 or 5 nodes so it survives minority failure and never loses a committed grant on failover. An acquire is a consensus write committed by a majority; because a majority must agree, two clients cannot both be granted. Combined with fencing, this is the production answer: <b>ZooKeeper, etcd, Chubby.</b></p>
+
+<div class="tablewrap"><table>
+<tr><th>Rung</th><th>Good until</th><th>Breaks on</th></tr>
+<tr><td>DB row lock</td><td>one app, DB always up</td><td>SPOF; crashed holder never releases</td></tr>
+<tr><td>Redis SET NX PX</td><td>best-effort, perf locks</td><td>failover loses key; slow-but-alive holder</td></tr>
+<tr><td>+ fencing token</td><td>correctness vs slow holder</td><td>lock <em>store</em> still a SPOF</td></tr>
+<tr><td>Quorum (Raft) + fencing</td><td>production coordination</td><td>quorum latency; needs majority alive</td></tr>
+</table></div>
+
+<h2 class="sec">5 &middot; High-level architecture</h2>
+<pre class="mermaid">
+graph TD
+  C1[client 1] -->|acquire| Q[(coordination service: Raft/Paxos 3 or 5 nodes)]
+  C2[client 2] -->|acquire / watch| Q
+  Q -->|grant + fencing token 34| C1
+  Q -->|blocked; watch fires on release| C2
+  C1 -->|op carries token 34| R[(protected resource: checks token)]
+  R -->|reject token < highest_seen| C1
+</pre>
+<p>A small consensus-backed service holds the lock state on a quorum. Clients acquire via <b>ephemeral keys</b> tied to a <b>session</b>, carry the returned fencing token to the protected resource, and <b>watch</b> for release rather than polling.</p>
+
+<h2 class="sec">6 &middot; Sessions, ephemeral nodes & watches</h2>
+<p><b>Death detection</b> is a lease: a client holds a session with a TTL (say 10&nbsp;s) and sends heartbeats (every ~3&nbsp;s); miss enough and the service declares the session dead and releases its locks. The lock is an <b>ephemeral node</b> &mdash; it exists only while the session lives, so a crashed holder is auto-released without anyone polling.</p>
+<p><b>Watches over polling:</b> thousands of waiters polling "is it free yet?" would hammer the cluster. Instead each waiter registers a one-shot watch and is notified the instant the lock frees. To avoid a <b>thundering herd</b> (all waiters wake and race), ZooKeeper's recipe has each waiter create a sequential ephemeral node and watch <em>only the node just ahead of it</em> &mdash; release wakes exactly one successor (a fair queue), not everyone.</p>
+<div class="newprob"><b>New bottleneck &mdash; the lease/heartbeat is itself the slow-but-alive trap.</b> Session expiry is just a distributed TTL, so it has the same window as rung 1. That's why fencing is not optional even with a consensus service: the session TTL gives <em>liveness</em> (eventually free a dead client); the fencing token gives <em>safety</em> (a late client can't corrupt). You need both.</div>
+
+<h2 class="sec">7 &middot; Leader election = a lock with a value</h2>
+<p>Leader election is the same primitive: candidates contend for one key; the winner writes its identity as the value and holds it via session. Followers <b>watch</b> the key and re-campaign when it frees. The Raft <b>term</b> (or ZAB epoch) is the fencing token: every action the leader takes is stamped with its term, and replicas reject messages from an older term, so a deposed-but-unaware leader can't act. This is exactly how Kafka's controller, HBase's master, and Kubernetes components elect via etcd.</p>
+
+<h2 class="sec">8 &middot; The Redlock controversy (in depth)</h2>
+<p><b>Redlock</b> is a proposed algorithm to make Redis locks safe by acquiring the same lock on <b>N independent Redis nodes</b> (e.g. N=5) and considering it held only if a <em>majority</em> (&ge;3) grant it within the TTL. Martin Kleppmann's critique &mdash; the canonical interview talking point &mdash; is that this <b>still doesn't give safety</b>, for two reasons:</p>
 <ul>
-<li>Use a consensus service (etcd/ZooKeeper/Chubby), don&rsquo;t DIY (<a href="../primitives/p10.html">P10</a>).</li>
-<li>Slow-but-alive holder is the core hazard.</li>
-<li>Fencing tokens, not TTL tuning, give correctness.</li>
-<li>Sessions + ephemeral nodes for death detection; watches over polling.</li>
-<li>Prefer coarse leader election to fine-grained locks.</li>
+<li><b>It relies on bounded clock drift and bounded pauses.</b> Redlock's correctness argument assumes each node's clock advances at roughly the same rate and that a process can't pause longer than the TTL. A GC pause or VM freeze longer than the TTL reintroduces the exact slow-but-alive double-holder &mdash; the same flaw as a single lock.</li>
+<li><b>It has no fencing token.</b> Without the resource rejecting stale tokens, no lock algorithm can be safe against a paused holder. So the fix isn't "more Redis nodes"; it's fencing.</li>
+</ul>
+<p>Antirez (Redis's author) countered that Redlock is fine for its intended use (efficiency locks, where occasional double-execution is merely wasteful, not corrupting). The settled interview answer: <b>for efficiency, a single Redis lock is fine; for correctness, you need a consensus store <em>and</em> fencing tokens at the resource.</b> Redlock cemented fencing as the non-negotiable piece.</p>
+
+<h2 class="sec">9 &middot; Scaling & bottlenecks</h2>
+<p>A consensus group does not scale writes by adding nodes &mdash; more nodes mean a larger quorum and <em>slower</em> commits, so you size it for fault tolerance (5 nodes), not throughput. To handle more locks, <b>shard the lock namespace</b> across multiple independent consensus groups (each lock name hashes to a group). Keep the cluster in one region; cross-region quorum latency (tens of ms per acquire) is usually unacceptable, so prefer one region as the coordination authority. Reads of lock state can be served from a local follower (with a staleness caveat) or via a linearizable read (ReadIndex) when correctness needs it.</p>
+
+<h2 class="sec">10 &middot; Tradeoffs & alternatives</h2>
+<p>A consensus service is the safe choice but adds an operational dependency and quorum latency; a single Redis lock is fast but only an efficiency lock unless the resource fences. <b>Coarse-grained locks</b> (one leader owns a whole shard) are simpler and usually better than many fine-grained locks &mdash; prefer <em>leader-election + single-writer</em> over distributed mutual exclusion whenever you can, because then there is no contention to coordinate at all. The deepest tradeoff is philosophical: a distributed lock is a liveness/safety bargain, and the only way to win it is to push the final safety check (the fence) down to the resource that actually matters.</p>
+
+<h2 class="sec">11 &middot; Real-world example</h2>
+<div class="example">
+<span class="tag">Google Chubby · ZooKeeper · etcd</span>
+<p>Google's <b>Chubby</b> (Paxos) is the original coarse-grained lock + naming service much of Google coordinates through &mdash; e.g. electing a master for GFS/Bigtable; its designers note it's used far more for <em>election and naming</em> than fine-grained locking. <b>ZooKeeper</b> (ZAB) brought the model to open source: Kafka historically used it for controller election, HBase/Hadoop for coordination, via ephemeral sequential nodes + watches. <b>etcd</b> (Raft) is the coordination store and leader-election backbone of Kubernetes &mdash; component leaders renew a lease key, and the Raft term fences a deposed leader. The cautionary tale across all three is the <b>Redlock debate</b>: a lock without a fencing token isn't safe under GC pauses, which is why every serious system pairs the consensus grant with a monotonic fence at the resource.</p>
+</div>
+
+<h2 class="sec">12 &middot; Interview follow-ups (Q&amp;A)</h2>
+<p><b>Q: Why isn't a longer TTL enough to fix the slow holder?</b> A longer TTL just widens the window where a genuinely-dead holder blocks everyone (hurts liveness), and the paused-holder race still exists for any pause longer than the TTL. The race is inherent to time-based leases; only a fencing token checked at the resource eliminates it.</p>
+<p><b>Q: Who actually enforces the fence?</b> The <em>protected resource</em> must record the highest token it has seen and reject lower ones. If the resource can't be modified to do that, you cannot have a safe lock &mdash; you only have an efficiency lock. This is the most-missed point.</p>
+<p><b>Q: Why an odd number of nodes (3, 5)?</b> Majority quorum needs a strict majority; an even cluster (e.g. 4) tolerates the same failures as the next-lower odd (1) while costing an extra node and being more prone to split votes. 5 nodes tolerate 2 failures &mdash; the usual sweet spot.</p>
+<p><b>Q: What happens during a leader election &mdash; can two leaders exist?</b> Briefly there may be <em>no</em> leader (unavailable), but never two that can <em>act</em>: a new leader gets a higher term, and the old leader's writes are rejected by replicas as stale-term. Availability dips; safety holds.</p>
+<p><b>Q: A client's session expires while it's mid-operation &mdash; now what?</b> It must stop and re-acquire; any in-flight op still carries the old (now-stale) token and will be fenced out at the resource. Make operations idempotent (<a href="../primitives/p9.html">P9</a>) so a re-acquire-and-retry is safe.</p>
+<p><b>Q: Lock vs lease vs leader election &mdash; when each?</b> Use <b>leader election</b> when one process should own a whole responsibility (a single-writer shard) &mdash; cheapest and contention-free. Use a <b>lock/lease</b> for short critical sections over shared state. Avoid many fine-grained locks; they multiply the coordination you have to get right.</p>
+
+<h2 class="sec">13 &middot; Key talking points</h2>
+<ul>
+<li>Use a consensus service (etcd/ZooKeeper/Chubby), don't DIY (<a href="../primitives/p10.html">P10</a>); safety over liveness.</li>
+<li>The core hazard is the <b>slow-but-alive</b> holder; no TTL value fixes it.</li>
+<li><b>Fencing tokens</b> (monotonic, rejected-if-stale at the resource), not TTL tuning, give correctness.</li>
+<li>Quorum replication makes the lock <em>state</em> fault-tolerant; the fence makes <em>use</em> of the lock safe &mdash; you need both.</li>
+<li>Sessions + ephemeral nodes for death detection; watches (with sequential-node queueing) over polling to avoid thundering herds.</li>
+<li>Redlock: fine as an efficiency lock; not safe without fencing. Prefer coarse leader election to fine-grained locks.</li>
 </ul>
 
-<h2 class="sec">8 &middot; Further reading</h2>
+<h2 class="sec">14 &middot; Further reading</h2>
 <ul>
-<li><a href="https://research.google/pubs/pub27897/">The Chubby lock service</a> &middot; <a href="https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html">Kleppmann on distributed locking</a></li>
+<li><a href="https://research.google/pubs/pub27897/">The Chubby lock service for loosely-coupled distributed systems</a> (Burrows, OSDI '06)</li>
+<li><a href="https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html">Kleppmann — How to do distributed locking (the Redlock critique)</a></li>
+<li><a href="https://zookeeper.apache.org/doc/current/recipes.html">ZooKeeper recipes (locks, leader election)</a> &middot; <a href="https://etcd.io/docs/latest/dev-guide/api_concurrency_reference_v3/">etcd concurrency API</a></li>
 </ul>
 
 <div class="prevnext"><a href="s12.html">&larr; S12 &middot; Task scheduler</a><a href="s14.html">S14 &middot; URL shortener &rarr;</a></div>

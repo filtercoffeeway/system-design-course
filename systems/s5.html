@@ -61,6 +61,7 @@ reconstruct it (Reed-Solomon). The math beats replication on <em>both</em> axes:
 <div class="newprob"><b>Bottleneck (accepted):</b> a read of a missing chunk must fetch k
 chunks and recompute (CPU + cross-node latency) &mdash; a <b>degraded read</b>. So small
 hot objects sometimes still use replication; big cold blobs use erasure coding.</div>
+<div class="note"><b>Durability is a process, not a number.</b> 11 nines isn't achieved by storing chunks once and hoping &mdash; a background <b>scrubber</b> continuously reads chunks, verifies checksums (catching silent <em>bit rot</em> / disk decay), and <b>repairs</b> any lost/corrupt chunk by reconstructing it from the survivors before a second failure can reach the reconstruction threshold. The durability math assumes repair is fast relative to the failure rate; spread chunks across racks/AZs so correlated failures (a rack power loss) never take out more than m chunks of one object.</div>
 
 <h2 class="sec">5 &middot; The write &amp; read paths</h2>
 <div class="estimate">PUT object (10,4):
@@ -119,16 +120,25 @@ For mutable, transactional, small-record data use a <a href="../systems/s3.html"
 keep pointers in the DB. Tiering across storage classes by access-frequency decay is the
 <a href="../primitives/p8.html">P8</a> dial.</p>
 
-<h2 class="sec">9 &middot; Key talking points</h2>
+<h2 class="sec">9 &middot; Interview follow-ups (Q&amp;A)</h2>
+<p><b>Q: Why erasure coding instead of 3&times; replication?</b> It survives <em>more</em> failures at <em>less</em> than half the storage &mdash; e.g. (10,4) is 1.4&times; overhead and tolerates 4 losses vs 3&times; overhead tolerating 2. The cost is degraded reads (fetch k chunks + recompute on a miss) and write-time CPU for parity, so hot small objects may still be replicated.</p>
+<p><b>Q: How do you actually hit 11 nines &mdash; is it just storing more copies?</b> No: spread chunks across independent failure domains (racks/AZs) so correlated failures can't exceed m, and run a continuous background scrubber that checksums and reconstructs lost/corrupt chunks faster than failures accumulate. Durability is an active repair process, not a static replication factor.</p>
+<p><b>Q: Why split metadata from data?</b> The bytes are immutable, huge, and erasure-coded; the metadata (key&rarr;chunk locations, version, ACL) is small, mutable, and transactional. They have opposite needs, so the index lives in a sharded KV/DB and the data plane stays append-only &mdash; mixing them would force mutability onto the data plane.</p>
+<p><b>Q: How do you serve a 5&nbsp;TB upload/download?</b> Multipart upload (parallel parts assembled server-side &mdash; you can't stream 5&nbsp;TB in one request, and a failed part retries alone), and presigned URLs so clients transfer directly to/from the data plane without proxying terabytes through your API.</p>
+<p><b>Q: LIST by prefix is slow / a hot prefix overloads a shard &mdash; why?</b> LIST needs ordered keys, so the metadata store is range-partitioned by key rather than hashed &mdash; which reintroduces hot-shard risk for a popular prefix (<a href="../primitives/p2.html">P2</a>). Mitigate by spreading keys (e.g. hashed prefixes) or a separate index for listing.</p>
+<p><b>Q: Billions of tiny objects &mdash; what breaks?</b> Each object needs a metadata row regardless of size, so the <em>metadata</em> service, not storage, becomes the bottleneck. Pack small objects into larger blobs, and charge/throttle per-request so the per-object overhead is priced in.</p>
+<p><b>Q: What consistency does it give, and why does it matter?</b> Modern S3 gives read-after-write for new objects and strong read-after-overwrite/delete; older systems were eventually consistent (a GET after PUT could 404). It shapes correctness &mdash; e.g. a pipeline that writes then immediately reads must know whether the read can miss.</p>
+
+<h2 class="sec">10 &middot; Key talking points</h2>
 <ul>
 <li>Lead with: <i>"durable + infinite, but immutable and non-transactional."</i></li>
 <li>Erasure coding for durability at lower storage cost (<a href="../primitives/p17.html">P17</a>).</li>
 <li>Multipart upload + presigned URLs (don&rsquo;t proxy big bytes).</li>
 <li>Separate mutable metadata into an index/DB.</li>
-<li>Tiering via storage classes (<a href="../primitives/p8.html">P8</a>).</li>
+<li>Tiering via storage classes (<a href="../primitives/p8.html">P8</a>); durability = continuous scrub + repair, not just copies.</li>
 </ul>
 
-<h2 class="sec">10 &middot; Further reading</h2>
+<h2 class="sec">11 &middot; Further reading</h2>
 <ul>
 <li><a href="https://aws.amazon.com/s3/">Amazon S3</a> &middot; <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/Welcome.html">S3 developer guide</a></li>
 </ul>

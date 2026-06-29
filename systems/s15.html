@@ -8,85 +8,182 @@
 <nav class="side" id="side"></nav>
 <main><div class="reading" id="top">
 <div class="crumb"><a href="../index.html">Curriculum</a> / Part III · Systems / Cluster E — Domain-specific</div><h1>15 · Ride-Sharing / Location System (Uber)</h1>
-<div class="summary"><div class="hard"><b>Hard constraint:</b> geo-search must be fast with a variable radius; geohash precision trades search radius against result-set size.</div><div class="prims"><b>Primitives exercised:</b> <a href="../primitives/p15.html">P15</a>, <a href="../primitives/p1.html">P1</a> (write-heavy), <a href="../primitives/p2.html">P2</a> (hot-cell).</div><p>Geohash/quad-tree partitioning; ~1M location updates/min (write-heavy); matching as supply-demand in a cell; surge as a real-time read on that ratio; routing vs ETA (static graph shortest-path + dynamic traffic).</p></div>
+<div class="summary"><div class="hard"><b>Hard constraint:</b> a flood of location writes (~1M/s) meets a variable-radius proximity read — the geo index must absorb both, and the cell size that makes the read cheap makes a downtown cell a hot partition.</div><div class="prims"><b>Primitives exercised:</b> <a href="../primitives/p15.html">P15</a> (geospatial), <a href="../primitives/p1.html">P1</a> (batching, write-heavy), <a href="../primitives/p2.html">P2</a> (hot-cell partitioning), <a href="../primitives/p13.html">P13</a> (live connections), <a href="../primitives/p4.html">P4</a> (surge read).</div><p>Geohash/H3 partitioning; ~1.25M location updates/s (write-heavy); matching as a supply/demand problem inside a cell; surge as a real-time read of that ratio; routing/ETA as shortest-path on a live-weighted graph.</p></div>
 
 <hr>
 
-<h2 class="sec">1 &middot; Requirements &amp; scale</h2>
-<p><b>Functional:</b> track driver locations in real time, match a rider to the nearest
-available driver, price by supply/demand, route and estimate ETA. <b>Non-functional:</b>
-absorb a huge write rate of location updates and answer proximity queries fast.</p>
-<div class="estimate">Back-of-envelope
-5,000,000 active drivers, update every ~4s    ~ 1,250,000 location writes/s
-matching: nearest available within radius     -> geo index lookup per request
-this is a WRITE-heavy + geo-query problem, not a storage problem
+<h2 class="sec">1 &middot; Requirements</h2>
+<p><b>Functional:</b> drivers stream their GPS location continuously; a rider requests a ride and is matched to a nearby available driver; the system prices the trip by local supply/demand (surge); it routes the driver and shows a live ETA. <b>Non-functional:</b></p>
+<div class="tablewrap"><table>
+<tr><th>Property</th><th>Target</th><th>Consequence</th></tr>
+<tr><td>Write throughput</td><td>millions of location updates/s</td><td>can't durably persist every ping (&sect;4)</td></tr>
+<tr><td>Read latency</td><td>match in &lt; ~1&ndash;2 s end-to-end</td><td>proximity query must be O(cell), not O(city)</td></tr>
+<tr><td>Freshness</td><td>driver position &le; few seconds stale</td><td>in-memory index, not a disk round-trip</td></tr>
+<tr><td>Consistency</td><td>a driver is offered to <b>one</b> rider at a time</td><td>matching needs a short lock/lease (&sect;7)</td></tr>
+<tr><td>Availability</td><td>a city stays up if one shard dies</td><td>partition by geography, replicate per cell</td></tr>
+</table></div>
+<p>The defining observation: this is <b>not a storage problem</b>. The working set (where every driver is <em>right now</em>) is small and fits in RAM; what's brutal is the <em>write rate</em> and the <em>geo read</em>. That reframing drives every later decision.</p>
+
+<h2 class="sec">2 &middot; Capacity estimation</h2>
+<div class="estimate">5,000,000 active drivers, GPS ping every ~4 s
+  -> 5,000,000 / 4   = 1,250,000 location writes/s          (the dominant load)
+
+live position record: driver_id 8B + lat 8B + lng 8B + ts 8B = 32 B
+  -> 5,000,000 x 32 B = 160 MB of live state            (fits in RAM on ONE box)
+
+ride requests ~ 20,000,000/day -> ~231/s avg, ~1,150/s peak (5x)
+  -> reads are ~1000x rarer than writes; optimize the WRITE path first
+
+naive: one DB row-write per ping -> 1.25M writes/s
+  a single SQL node does a few k writes/s -> ~250x over budget   (&sect;4 kills this)
+</div>
+<p>Two numbers decide the architecture: <b>1.25M writes/s</b> (so the ingest path cannot touch a durable DB per ping) and <b>160 MB of live state</b> (so the entire "where is everyone" index fits in memory and can be sharded by geography across a handful of nodes for headroom + HA).</p>
+
+<h2 class="sec">3 &middot; API design</h2>
+<div class="estimate">// driver -> server, continuous
+updateLocation(driver_id, lat, lng, ts, heading, available)   -> 204
+
+// rider -> server
+requestRide(rider_id, pickup{lat,lng}, product)               -> { request_id, eta, surge }
+getMatch(request_id)                                           -> { driver_id, eta } | PENDING
+
+// internal
+nearbyDrivers(lat, lng, radius_m, product)                    -> [driver_id, dist, eta]
+surgeFor(cell_id)                                             -> multiplier
 </div>
 
-<h2 class="sec">2 &middot; High-level architecture</h2>
+<h2 class="sec">4 &middot; Data model &mdash; deriving the geo index (ladder)</h2>
+<p>The core question is: <em>given a rider's point, return the available drivers within radius R, fast, while 1.25M updates/s rain down.</em> Derive the structure, don't assert "use a quadtree."</p>
+
+<h3>Rung 0 &mdash; durable DB, one row per driver, <code>WHERE</code> on lat/lng</h3>
+<p><code>SELECT * FROM drivers WHERE lat BETWEEN ? AND ? AND lng BETWEEN ? AND ?</code>. A B-tree on <code>lat</code> can range-scan one dimension, but the second dimension isn't covered, so the engine scans a horizontal stripe across the whole map and filters. <b>Breaks on:</b> two things at once &mdash; the write rate (1.25M row-updates/s &asymp; 250&times; a single node) and the read (a stripe scan is O(drivers-in-a-latitude-band), not O(drivers-near-you)). Dead on arrival.</p>
+
+<h3>Rung 1 &mdash; an in-memory uniform grid (fixed lat/lng buckets)</h3>
+<p>Chop the world into fixed squares (say 0.01&deg; &asymp; 1&nbsp;km). <code>cell_id = (floor(lat/0.01), floor(lng/0.01))</code> is an O(1) hash. A query reads the rider's cell plus the 8 neighbors (a 3&times;3 ring, because the nearest driver may be just over a boundary). All in RAM &rarr; reads and writes are both O(1)-ish. <b>Breaks on:</b> the Earth isn't flat &mdash; a fixed degree-square is ~111&nbsp;km tall everywhere but shrinks east-west toward the poles (cos(latitude)), so cells are wildly non-uniform; and the grid is <em>flat</em> &mdash; there's no cheap way to <b>zoom out</b> when a rural cell has zero drivers and you must widen the radius.</p>
+
+<h3>Rung 2 &mdash; geohash (hierarchical prefix cells)</h3>
+<p>Geohash interleaves latitude and longitude bits and Base32-encodes them, so a <b>string prefix</b> <em>is</em> a bounding box, and a longer prefix is a smaller box nested inside the shorter one. That hierarchy is the upgrade over a flat grid: to widen the search you just drop a character.</p>
+<div class="estimate">geohash precision -> approximate cell size
+  len 5  ~ 4.9 km  x 4.9 km
+  len 6  ~ 1.2 km  x 0.61 km
+  len 7  ~ 153 m   x 153 m       <- typical dispatch precision
+  len 8  ~ 38 m    x 19 m
+  len 9  ~ 4.8 m   x 4.8 m
+
+index: HASH (geohash7) -> set{ driver_id }   (a Redis sorted set / in-mem map per cell)
+query: drivers in rider's geohash7 + its 8 neighbors; widen to geohash6 if too few
+</div>
+<p><b>Breaks on:</b> (a) the prefix box is rectangular and its aspect ratio changes with latitude, so "neighbors" aren't equidistant &mdash; ring search over-/under-shoots; (b) the <b>edge problem</b>: two points 1&nbsp;m apart can straddle a prefix boundary and share no common prefix, so you must always probe neighbors; (c) precision jumps by ~32&times; in area per character, so there's no smooth "widen by 20%."</p>
+
+<h3>Rung 3 &mdash; H3 hexagonal hierarchical grid (the answer)</h3>
+<p>H3 (Uber's open grid) tiles the globe with <b>hexagons</b> at 16 resolutions. Hexagons fix geohash's flaws: every neighbor is the <em>same</em> distance away (a hexagon has 6 equidistant neighbors; a square has 4 edge + 4 diagonal at &radic;2), so "expand the search ring" (<code>kRing(cell, k)</code>) grows smoothly and uniformly, and cell areas are near-constant within a resolution.</p>
+<div class="estimate">H3 resolution -> ~edge length
+  res 7  ~ 1.22 km
+  res 8  ~ 461 m       <- common dispatch resolution
+  res 9  ~ 174 m
+  res 10 ~ 66 m
+
+index:  H3index(res8) -> { driver_id -> {lat,lng,ts} }   in-memory, sharded by cell
+match:  ring = kRing(riderCell, 1); if |available| < N: k++ and retry
+</div>
+<div class="note"><b>Why this is the canonical answer:</b> uniform neighbor distance makes ring-expansion and supply/demand smoothing across adjacent cells clean, and the hierarchy (a res-8 cell has 7 res-9 children) lets surge and analytics roll up by zoom level for free.</div>
+
+<div class="tablewrap"><table>
+<tr><th>Rung</th><th>Good until</th><th>Breaks on</th></tr>
+<tr><td>DB lat/lng range scan</td><td>a toy demo</td><td>1.25M writes/s + stripe-scan reads</td></tr>
+<tr><td>In-mem uniform grid</td><td>one flat city</td><td>cell size varies w/ latitude; can't zoom out</td></tr>
+<tr><td>Geohash prefix cells</td><td>most apps</td><td>rectangular cells, edge boundaries, 32&times; precision jumps</td></tr>
+<tr><td>H3 hex grid</td><td>planet scale</td><td>&mdash; (the destination)</td></tr>
+</table></div>
+
+<h3>Durable layout vs the in-memory index</h3>
+<p>The hot index is RAM-only and rebuildable: positions are ephemeral (a 4-second-old GPS ping is worthless), so durability isn't required for the live map &mdash; on shard failover the new owner repopulates within one ping interval (~4&nbsp;s) as drivers send their next update. Trip records, payments, and ratings <em>are</em> durable and live in normal stores (<a href="../systems/s17.html">S17</a>-style ledger for fares).</p>
+
+<h2 class="sec">5 &middot; High-level architecture</h2>
 <pre class="mermaid">
 graph LR
-  D[drivers] -->|location updates| LOC[location service]
-  LOC --> GEO[(geo index: H3 cells -> drivers)]
-  R[rider request] --> DISCO[matching / dispatch]
-  DISCO --> GEO
-  DISCO --> SURGE[surge: supply/demand per cell]
+  D[drivers] -->|ping every 4s| GW[location gateway / WebSocket]
+  GW -->|batch flush| ING[ingest workers]
+  ING --> GEO[(in-mem H3 index, sharded by cell)]
+  R[rider request] --> DISP[dispatch / matching]
+  DISP -->|kRing query| GEO
+  DISP --> SURGE[surge: supply/demand per cell]
+  SURGE --> GEO
+  DISP -->|offer w/ lease| D
+  GEO -. async .-> TRIP[(durable trip store)]
 </pre>
+<p>Drivers hold a persistent connection (<a href="../primitives/p13.html">P13</a>) to a location gateway, which <b>batches</b> (<a href="../primitives/p1.html">P1</a>) pings and updates the in-memory H3 index sharded by cell. Dispatch queries that index, consults surge, and offers the ride to a driver under a short lease. Trips are written durably out of the hot path.</p>
 
-<h2 class="sec">3 &middot; The hard constraint, in depth</h2>
-<div class="hard"><p>Geo-search must be fast and the radius is <b>variable</b> (expand
-until you find enough drivers). Indexing by geohash/H3 gives approximate range search,
-where the cell precision trades search radius against result-set size, and you must also
-search neighboring cells to catch drivers just across a boundary (<a href="../primitives/p15.html">P15</a>).
-Layer on a ~1M/s update rate and a <b>hot cell</b> downtown and it&rsquo;s a write-heavy,
-skew-prone problem.</p></div>
+<h2 class="sec">6 &middot; The write path &mdash; absorbing 1.25M pings/s</h2>
+<p>Each ping does an in-place update of one driver's entry and, if the driver crossed a cell boundary, moves it between cells. The relief ladder for the write rate:</p>
+<ul>
+<li><b>Don't persist every ping.</b> The DB rung already died (&sect;4). Writes hit RAM; a sampled/throttled subset (e.g. every Nth ping, or on cell change) is async-journaled for analytics &mdash; not on the critical path.</li>
+<li><b>Batch + coalesce</b> (<a href="../primitives/p1.html">P1</a>): the gateway buffers pings for ~200&nbsp;ms; if a driver pings twice in a window, only the latest matters (last-write-wins on position), so 1.25M pings collapse to ~1 update per driver per window.</li>
+<li><b>Shard by cell</b> (<a href="../primitives/p2.html">P2</a>): the index is partitioned by H3 cell (or a coarse parent cell), so the write load spreads across nodes by geography. A driver's update routes to the node owning its current cell.</li>
+</ul>
+<div class="newprob"><b>New bottleneck &mdash; the hot cell.</b> Geography is skewed: midtown Manhattan on Friday night has orders of magnitude more drivers/requests than a suburb. Sharding by cell concentrates that load on one node. Fixes: shard by a <em>coarser parent cell</em> so load averages out; or split the hot cell across replicas with the cell key suffixed by a bucket (<code>cell#0..cell#k</code>) and scatter-gather the buckets on read (<a href="../primitives/p2.html">P2</a> hot-key split, <a href="../primitives/p7.html">P7</a> merge). The read fan-out over k buckets is cheap because k is small.</div>
 
-<h2 class="sec">4 &middot; Component deep dives</h2>
-<h3>Geospatial index (P15)</h3>
-<p>Driver positions are bucketed into H3/geohash cells; a match queries the rider&rsquo;s
-cell plus its ring of neighbors &mdash; see <a href="../primitives/p15.html">P15</a>.</p>
-<h3>Location ingest (P1/P2)</h3>
-<p>High-frequency updates are batched and written to an in-memory geo store; partition by
-cell, but watch for hot downtown cells (<a href="../primitives/p2.html">P2</a>).</p>
-<h3>Matching / dispatch</h3>
-<p>A supply-demand problem within a cell: find nearby available drivers, rank by ETA, and
-offer. Uber&rsquo;s dispatch (DISCO) batches requests over short windows to make globally
-better matches rather than greedy nearest-first.</p>
-<h3>Surge &amp; routing</h3>
-<p>Surge is a real-time read of the supply:demand ratio per cell over the same location
-data. ETA/routing uses shortest-path (Dijkstra/A*) on a road graph adjusted by live
-traffic.</p>
+<h2 class="sec">7 &middot; The read path &mdash; matching (ladder)</h2>
+<p>A request resolves the pickup point to its H3 cell, queries <code>kRing(cell, k)</code> for available drivers, ranks them, and offers. How you <em>choose and commit</em> the driver is itself a ladder.</p>
 
-<h2 class="sec">5 &middot; Real-world example</h2>
+<h3>Rung 1 &mdash; greedy nearest, offer immediately</h3>
+<p>Pick the closest available driver, offer, done. Simple, low latency. <b>Breaks on:</b> two riders 50&nbsp;m apart both get offered the <em>same</em> nearest driver (a race), and greedy-nearest is globally poor &mdash; assigning the closest driver to rider A may strand rider B with a far one, when a tiny swap would have served both better.</p>
+
+<h3>Rung 2 &mdash; lease the driver during the offer (fix the race)</h3>
+<p>When a driver is offered, mark them <code>held</code> with a short <b>lease</b> (a few seconds, the time to accept/decline). A concurrent match skips held drivers. If the offer times out or is declined, the lease expires and the driver returns to the pool. This is the same lease/fencing pattern as <a href="../primitives/p10.html">P10</a> / <a href="../systems/s13.html">S13</a> &mdash; it prevents double-offering.</p>
+
+<h3>Rung 3 &mdash; batched window dispatch (fix global quality)</h3>
+<p>Instead of matching each request the instant it arrives, accumulate requests over a short window (e.g. ~1&nbsp;s) per area and solve a <b>batch assignment</b> &mdash; a min-cost bipartite matching (Hungarian algorithm / min-cost flow) of riders&rarr;drivers minimizing total ETA. This is Uber's DISCO insight: a sub-second wait buys a globally better set of matches than greedy-nearest.</p>
+<div class="estimate">greedy:  rider A -> driver 1 (80m), rider B -> driver 2 (900m)   total 980m
+batched: rider A -> driver 2 (300m), rider B -> driver 1 (250m)   total 550m
+  -> the window trades ~1s latency for shorter combined pickup ETA + fewer cancels
+</div>
+<div class="tablewrap"><table>
+<tr><th>Rung</th><th>Good until</th><th>Breaks on</th></tr>
+<tr><td>Greedy nearest</td><td>sparse demand</td><td>double-offer race + globally poor matches</td></tr>
+<tr><td>+ offer lease</td><td>moderate concurrency</td><td>still greedy/local optimum</td></tr>
+<tr><td>Batched window assignment</td><td>dense markets</td><td>window adds latency; needs solver per cell</td></tr>
+</table></div>
+
+<h2 class="sec">8 &middot; Surge, routing & ETA</h2>
+<p><b>Surge</b> is a real-time read over the <em>same</em> location data: per cell, <code>multiplier = f(open_requests / available_drivers)</code> smoothed over neighbors and time. Because H3 cells roll up, surge can be computed at a coarse resolution and interpolated &mdash; it's a cheap aggregate read (<a href="../primitives/p4.html">P4</a>), recomputed every few seconds, not a per-request computation.</p>
+<p><b>ETA / routing</b> is shortest-path on a road graph. The naive Dijkstra over a continent is far too slow per request, so the production ladder is: precompute <b>contraction hierarchies</b> (or CH/ALT landmarks) on the static graph so a query is milliseconds; overlay <b>live edge weights</b> from current traffic (itself derived from driver speeds &mdash; the location stream feeds back in); recompute ETAs periodically. Pickup ETA (driver&rarr;rider) is the routing cost used to rank candidates in &sect;7.</p>
+
+<h2 class="sec">9 &middot; Scaling & bottlenecks at 10&times;</h2>
+<p>At 50M drivers / 12.5M writes/s: the in-memory index no longer fits/serves on a few nodes, so shard finer by H3 parent cell and add read replicas per cell for the (rarer) match reads. The hot-cell problem intensifies during events (a stadium emptying) &mdash; pre-split known hot cells and apply <a href="../primitives/p16.html">P16</a> backpressure (drop to a coarser ping cadence) when a region saturates. The batch solver becomes the per-cell bottleneck in dense markets; cap the batch size and fall back to greedy+lease under overload (graceful degradation).</p>
+
+<h2 class="sec">10 &middot; Tradeoffs & alternatives</h2>
+<p>Cell size is the master dial: bigger cells &rarr; fewer lookups but more candidates to filter and coarser surge; smaller cells &rarr; precise but more boundary handling and more hot-cell risk. In-memory index (fast, ephemeral, fast failover) vs durable geo store (safe but too slow for 1.25M/s). Batched dispatch (better matches) vs greedy (lower latency). Quadtree is the alternative to H3 when density is extremely non-uniform &mdash; a quadtree subdivides only where it's dense, so each leaf holds a bounded count, at the cost of rebalancing as drivers move (H3's fixed grid never rebalances, which is why Uber chose it).</p>
+
+<h2 class="sec">11 &middot; Real-world example</h2>
 <div class="example">
 <span class="tag">Uber</span>
-<p>Uber indexes the world with <b>H3</b>, its open-source hexagonal hierarchical grid
-(<a href="../primitives/p15.html">P15</a>), and runs matching/surge per cell. Hexagons give uniform
-neighbor distances, which makes "expand the search ring" and smoothing supply/demand
-across adjacent cells clean. Its dispatch system batches ride requests over short time
-windows to optimize matches city-wide instead of greedily, and surge pricing is computed
-from real-time supply/demand per H3 cell. The defining trait is that it is a write-heavy
-real-time geospatial system, so the location index and its cells are the center of the
-design.</p>
+<p>Uber indexes the world with <b>H3</b>, its open-source hexagonal hierarchical grid (<a href="../primitives/p15.html">P15</a>), and runs matching and surge per cell. Hexagons give uniform neighbor distances, which makes ring-expansion and supply/demand smoothing across adjacent cells clean. Its dispatch system (<b>DISCO</b>) batches ride requests over short time windows and solves a global assignment rather than matching greedily, improving combined ETAs and cutting cancellations. Surge is computed from real-time supply/demand per H3 cell. Live ETAs come from routing over a road graph whose edge weights are continuously updated from the very driver-speed stream the system ingests &mdash; the location firehose is both the write load and the input to traffic estimation. The defining trait: a write-heavy, real-time geospatial system where the in-memory location index and its cells are the center of the design.</p>
 </div>
 
-<h2 class="sec">6 &middot; Tradeoffs &amp; alternatives</h2>
-<p>Bigger cells = fewer lookups but more candidates to filter; smaller cells = precise but
-more boundary handling and more hot-cell risk. Batched dispatch yields better matches at
-the cost of a little latency vs greedy nearest. In-memory geo store for speed vs durable
-store for safety.</p>
+<h2 class="sec">12 &middot; Interview follow-ups (Q&amp;A)</h2>
+<p><b>Q: How do you handle a driver right on a cell boundary?</b> Always query the rider's cell <em>plus its ring of neighbors</em> (<code>kRing(cell,1)</code> = 6 hexes for H3), then filter by true great-circle distance and rank by routing ETA. Never trust the cell alone for the radius decision &mdash; the cell is a coarse pre-filter; the exact distance/ETA is the real ranking key.</p>
+<p><b>Q: How do you stop two riders being matched to the same driver?</b> A short <b>lease/hold</b> on the driver during the offer (&sect;7 rung 2), with a fencing token so a stale dispatcher can't re-confirm a driver who already moved on (<a href="../primitives/p10.html">P10</a>). The lease auto-expires on decline/timeout.</p>
+<p><b>Q: A leader/shard owning a hot cell dies &mdash; recovery?</b> Position state is ephemeral, so there's no big rebuild: the standby takes the cell and the in-memory map repopulates within ~one ping interval (~4&nbsp;s) as drivers send their next update. In-flight offers (held leases) are reconstructed from the durable matching log or simply expire and re-match. This is the "bound the failover cost" check &mdash; here the bound is ~4&nbsp;s, by design.</p>
+<p><b>Q: Why not just persist every location to a database?</b> 1.25M durable writes/s is ~250&times; a single SQL node and the data is worthless in 4&nbsp;s &mdash; persisting it buys nothing. Keep the live map in RAM; async-journal a sampled subset for analytics/traffic only.</p>
+<p><b>Q: How does the location stream feed traffic/ETA without a loop?</b> Aggregate driver speeds per road segment over a sliding window to estimate live edge weights; routing reads those weights. It's a feedback <em>pipeline</em>, not a synchronous loop &mdash; ETAs use the latest published weights, recomputed every few seconds.</p>
+<p><b>Q: What about exactly-once for the match itself?</b> Treat "create trip" as an idempotent operation keyed by <code>request_id</code> (<a href="../primitives/p9.html">P9</a>): a retried confirm with the same key returns the existing trip rather than creating a second one, so at-least-once delivery of the confirm is safe.</p>
 
-<h2 class="sec">7 &middot; Key talking points</h2>
+<h2 class="sec">13 &middot; Key talking points</h2>
 <ul>
-<li>Write-heavy + geo-query, not storage-heavy.</li>
-<li>H3/geohash cells; search cell + neighbor ring (<a href="../primitives/p15.html">P15</a>).</li>
-<li>Hot downtown cells = hot partition (<a href="../primitives/p2.html">P2</a>).</li>
-<li>Batched dispatch for better global matching.</li>
-<li>Surge = real-time supply/demand read per cell.</li>
+<li>It's a <b>write-heavy + geo-query</b> problem (~1.25M pings/s), not a storage problem &mdash; the live map is 160 MB and lives in RAM.</li>
+<li>Geo index derived as a ladder: DB scan &rarr; uniform grid &rarr; geohash &rarr; <b>H3 hexes</b> (uniform neighbors, smooth ring-expansion).</li>
+<li>Hot downtown cells = hot partition (<a href="../primitives/p2.html">P2</a>); fix by coarser parent-cell sharding or bucket-split + scatter-gather.</li>
+<li>Matching ladder: greedy nearest &rarr; <b>offer lease</b> (fix race) &rarr; <b>batched window assignment</b> (fix global quality, à la DISCO).</li>
+<li>Surge = real-time supply/demand read per cell; ETA = contraction-hierarchy routing on a live-weighted graph fed by the same stream.</li>
+<li>Don't persist every ping; positions are ephemeral, so failover is bounded by one ping interval.</li>
 </ul>
 
-<h2 class="sec">8 &middot; Further reading</h2>
+<h2 class="sec">14 &middot; Further reading</h2>
 <ul>
-<li><a href="https://www.uber.com/blog/h3/">Uber H3</a> &middot; <a href="https://www.uber.com/blog/engineering/">Uber Engineering blog</a></li>
+<li><a href="https://www.uber.com/blog/h3/">Uber Engineering — H3: Hexagonal Hierarchical Spatial Index</a></li>
+<li><a href="https://www.uber.com/blog/engineering/">Uber Engineering blog</a> (Marketplace, DISCO dispatch, ETA)</li>
+<li><a href="https://www.uber.com/blog/engineering/h3-tutorial/">H3 usage tutorial</a> &middot; <a href="https://h3geo.org/">h3geo.org docs</a></li>
 </ul>
 
 <div class="prevnext"><a href="s14.html">&larr; S14 &middot; URL shortener</a><a href="s16.html">S16 &middot; Video streaming &rarr;</a></div>

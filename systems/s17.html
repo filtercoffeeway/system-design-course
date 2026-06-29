@@ -19,7 +19,13 @@ money created or destroyed), full auditability, and the one domain where eventua
 consistency is unacceptable. Throughput is secondary to being right.</p>
 <div class="estimate">correctness: reconcile to the cent — zero money created/destroyed
 external deps: card networks, banks, Stripe — you control ONLY your side
-every state change auditable & immutable (regulators, disputes)</div>
+every state change auditable & immutable (regulators, disputes)
+
+scale (illustrative): 10,000 charges/s peak, each -> a few ledger entries
+  -> tens of thousands of ledger appends/s; modest by web standards
+  the hard part is CORRECTNESS, not QPS: money math uses integer minor units
+  (cents), never floats (0.1+0.2 != 0.3) -> store amount as int + currency code</div>
+<p>A note that separates a real answer from a naive one: <b>never represent money as a floating-point number</b> &mdash; <code>0.1 + 0.2 &ne; 0.3</code> in IEEE-754, and a fraction-of-a-cent drift becomes a reconciliation failure. Store integer minor units (cents) plus a currency code, and define rounding rules explicitly for splits/fees.</p>
 
 <h2 class="sec">2 &middot; API &amp; data model</h2>
 <div class="estimate">POST /charges
@@ -71,6 +77,8 @@ fails midway is unwound by compensations rather than left half-done.</p>
 </table></div>
 <p>You can&rsquo;t escape the external boundary, so you land on the saga and add
 <b>reconciliation</b> as the net under it.</p>
+<h3>Authorize vs capture &mdash; the money state machine</h3>
+<p>A card payment is two distinct steps, and conflating them is a classic mistake. <b>Authorization</b> places a <em>hold</em> on the customer's funds (proves the money exists and reserves it) without moving it; <b>capture</b> actually transfers it, possibly later (e.g. when an order ships). This makes the charge a state machine &mdash; <code>authorized &rarr; captured &rarr; settled</code>, with <code>voided</code> (auth released) and <code>refunded</code> branches &mdash; and the ledger records each transition as balanced entries. Auth holds expire if not captured, which is itself the lease pattern from <a href="../systems/s21.html">S21</a>/<a href="../primitives/p10.html">P10</a>. Refunds and <b>chargebacks/disputes</b> (the cardholder's bank reverses a settled payment, sometimes months later) are <em>new</em> compensating ledger entries, never edits to the original &mdash; the append-only rule is what makes the history auditable for regulators and dispute evidence.</p>
 
 <h2 class="sec">5 &middot; The hard constraint, in depth</h2>
 <div class="hard"><p>You <b>cannot wrap a distributed transaction</b> across your database
@@ -100,16 +108,25 @@ and more process than other domains. 2PC across your <em>own</em> services is po
 blocks resources; a saga is preferred. Real-time guarantees are impossible against external
 parties &mdash; reconciliation is how you make it right after the fact.</p>
 
-<h2 class="sec">8 &middot; Key talking points</h2>
+<h2 class="sec">8 &middot; Interview follow-ups (Q&amp;A)</h2>
+<p><b>Q: A user double-clicks "Pay" / the request retries &mdash; how do you avoid charging twice?</b> An idempotency key (<a href="../primitives/p9.html">P9</a>) on <code>POST /charges</code>: insert the key under a unique constraint before charging; a retry with the same key returns the stored result instead of charging again. The key insert and the ledger write commit in one transaction so they can't diverge.</p>
+<p><b>Q: Why can't you just use one ACID transaction for the whole payment?</b> The steps span your DB <em>and</em> an external processor/bank you can't enroll in your transaction or 2PC. So you use a saga (<a href="../primitives/p14.html">P14</a>): each step is idempotent and has a compensation (void/refund), and reconciliation is the net that catches anything left inconsistent.</p>
+<p><b>Q: What is reconciliation and why is it the "real" correctness mechanism?</b> A batch job that compares your ledger line-by-line against the processor's settlement statement and flags/fixes drift. Because real-time agreement with an external party is impossible (their ack can be lost after they acted), correctness is achieved <em>after the fact</em> by reconciliation, not by a real-time guarantee.</p>
+<p><b>Q: Why double-entry, not just a balance column?</b> Every movement writes balanced entries that sum to zero, so money can't be silently created or lost &mdash; a non-zero sum is an immediate, detectable bug. A single mutable balance has no such built-in invariant and no audit trail.</p>
+<p><b>Q: Authorize vs capture &mdash; why separate?</b> Auth reserves funds (a hold) without moving them; capture moves them, possibly later (on ship). It lets you verify funds upfront but only take money when you deliver, and the hold expires if not captured &mdash; a lease. Refunds/chargebacks are new compensating entries, never edits.</p>
+<p><b>Q: How do you represent money?</b> Integer minor units (cents) + currency code, never floats (<code>0.1+0.2&ne;0.3</code> drifts and breaks reconciliation). Define rounding rules explicitly for fee splits and multi-currency conversion.</p>
+<p><b>Q: A charge succeeds at the processor but your DB write fails &mdash; now what?</b> The idempotency record is left <code>in_progress</code>; on retry you query the processor by the key (or your reference) to learn the true state rather than re-charging, then complete the ledger write. Reconciliation catches any that slip through. This is the at-least-once + idempotent-effect pattern applied to money.</p>
+
+<h2 class="sec">9 &middot; Key talking points</h2>
 <ul>
 <li>Double-entry ledger: entries sum to zero = built-in bug detector.</li>
 <li>Idempotency keys to prevent double-charge (<a href="../primitives/p9.html">P9</a>).</li>
 <li>Saga + compensation for multi-step flows (<a href="../primitives/p14.html">P14</a>).</li>
 <li>Reconciliation is the real correctness mechanism, not real-time.</li>
-<li>You only control your side; no distributed txn with the bank.</li>
+<li>You only control your side; no distributed txn with the bank. Auth vs capture; money as integer cents.</li>
 </ul>
 
-<h2 class="sec">9 &middot; Further reading</h2>
+<h2 class="sec">10 &middot; Further reading</h2>
 <ul>
 <li><a href="https://stripe.com/blog/idempotency">Stripe &mdash; idempotency</a> &middot; <a href="https://www.uber.com/blog/how-ledgerstore-supports-trillions-of-indexes/">Uber LedgerStore</a></li>
 </ul>

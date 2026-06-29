@@ -119,14 +119,20 @@ be formed for some keys, and you must choose &mdash; another ladder:</p></div>
 <p>Dynamo chose AP so &ldquo;add to cart&rdquo; is never rejected; etcd chose CP so cluster state is
 never wrong. Stating this choice and justifying it from the use case is the whole answer.</p>
 
-<h2 class="sec">8 &middot; Scaling &amp; bottlenecks</h2>
+<h2 class="sec">8 &middot; Membership, failure detection & deletes</h2>
+<p>With no leader, nodes learn the ring and each other's liveness via <b>gossip</b>: each node periodically exchanges membership + heartbeat state with a few random peers, so knowledge of a join/leave/failure spreads epidemically in O(log&nbsp;n) rounds without a central registry. A node is marked down by a <b>&phi;-accrual failure detector</b> (a suspicion level that rises with missed heartbeats) rather than a hard timeout, which adapts to variable latency. <b>Deletes</b> are subtle in an LSM + replicated store: you can't just remove a key, because a replica that missed the delete would resurrect it on the next anti-entropy. So a delete writes a <b>tombstone</b> (a versioned "deleted" marker) that propagates like any write and is only physically purged after a grace period (> the longest possible replica downtime) &mdash; the same resurrection hazard as <a href="../primitives/p19.html">CRDTs</a>.</p>
+
+<h2 class="sec">9 &middot; Scaling &amp; bottlenecks</h2>
 <p>Adding a node steals a fair set of vnodes from existing nodes, moving only ~1/N of keys
 (<a href="../primitives/p2.html">P2</a>). The classic failure is the <b>hot key / wide
 partition</b> &mdash; one key (or a low-cardinality partition key like <code>country=US</code>)
 lands all its load on one replica set, recreating the single-node ceiling; mitigate by
 splitting the key or fronting it with a cache (<a href="../primitives/p4.html">P4</a>).
 Stronger consistency (higher R/W, or CP) costs latency and availability; that&rsquo;s the dial
-you tune per workload.</p>
+you tune per workload. <b>Sloppy quorum</b> + hinted handoff keep an AP store writable even
+when N's natural replicas are partitioned away: the write goes to the next N <em>reachable</em>
+nodes on the ring, with hints to replay onto the rightful owners once they return &mdash;
+trading a wider staleness window for never rejecting a write.</p>
 
 <h2 class="sec">9 &middot; Real-world example</h2>
 <div class="example">
@@ -147,16 +153,25 @@ availability in a partition and write throughput. A simpler single-leader KV (Re
 replicas) is great until the write rate or dataset exceeds one primary. Pick by the
 consistency and scale the workload actually needs.</p>
 
-<h2 class="sec">11 &middot; Key talking points</h2>
+<h2 class="sec">11 &middot; Interview follow-ups (Q&amp;A)</h2>
+<p><b>Q: With R+W&gt;N, do I always read the latest value?</b> You're guaranteed the read set overlaps the last <em>successful quorum</em> write, so a quorum read sees it. But it isn't full linearizability: concurrent writes can produce siblings, in-flight writes may be partially applied, and sloppy quorums widen the window. R+W&gt;N gives "read-your-quorum-writes," not a total order.</p>
+<p><b>Q: Why not just use last-writer-wins for conflicts?</b> LWW silently discards a concurrent update &mdash; fine for "user status," data-losing for a cart (an added item vanishes). Detect concurrency with version vectors and either return siblings for app merge or use a CRDT (<a href="../primitives/p19.html">P19</a>) that merges deterministically. Choose by whether a dropped write is acceptable.</p>
+<p><b>Q: How does a node recover after being down &mdash; full re-sync?</b> No: hinted handoff replays the writes it missed during a short outage, and Merkle-tree anti-entropy repairs the rest by comparing range hashes and exchanging only the diverged keys &mdash; bounded by the diff, not a full scan of the dataset.</p>
+<p><b>Q: AP vs CP &mdash; how do you decide in the interview?</b> From the use case: if a rejected write is worse than a stale read (cart, sessions, likes) choose AP; if a wrong value is worse than an error (config, locks, balances) choose CP. State it explicitly and justify it &mdash; that <em>is</em> the answer.</p>
+<p><b>Q: Why LSM and not a B-tree?</b> A KV store is write-heavy, and B-tree in-place updates are random I/O that caps write throughput. LSM turns writes into sequential appends (memtable+WAL &rarr; SSTable &rarr; compaction), trading read amplification that Bloom filters largely claw back (<a href="../primitives/p17.html">P17</a>).</p>
+<p><b>Q: A single hot key saturates one replica set &mdash; fix?</b> Split the key into sub-keys spread across the ring, or front it with a cache (<a href="../primitives/p4.html">P4</a>); a low-cardinality partition key (e.g. <code>country=US</code>) is the wide-partition version of the same bug &mdash; choose a higher-cardinality key.</p>
+<p><b>Q: How do deletes not come back from the dead?</b> Tombstones: a delete is a versioned marker that propagates like a write and is purged only after a grace period longer than any replica's expected downtime, so anti-entropy can't resurrect the key.</p>
+
+<h2 class="sec">12 &middot; Key talking points</h2>
 <ul>
 <li>Open with the CAP choice and justify AP vs CP from the use case.</li>
 <li>Consistent hashing + vnodes for elastic partitioning (<a href="../primitives/p2.html">P2</a>).</li>
 <li>Quorums (R + W &gt; N) as the consistency dial (<a href="../primitives/p3.html">P3</a>).</li>
 <li>LSM + WAL + Bloom internals (<a href="../primitives/p17.html">P17</a>).</li>
-<li>Vector clocks, hinted handoff, Merkle anti-entropy for AP correctness.</li>
+<li>Vector clocks, hinted handoff, Merkle anti-entropy, gossip + tombstones for AP correctness.</li>
 </ul>
 
-<h2 class="sec">12 &middot; Further reading</h2>
+<h2 class="sec">13 &middot; Further reading</h2>
 <ul>
 <li><a href="https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf">Dynamo (SOSP 2007)</a></li>
 <li><a href="https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Introduction.html">Amazon DynamoDB docs</a></li>

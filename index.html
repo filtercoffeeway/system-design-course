@@ -80,6 +80,9 @@
     <a class="tile" href="primitives/p15.html"><div class="k">P15</div><div class="t">Geospatial indexing</div></a>
     <a class="tile" href="primitives/p16.html"><div class="k">P16</div><div class="t">Backpressure</div></a>
     <a class="tile" href="primitives/p17.html"><div class="k">P17</div><div class="t">Storage internals</div></a>
+    <a class="tile" href="primitives/p18.html"><div class="k">P18</div><div class="t">Distributed sort</div></a>
+    <a class="tile" href="primitives/p19.html"><div class="k">P19</div><div class="t">CRDTs</div></a>
+    <a class="tile" href="primitives/p20.html"><div class="k">P20</div><div class="t">Distributed tracing</div></a>
   </div>
 
   <hr>
@@ -105,6 +108,10 @@
     <a class="tile" href="systems/s16.html"><div class="k">16</div><div class="t">Video streaming</div></a>
     <a class="tile" href="systems/s17.html"><div class="k">17</div><div class="t">Payment</div></a>
     <a class="tile" href="systems/s18.html"><div class="k">18</div><div class="t">Web crawler</div></a>
+    <a class="tile" href="systems/s19.html"><div class="k">19</div><div class="t">Search autocomplete</div></a>
+    <a class="tile" href="systems/s20.html"><div class="k">20</div><div class="t">Auth</div></a>
+    <a class="tile" href="systems/s21.html"><div class="k">21</div><div class="t">Booking / reservation</div></a>
+    <a class="tile" href="systems/s22.html"><div class="k">22</div><div class="t">Top-K trending</div></a>
   </div>
 
   <hr>
@@ -132,6 +139,9 @@
       <tr><td><a href="primitives/p15.html">P15 Geospatial</a></td><td>Ride-sharing</td></tr>
       <tr><td><a href="primitives/p16.html">P16 Backpressure</a></td><td>Kafka, Datadog, Rate limiter</td></tr>
       <tr><td><a href="primitives/p17.html">P17 Storage internals</a></td><td>KV, RDBMS, Object store, Kafka</td></tr>
+      <tr><td><a href="primitives/p18.html">P18 Distributed sort</a></td><td>Distributed SQL, Video, Crawler</td></tr>
+      <tr><td><a href="primitives/p19.html">P19 CRDTs</a></td><td>KV store, Booking</td></tr>
+      <tr><td><a href="primitives/p20.html">P20 Distributed tracing</a></td><td>Datadog, Task scheduler, Notification</td></tr>
     </tbody>
   </table></div>
 
@@ -158,6 +168,8 @@
     <li><a href="systems/s16.html">Video streaming</a> → P11, P8, P1: CDN + encoding pipeline.</li>
     <li><a href="systems/s17.html">Payment</a> → P14, P9, P3: saga + distributed correctness.</li>
     <li><a href="systems/s18.html">Web crawler</a> → P2, P1, P4: distributed graph traversal.</li>
+    <li><a href="systems/s19.html">Search autocomplete</a> → P2, P4, P11, P1: precomputed top-k tries + hot-key caching + streaming freshness.</li>
+    <li><a href="systems/s22.html">Top-K trending topics</a> → P7, P2, P1, P8: approximate counting (Count-Min Sketch + heavy-hitters) + per-shard top-K scatter-gather + surge-vs-baseline ranking.</li>
   </ol>
 
 </div></main>

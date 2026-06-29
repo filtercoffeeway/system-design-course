@@ -57,8 +57,20 @@ Legend: `[x]` done · `[~]` in progress · `[ ]` not started
 - [x] **S16** Video streaming                     — *Netflix Open Connect*
 - [x] **S17** Payment system                      — *Stripe, Uber LedgerStore*
 - [x] **S18** Web crawler                         — *Googlebot / Mercator*
+- [x] **S19** Search autocomplete / Typeahead      — *Google Suggest, Elasticsearch completion suggester*
+- [ ] **S20** Authentication & authorization       — *gap, not started (see DEPTH-PASS.md)*
+- [ ] **S21** Booking / reservation system          — *gap, not started (see DEPTH-PASS.md)*
+- [ ] **S22** Top-K / real-time leaderboard         — *gap, not started (see DEPTH-PASS.md)*
 
-Progress: **35 / 35** pages have full write-ups.
+## New primitives (gap additions, not yet drafted)
+
+- [ ] **P18** Distributed sort / external merge (MapReduce) — *gap, not started (see DEPTH-PASS.md)*
+- [ ] **P19** CRDTs (conflict-free replicated data types)    — *gap, not started (see DEPTH-PASS.md)*
+- [ ] **P20** Distributed tracing (spans, sampling, propagation) — *gap, not started (see DEPTH-PASS.md)*
+
+Progress: **36 / 42** pages have a full write-up (P1–17, S1–19). The six rows
+above (P18–20, S20–22) were added 2026-06-21 from a gap audit against the
+"45 curated system design questions" list and have no draft yet.
 
 ---
 
@@ -83,6 +95,12 @@ Progress: **35 / 35** pages have full write-ups.
 
 ## Changelog
 
+- 2026-06-21 — Added **S19** (already built to depth, was missing from this
+  checklist) and six new gap rows — **P18** distributed sort/MapReduce, **P19**
+  CRDTs, **P20** distributed tracing, **S20** auth, **S21** booking/reservation,
+  **S22** top-K/leaderboard — found via a gap audit against the "45 curated
+  system design questions" Reddit/SystemDesign.io list. See DEPTH-PASS.md for
+  the per-page ladder sketch. Progress now 36/42 (was reported as a stale 35/35).
 - 2026-06-20 — Scaffolded site; wrote CLAUDE.md + CHECKLIST.md; deep-dive CSS +
   Mermaid. Completed **P1, S2, S6** by hand (web-verified Datadog/Kafka facts).
 - 2026-06-20 — Completed the remaining **32** pages (P2–P17, S1, S3–S5, S7–S18)

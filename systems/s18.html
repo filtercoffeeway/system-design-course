@@ -8,89 +8,145 @@
 <nav class="side" id="side"></nav>
 <main><div class="reading" id="top">
 <div class="crumb"><a href="../index.html">Curriculum</a> / Part III · Systems / Cluster E — Domain-specific</div><h1>18 · Web Crawler</h1>
-<div class="summary"><div class="hard"><b>Hard constraint:</b> the URL frontier must be distributed (too big for one node) yet ordered (prioritized) — a distributed priority queue is non-trivial.</div><div class="prims"><b>Primitives exercised:</b> <a href="../primitives/p2.html">P2</a>, <a href="../primitives/p1.html">P1</a>, <a href="../primitives/p4.html">P4</a> (DNS caching), graph traversal.</div><p>URL frontier (priority queue by freshness); politeness (robots.txt, per-domain rate limit); near-duplicate detection (SimHash/MinHash); mandatory DNS caching; recrawl scheduling via change-frequency backoff.</p></div>
+<div class="summary"><div class="hard"><b>Hard constraint:</b> the URL frontier must be <em>distributed</em> (too big for one node), <em>prioritized</em> (crawl what matters first), and <em>polite</em> (never hammer one domain) all at once — a distributed priority queue with per-domain pacing.</div><div class="prims"><b>Primitives exercised:</b> <a href="../primitives/p2.html">P2</a> (partition by domain), <a href="../primitives/p1.html">P1</a> (batching), <a href="../primitives/p4.html">P4</a> (DNS cache), <a href="../primitives/p17.html">P17</a> (Bloom seen-set), <a href="../primitives/p9.html">P9</a> (idempotent re-fetch), <a href="../primitives/p16.html">P16</a> (backpressure).</div><p>URL frontier (priority by freshness/importance); politeness (robots.txt, per-domain rate); exact + near-duplicate detection (Bloom + SimHash/MinHash); mandatory DNS caching; recrawl scheduling via change-frequency backoff; trap avoidance.</p></div>
 
 <hr>
 
-<h2 class="sec">1 &middot; Requirements &amp; scale</h2>
-<p><b>Functional:</b> traverse the web graph, fetch pages, extract links, store content
-for indexing, and recrawl as pages change. <b>Non-functional:</b> web-scale throughput,
-politeness toward sites, deduplication, and prioritization of what to crawl next.</p>
-<div class="estimate">Back-of-envelope
-target 1,000,000,000 pages, recrawl periodically
-1,000 pages/s sustained                       ~ 86M/day -> ~12 days for a billion
-each page: DNS + fetch + parse + dedup + enqueue new links
-politeness: &lt;= 1 concurrent / small rate per domain
+<h2 class="sec">1 &middot; Requirements</h2>
+<p><b>Functional:</b> starting from seed URLs, traverse the web graph &mdash; fetch a page, extract its links, store its content for indexing (<a href="../systems/s7.html">S7</a>), enqueue new links, and recrawl pages as they change. <b>Non-functional:</b></p>
+<div class="tablewrap"><table>
+<tr><th>Property</th><th>Target</th><th>Consequence</th></tr>
+<tr><td>Throughput</td><td>tens of thousands of pages/s</td><td>massive fetcher parallelism</td></tr>
+<tr><td>Politeness</td><td>never overload a site</td><td>per-domain rate limit + robots.txt (&sect;5)</td></tr>
+<tr><td>Coverage vs freshness</td><td>find new pages AND recrawl changed ones</td><td>priority frontier + recrawl scheduler</td></tr>
+<tr><td>No duplicates</td><td>don't re-store the same/near-same page</td><td>URL seen-set + content fingerprint (&sect;6)</td></tr>
+<tr><td>Robustness</td><td>survive traps, redirects, junk</td><td>depth/budget limits, trap detection (&sect;8)</td></tr>
+</table></div>
+<p>The interesting tension: maximize fetch throughput <em>while</em> being polite to every individual site. Those pull in opposite directions &mdash; raw throughput wants to blast a domain, politeness forbids it &mdash; and reconciling them is what makes the frontier hard.</p>
+
+<h2 class="sec">2 &middot; Capacity estimation</h2>
+<div class="estimate">target 1,000,000,000 pages
+  at 1,000 pages/s   -> ~12 days for one full pass     (too slow)
+  at 30,000 pages/s  -> ~9 hours                        (need this; many fetchers)
+bandwidth: 30,000 pages/s x ~100 KB/page x 8 = ~24 Gbps ingest
+
+seen-set (have we queued this URL?): 1B URLs
+  exact (hash 20 B each)        = ~20 GB
+  Bloom filter @ 10 bits/URL    = ~1.2 GB, false-positive ~0.8%   (P17)
+content store: 1B x ~100 KB = ~100 TB (raw); compressed less
+
+DNS: 30,000 fetches/s would be 30,000 lookups/s without caching -> resolver meltdown
+  pages cluster by domain -> a cache gets a very high hit ratio (mandatory, &sect;7)
 </div>
 
-<h2 class="sec">2 &middot; High-level architecture</h2>
+<h2 class="sec">3 &middot; API & data model</h2>
+<div class="estimate">// internal services, not a public API
+enqueue(url, priority)                  // add to frontier (after seen-check)
+nextBatch(fetcher_id)  -> [url]         // frontier hands out polite-ready URLs
+storePage(url, content, fetched_at, fingerprint)
+
+frontier:     per-domain queues + a priority/freshness ordering over domains
+seen_urls:    Bloom filter (+ exact store) of canonicalized URLs        (P17)
+content_fp:   SimHash/MinHash fingerprints for near-dup detection       (&sect;6)
+crawl_meta:   url -> {last_crawled, last_changed, etag, change_interval} (&sect;9)
+dns_cache:    host -> {ips, ttl}                                        (P4)
+</div>
+
+<h2 class="sec">4 &middot; The hard constraint: the URL frontier (ladder)</h2>
+<div class="hard"><p>The frontier is a priority queue that's simultaneously too big for one node, must be <em>ordered</em> by importance/freshness, and must never release two URLs for the same domain too close together. Those three requirements fight each other.</p></div>
+<h3>Rung 0 &mdash; one in-memory FIFO queue (BFS)</h3>
+<p>Classic breadth-first: pop a URL, fetch, push its links. <b>Breaks on:</b> (a) it doesn't fit on one node at billions of URLs; (b) FIFO ignores importance &mdash; you waste days on junk before reaching valuable pages; (c) no politeness &mdash; links from one page mostly point to the <em>same</em> domain, so a FIFO hammers that host.</p>
+<h3>Rung 1 &mdash; a priority queue (importance/freshness first)</h3>
+<p>Order by a priority score (PageRank-ish importance, freshness, depth). Now you fetch valuable pages first. <b>Breaks on:</b> still hammers a domain &mdash; the highest-priority URLs at any moment are often clustered on one popular host, so a pure priority pop violates politeness.</p>
+<h3>Rung 2 &mdash; two-level frontier: priority front + per-domain back queues (the answer)</h3>
+<p>The Mercator design. A <b>front set</b> of priority queues decides <em>which URLs are important</em>. A <b>back set</b> of <em>per-domain</em> queues enforces politeness: each domain has its own FIFO, and a <b>heap of (next-allowed-time, domain)</b> releases a URL from a domain only once its politeness delay has elapsed. A fetcher is handed the domain whose next-allowed-time is soonest. This decouples "what to crawl" (priority) from "when we're allowed to" (politeness).</p>
+<div class="estimate">back queue selection (politeness heap):
+  heap entries: (next_ok_time, domain)
+  fetcher pops domain with smallest next_ok_time (wait if in the future)
+  fetch one URL from that domain's queue
+  push back (now + crawl_delay(domain), domain)
+  -> guarantees >= crawl_delay between hits to any single host
+</div>
+<h3>Rung 3 &mdash; distributed frontier (shard by domain)</h3>
+<p>Partition the whole frontier across nodes by <code>hash(domain)</code> (<a href="../primitives/p2.html">P2</a>) so all of a domain's URLs &mdash; and its politeness state &mdash; live on one shard (politeness is meaningless if two nodes independently crawl the same host). Within a shard, use the two-level structure. Persist queues (RocksDB/Kafka) so a node restart doesn't lose the frontier.</p>
+<div class="tablewrap"><table>
+<tr><th>Rung</th><th>Good until</th><th>Breaks on</th></tr>
+<tr><td>FIFO BFS</td><td>a small site crawl</td><td>size, no priority, hammers domains</td></tr>
+<tr><td>Priority queue</td><td>importance ordering</td><td>still impolite (hot-domain clustering)</td></tr>
+<tr><td>Front priority + back per-domain</td><td>polite single-node crawl</td><td>frontier exceeds one node</td></tr>
+<tr><td>Sharded by domain</td><td>web scale</td><td>&mdash; (the destination)</td></tr>
+</table></div>
+
+<h2 class="sec">5 &middot; Politeness in depth</h2>
+<p>Politeness is non-negotiable &mdash; crawl too aggressively and you DoS a site and get IP-banned. It has three parts: (1) <b>robots.txt</b> &mdash; fetch and cache each domain's rules; honor <code>Disallow</code> and <code>Crawl-delay</code>; (2) <b>per-domain rate limit</b> &mdash; typically at most one in-flight request per host and a minimum delay between requests (the politeness heap above enforces it); (3) <b>crawl budget</b> &mdash; cap how much of any one site you crawl per period so a giant site doesn't starve the rest. Identify yourself with a proper User-Agent and back off on 429/503 (<a href="../primitives/p16.html">P16</a>).</p>
+
+<h2 class="sec">6 &middot; Deduplication: exact + near-duplicate</h2>
+<p><b>Exact URL dedup</b> ("have we already queued this?"): canonicalize the URL (lowercase host, strip default ports, sort query params, drop fragments and tracking params) then check a <b>Bloom filter</b> (<a href="../primitives/p17.html">P17</a>) &mdash; 1.2&nbsp;GB for 1B URLs at ~0.8% false positives. A Bloom false positive means a genuinely-new URL is wrongly skipped (acceptable: you miss one page), never a wrong re-crawl, so the asymmetry is safe.</p>
+<p><b>Near-duplicate content dedup:</b> the web is full of mirrors, print-vs-web versions, and pages differing only in ads/timestamps. Exact hashing misses these. Use <b>SimHash</b> (Charikar): hash each page into a 64-bit fingerprint where <em>similar pages get fingerprints within a small Hamming distance</em>. Two pages are near-duplicates if their fingerprints differ in &le; ~3 bits.</p>
+<div class="estimate">SimHash(page):
+  1. weight features (shingles/tokens) of the page
+  2. for each feature hash to 64 bits; sum +w for 1-bits, -w for 0-bits per position
+  3. fingerprint bit = 1 if its column sum > 0 else 0
+  near-dup if HammingDistance(fp_a, fp_b) <= 3   (out of 64)
+  -> small edits flip few bits; boilerplate changes don't flip the fingerprint
+</div>
+<p>(MinHash + LSH is the alternative when you want estimated Jaccard set-similarity rather than SimHash's cosine-style similarity.) Near-dup detection both avoids re-storing junk and helps the indexer pick a canonical page.</p>
+
+<h2 class="sec">7 &middot; DNS caching (P4)</h2>
+<div class="newprob"><b>New bottleneck &mdash; DNS.</b> A naive crawler does one DNS lookup per fetch; at 30k fetches/s that's 30k lookups/s, which melts resolvers and adds latency to every fetch (DNS is often the slowest step). Because pages cluster heavily by domain, a local <b>DNS cache</b> (<a href="../primitives/p4.html">P4</a>) gets a very high hit ratio &mdash; mandatory, not optional. Pre-resolve domains in the frontier ahead of fetching, and respect TTLs. Some crawlers run their own recursive resolver to avoid hammering public DNS.</div>
+
+<h2 class="sec">8 &middot; Traps, junk & the high-level pipeline</h2>
 <pre class="mermaid">
 graph LR
-  F[(URL frontier: prioritized + per-domain)] --> FET[fetchers]
-  FET --> DNS[DNS cache]
-  FET --> PARSE[parse + extract links]
-  PARSE --> DEDUP{seen? near-dup?}
-  DEDUP -->|new| F
-  PARSE --> STORE[(content store)]
+  F[(frontier: priority front + per-domain back, sharded)] --> SEL[politeness selector]
+  SEL --> DNS[DNS cache] --> FET[fetchers]
+  FET --> PARSE[parse + extract links + canonicalize]
+  PARSE --> DEDUP{URL seen? content near-dup?}
+  DEDUP -->|new URL| F
+  PARSE --> FP[SimHash fingerprint]
+  PARSE --> STORE[(content store, 100 TB)]
+  PARSE --> META[recrawl scheduler]
 </pre>
+<p><b>Crawler traps</b> are infinite or near-infinite URL spaces &mdash; calendars (<code>?date=</code> forever), session-id query params that make every URL look new, deep faceted-search permutations, and self-referential redirect loops. Defenses: cap crawl depth and per-domain budget, canonicalize away session params, detect and break redirect cycles, and bound the URL length / path-segment repetition. Without these, a single trap can consume the whole frontier.</p>
 
-<h2 class="sec">3 &middot; The hard constraint, in depth</h2>
-<div class="hard"><p>The <b>URL frontier</b> must be <em>distributed</em> (it&rsquo;s far
-too large for one node) yet <em>ordered</em> (crawl high-priority/fresh pages first) and
-<em>polite</em> (never hammer one domain). A distributed priority queue with per-domain
-rate limiting is non-trivial &mdash; the practical answers are per-domain queues (a
-sorted set per host) or Kafka topics with priority, plus a scheduler that releases URLs
-respecting each domain&rsquo;s politeness delay.</p></div>
+<h2 class="sec">9 &middot; Recrawl scheduling</h2>
+<p>The web changes at wildly different rates, so a fixed recrawl interval is wasteful (recrawling a static archive hourly) or stale (recrawling a news homepage monthly). Schedule recrawls by <b>observed change frequency</b>: track <code>last_changed</code> via ETag/Last-Modified and content fingerprint; if a page changed since last visit, shorten its interval; if not, lengthen it (exponential backoff toward a max). News homepages converge to minutes/hours; archives to weeks/months. This is a per-URL adaptive timer &mdash; the same change-frequency-driven scheduling Googlebot calls crawl-budget management. Conditional GETs (<code>If-None-Match</code>/<code>If-Modified-Since</code>) make an unchanged recrawl nearly free (a 304, no body).</p>
 
-<h2 class="sec">4 &middot; Component deep dives</h2>
-<h3>Frontier &amp; politeness</h3>
-<p>Two-level: a front queue orders by priority/freshness; a back queue per domain enforces
-politeness (one in flight, respect <code>robots.txt</code> and crawl-delay). Partition by
-domain so a host&rsquo;s pages stay together (<a href="../primitives/p2.html">P2</a>).</p>
-<h3>Deduplication</h3>
-<p>Exact URL dedup (seen-set, often a Bloom filter, <a href="../primitives/p17.html">P17</a>) plus
-<b>near-duplicate</b> content detection via <b>SimHash/MinHash</b> so mirror pages and
-boilerplate aren&rsquo;t re-stored.</p>
-<h3>DNS caching</h3>
-<p>Millions of lookups make DNS a bottleneck; an aggressive local DNS cache is mandatory
-(<a href="../primitives/p4.html">P4</a>).</p>
-<h3>Recrawl scheduling</h3>
-<p>Pages change at different rates; schedule recrawls with exponential backoff keyed to
-observed change frequency &mdash; crawl news hourly, an archive monthly.</p>
+<h2 class="sec">10 &middot; Scaling, fault tolerance & alternatives</h2>
+<p>Fetchers are stateless and scale horizontally; the frontier shards by domain. <b>Idempotent re-fetch</b> (<a href="../primitives/p9.html">P9</a>): a URL may be fetched more than once after a crash &mdash; storing by canonical URL makes re-storage harmless. Persist the frontier and seen-set so a node restart resumes rather than re-crawling the web. <b>Tradeoffs:</b> breadth-first is simple but ignores importance; priority crawling fetches valuable pages first at the cost of frontier complexity. Aggressive recrawl keeps the index fresh but wastes bandwidth on stable pages. Bloom-filter dedup is memory-cheap but admits rare false negatives in coverage (a skipped page) &mdash; pair with an exact store if completeness matters. Politeness throughput vs total throughput is the eternal tension: more domains in flight, not more requests per domain, is how you go faster.</p>
 
-<h2 class="sec">5 &middot; Real-world example</h2>
+<h2 class="sec">11 &middot; Real-world example</h2>
 <div class="example">
 <span class="tag">Googlebot / Mercator</span>
-<p>The architecture traces to the <b>Mercator</b> crawler (Heydon &amp; Najork) and the
-original Google crawler (Brin &amp; Page): a prioritized URL frontier, per-host politeness
-queues, a seen-URL set, content fingerprinting to avoid duplicates, and a DNS cache.
-Modern <b>Googlebot</b> adds crawl-budget management (how much to crawl a site without
-overloading it) and change-frequency-driven recrawl scheduling. The defining challenge is
-the same: a frontier that is simultaneously huge, ordered, and polite.</p>
+<p>The architecture traces to the <b>Mercator</b> crawler (Heydon &amp; Najork) and the original Google crawler (Brin &amp; Page): a prioritized URL frontier, per-host politeness queues, a seen-URL set, content fingerprinting to avoid duplicates, and an aggressive DNS cache. The two-level frontier (front priority queues + back per-domain queues with a politeness heap) is Mercator's signature. Modern <b>Googlebot</b> adds <b>crawl-budget management</b> (how much to crawl a site without overloading it, balancing crawl-rate limit and crawl demand) and change-frequency-driven recrawl scheduling. The defining challenge is unchanged: a frontier that is simultaneously huge, ordered, and polite.</p>
 </div>
 
-<h2 class="sec">6 &middot; Tradeoffs &amp; alternatives</h2>
-<p>Breadth-first is simple but ignores importance; priority crawling fetches valuable
-pages first at the cost of frontier complexity. Aggressive recrawl keeps the index fresh
-but wastes bandwidth on stable pages. Bloom-filter dedup is memory-cheap but admits rare
-false positives (a page skipped).</p>
+<h2 class="sec">12 &middot; Interview follow-ups (Q&amp;A)</h2>
+<p><b>Q: How do you crawl fast but stay polite?</b> Parallelize across <em>domains</em>, not within a domain. The two-level frontier separates priority (front queues) from politeness (per-domain back queues + a next-allowed-time heap), so thousands of domains are in flight at once while each host sees at most one request per crawl-delay.</p>
+<p><b>Q: Why shard the frontier by domain specifically?</b> Politeness state is per-domain; if two nodes independently held the same domain's URLs they'd both crawl it and violate the rate limit. Hashing by domain keeps all of a host's URLs and its pacing state on one shard (<a href="../primitives/p2.html">P2</a>).</p>
+<p><b>Q: How do you detect that two pages are the same content at different URLs?</b> SimHash each page to a 64-bit fingerprint where similar content lands within a few bits' Hamming distance; treat &le; ~3 bits as a near-duplicate. Exact URL/content hashing can't catch mirrors and boilerplate variants; SimHash/MinHash can.</p>
+<p><b>Q: Why is DNS a problem and how do you fix it?</b> One lookup per fetch at 30k/s melts resolvers and adds latency. Pages cluster by domain, so a local DNS cache (<a href="../primitives/p4.html">P4</a>) with TTL respect gets a very high hit ratio; pre-resolve frontier domains ahead of fetching.</p>
+<p><b>Q: What's a crawler trap and how do you survive one?</b> An effectively-infinite URL space (calendars, session-id params, faceted search, redirect loops). Defend with depth + per-domain budget caps, query-param canonicalization (drop session ids), redirect-cycle detection, and URL-length/repetition limits &mdash; otherwise one site can swallow the whole frontier.</p>
+<p><b>Q: How do you decide when to recrawl?</b> Adaptively, by observed change frequency: shorten the interval for pages that change, lengthen it (exponential backoff) for stable ones, and use conditional GETs so an unchanged recrawl returns a cheap 304. News &rarr; minutes; archives &rarr; weeks.</p>
+<p><b>Q: A Bloom-filter false positive skips a real page &mdash; acceptable?</b> Usually yes: missing one page out of billions is fine, and the Bloom filter saves ~20&times; the memory of an exact set. If full coverage matters, back the Bloom with an exact store checked only on Bloom hits.</p>
 
-<h2 class="sec">7 &middot; Key talking points</h2>
+<h2 class="sec">13 &middot; Key talking points</h2>
 <ul>
-<li>The frontier: distributed + prioritized + polite is the wall.</li>
-<li>Per-domain politeness queues; respect robots.txt (<a href="../primitives/p2.html">P2</a>).</li>
-<li>Exact + near-duplicate dedup (Bloom + SimHash) (<a href="../primitives/p17.html">P17</a>).</li>
-<li>Mandatory DNS caching (<a href="../primitives/p4.html">P4</a>).</li>
-<li>Change-frequency-based recrawl scheduling.</li>
+<li>The wall is the <b>frontier</b>: distributed + prioritized + polite at once &rarr; two-level (priority front + per-domain back) sharded by domain (<a href="../primitives/p2.html">P2</a>).</li>
+<li>Parallelize across <b>domains</b>, not within one; a next-allowed-time heap enforces crawl-delay.</li>
+<li>Dedup is two-layered: exact URL via <b>Bloom filter</b> (<a href="../primitives/p17.html">P17</a>) + near-duplicate content via <b>SimHash/MinHash</b>.</li>
+<li><b>DNS caching is mandatory</b> (<a href="../primitives/p4.html">P4</a>) &mdash; pages cluster by domain so hit ratio is high.</li>
+<li>Recrawl by <b>change frequency</b> with conditional GETs; respect robots.txt and crawl budget.</li>
+<li>Survive <b>traps</b> with depth/budget caps, URL canonicalization, and redirect-loop detection.</li>
 </ul>
 
-<h2 class="sec">8 &middot; Further reading</h2>
+<h2 class="sec">14 &middot; Further reading</h2>
 <ul>
 <li><a href="https://www.cindyxiaoxiaoli.com/post/mercator-a-scalable-extensible-web-crawler">Mercator: A Scalable, Extensible Web Crawler</a></li>
-<li><a href="http://infolab.stanford.edu/~backrub/google.html">The Anatomy of a Large-Scale Hypertextual Web Search Engine (Brin &amp; Page)</a></li>
+<li><a href="http://infolab.stanford.edu/~backrub/google.html">The Anatomy of a Large-Scale Hypertextual Web Search Engine (Brin &amp; Page)</a> &middot; Charikar, "Similarity Estimation Techniques" (SimHash)</li>
 </ul>
 
-<div class="prevnext"><a href="s17.html">&larr; S17 &middot; Payment</a><span></span></div>
+<div class="prevnext"><a href="s17.html">&larr; S17 &middot; Payment</a><a href="s19.html">S19 &middot; Search autocomplete &rarr;</a></div>
 </div></main>
 </div>
 <a href="#top" class="backtop" title="Back to top">&uarr;</a>

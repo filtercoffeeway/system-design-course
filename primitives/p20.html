@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>P20 Distributed tracing — System Design Curriculum</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head><body>
+<div class="wrap">
+<nav class="side" id="side"></nav>
+<main><div class="reading" id="top">
+<div class="crumb"><a href="../index.html">Curriculum</a> / Part II · Primitives / P20</div><h1>P20 · Distributed tracing (spans, propagation, sampling)</h1>
+<div class="summary"><div class="field"><b>What it is:</b> stitch one user request's path across many services into a single causal tree of timed <em>spans</em>, by propagating a shared trace id through every hop.</div>
+<div class="field"><b>Reach for it when:</b> debugging latency/errors in a microservice or async system — "which of the 30 services made this request slow?" — and any deferred work (queues, cron) you need to tie back to its origin.</div>
+<div class="field"><b>The lever:</b> a small, propagated <b>trace context</b> (trace id + parent span id) carried on every call, plus a <b>sampling</b> decision so you keep the useful traces without storing 100% of them.</div>
+<div class="newprob"><b>New problem it hands you:</b> context must cross process / thread-pool / queue boundaries or the trace breaks; high-cardinality span storage is expensive (<a href="../primitives/p8.html">P8</a>); naive head sampling drops the rare error trace you actually wanted.</div>
+<div class="prims"><b>Exemplified by:</b> <a href="../systems/s6.html">Datadog APM / observability</a>, and the async-context check in <a href="../systems/s12.html">S12</a> / <a href="../systems/s11.html">S11</a>.</div></div>
+
+<hr>
+
+<h2 class="sec">1 &middot; The problem it solves</h2>
+<p>One click can fan through 30 services, a queue, and three databases. When it's slow or errors, a per-service log tells you <em>that</em> service was slow but not <em>why the request</em> was &mdash; you can't see the causal chain. <b>Distributed tracing</b> reconstructs the whole request as a tree of <b>spans</b> (one timed unit of work per service/operation), linked by a shared <b>trace id</b>, so you can see exactly where the time and the error went. It's the third pillar of observability alongside metrics and logs (<a href="../systems/s6.html">S6</a>) &mdash; promoted here to a standalone primitive because the propagation + sampling machinery is reused across many systems (<a href="../systems/s12.html">S12</a>, <a href="../systems/s11.html">S11</a>, <a href="../primitives/p9.html">P9</a>).</p>
+
+<h2 class="sec">2 &middot; The data model: trace, span, context</h2>
+<p>A <b>trace</b> is a tree of <b>spans</b>. Each span records: <code>trace_id</code> (shared by the whole tree), its own <code>span_id</code>, its <code>parent_span_id</code> (who called it), an operation name, start/end timestamps, and tags (service, status, attributes). The parent links make the tree; the timestamps make the waterfall.</p>
+<div class="estimate">trace_id = T1
+  span A (gateway)         parent=none     0ms-120ms
+   |- span B (auth)        parent=A        2ms-18ms
+   |- span C (orders svc)  parent=A       20ms-118ms
+       |- span D (db query) parent=C      25ms-110ms   <- 85ms here = the culprit
+</div>
+<p>The waterfall instantly shows span D (the DB) dominates, something no single service's logs reveal.</p>
+
+<h2 class="sec">3 &middot; Context propagation (the core mechanism)</h2>
+<p>For child spans to link to their parent, each service must pass the trace context to the next. The <b>W3C Trace Context</b> standard carries it in a <code>traceparent</code> HTTP header:</p>
+<div class="estimate">traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01   (55 chars)
+              ^version  ^trace-id (128 bit / 32 hex)      ^span-id (64b)  ^flags
+flags bit 0 = "sampled" -> downstream services honor the same keep/drop decision
+(plus tracestate: vendor-specific key=value pairs, e.g. for multi-vendor trace info)
+</div>
+<p>On each hop: read the incoming <code>traceparent</code>, start a new span whose <code>parent_span_id</code> = the incoming span id, and inject a fresh <code>traceparent</code> (same trace id, new span id) on outbound calls. The hard part &mdash; and the most common cause of broken traces &mdash; is propagation across <b>non-HTTP boundaries</b>:</p>
+<ul>
+<li><b>Across a queue:</b> stamp the trace context into the message headers so a consumer minutes later continues the trace (the <a href="../systems/s12.html">S12</a>/<a href="../systems/s11.html">S11</a> async-context check). Use a <em>span link</em> rather than a parent when the producer doesn't wait.</li>
+<li><b>Across threads / async / thread-pools:</b> the context lives in thread-local storage; hand it off explicitly when work jumps threads, or the child span loses its parent.</li>
+<li><b>Baggage:</b> optional propagated key&ndash;value pairs (e.g. <code>user_tier=premium</code>) that ride alongside for cross-service correlation &mdash; powerful but adds to every header, so keep it tiny.</li>
+</ul>
+
+<h2 class="sec">4 &middot; How it works (diagram)</h2>
+<pre class="mermaid">
+graph LR
+  U[request] -->|traceparent T1, span A| GW[gateway]
+  GW -->|T1, parent=A, span C| ORD[orders svc]
+  ORD -->|T1 in message headers| Q[(queue)]
+  Q -->|continue T1| WK[async worker, span E]
+  GW --> COL[span collector / agent]
+  ORD --> COL
+  WK --> COL
+  COL --> STORE[(trace store: query by trace_id / service / latency)]
+</pre>
+<p>Each service emits its spans to a local <b>agent/collector</b> (out of the request path), which forwards to a backend that assembles spans sharing a trace id into the tree and indexes them.</p>
+
+<h2 class="sec">5 &middot; The sampling ladder</h2>
+<div class="newprob"><p>Tracing every request at full fidelity is too expensive to store &mdash; so you sample. But naive sampling throws away the rare slow/error trace you most wanted. Derive the sampling strategy.</p></div>
+<h3>Rung 1 &mdash; head sampling (decide at the start)</h3>
+<p>At the first service, flip a coin: keep this trace with probability p (e.g. 1%), and propagate the decision in the <code>sampled</code> flag so every downstream service agrees (you never get half a trace). Cheap and simple.</p>
+<div class="estimate">1,000,000,000 requests/day, head sample 1% -> 10,000,000 traces/day stored
+  per trace ~ 20 spans x 500 B ~ 10 KB -> ~0.1 TB/day kept (vs ~10 TB at 100%)
+</div>
+<p><b>Breaks on:</b> the decision is made <em>before</em> you know the outcome &mdash; so a 1% sample keeps mostly boring fast traces and drops 99% of the errors and slow tails, exactly the ones worth keeping.</p>
+<h3>Rung 2 &mdash; tail sampling (decide after the trace completes)</h3>
+<p>Buffer <em>all</em> spans for a short decision window, then keep a trace if it's <em>interesting</em> (errored, slow, hit a rare endpoint) and down-sample the boring ones. Now you keep the traces that matter.</p>
+<div class="estimate">buffer 100% for ~10 s; route all spans of a trace to the SAME buffer node by hash(trace_id)%N
+  so one node sees the whole trace to decide
+in-flight: ~11,500 traces/s x 10 s x 10 KB ~ ~1.1 GB buffered    (bounded, not stored)
+keep: all errors + slow (p99) + p% of normal
+</div>
+<p><b>Breaks on:</b> cost and complexity &mdash; you must buffer everything briefly and shard by trace id so one node sees a whole trace. Often combined: tail-sample for keep/drop, head-sample a baseline for RED metrics.</p>
+<h3>Rung 3 &mdash; metrics from 100%, sample only what's stored</h3>
+<p>Compute RED metrics (Rate, Errors, Duration) from <em>every</em> span before sampling, so your dashboards/alerts are accurate even though you only <em>store</em> a sample of full traces. You get exact aggregates and representative exemplars without 100% storage.</p>
+<div class="tablewrap"><table>
+<tr><th>Rung</th><th>Decides when</th><th>Keeps the rare error?</th><th>Cost</th></tr>
+<tr><td>Head sampling</td><td>at request start</td><td>no (pre-outcome)</td><td>cheap</td></tr>
+<tr><td>Tail sampling</td><td>after trace completes</td><td>yes</td><td>buffer 100% briefly + route by trace_id</td></tr>
+<tr><td>Metrics-from-100% + sample store</td><td>aggregate always; store sampled</td><td>yes (+ exact metrics)</td><td>span processing at full rate</td></tr>
+</table></div>
+
+<h2 class="sec">6 &middot; Storage: high-cardinality spans (P8)</h2>
+<p>Spans are wide, high-cardinality records (every request has unique ids/timestamps), queried by trace id (point lookup), by service/operation, and by latency range (scan). That's the same two-access-pattern split as <a href="../systems/s6.html">S6</a>: a point-lookup layout keyed by <code>trace_id</code> to assemble one trace, plus a <b>columnar</b> store (<a href="../primitives/p8.html">P8</a>) for analytical queries ("p99 latency of the orders service by endpoint"). Retention is short (traces age out fast) and the store is write-heavy, so it leans on the same columnar/LSM machinery as a metrics/logs backend.</p>
+
+<h2 class="sec">7 &middot; Service maps &amp; correlation</h2>
+<p>Aggregating parent&rarr;child edges across many traces yields a <b>service dependency map</b> (who calls whom, with latencies/error rates per edge) &mdash; built for free from the span tree. And because the <code>trace_id</code> is propagated everywhere, it can be stamped into <b>logs</b> and attached to <b>metrics</b> exemplars, so the three pillars cross-link: from a latency spike (metric) → an exemplar trace → the logs of the slow span. That correlation is the payoff of having one propagated id.</p>
+
+<h2 class="sec">8 &middot; Real-world example</h2>
+<div class="example">
+<span class="tag">Dapper · OpenTelemetry · Datadog</span>
+<p>Google's <b>Dapper</b> paper established the model &mdash; low-overhead, always-on tracing with <em>sampling</em> as the key to making it affordable, and propagated context as the key to making it work. <b>OpenTelemetry</b> standardized the SDKs and the <b>W3C Trace Context</b> header so traces flow across vendors and languages. <b>Datadog APM</b> (and Jaeger, Zipkin, Honeycomb) implement spans → agent → backend with both head and tail sampling, RED metrics computed before sampling, columnar span storage for analytics, and trace↔log↔metric correlation on the shared trace id. The recurring lessons match the constraints: propagate context across every boundary (including queues and threads), and sample by <em>outcome</em> (tail) so you keep the errors, not just the happy path.</p>
+</div>
+
+<h2 class="sec">9 &middot; Applying it in a design</h2>
+<p>Whenever a request crosses services or defers work, say: <i>"propagate a W3C trace context on every hop &mdash; including into queue message headers and across thread handoffs &mdash; emit spans to a local collector, and tail-sample so I keep all errors/slow traces while storing a small fraction of normal ones; compute RED metrics from 100% before sampling."</i> It's the concrete answer to "how would you debug this in production?" and the async-observability requirement in <a href="../systems/s12.html">S12</a>/<a href="../systems/s11.html">S11</a>.</p>
+
+<h2 class="sec">10 &middot; Pitfalls</h2>
+<ul>
+<li>Dropping context across a queue or thread-pool &rarr; the trace silently breaks into disconnected fragments.</li>
+<li>Head-sampling only &rarr; you throw away the rare error/slow traces you needed.</li>
+<li>Sampling decisions that differ per service &rarr; partial traces (always propagate the sampled flag).</li>
+<li>Storing 100% of spans &rarr; runaway cost; or computing metrics <em>after</em> sampling &rarr; wrong rates.</li>
+<li>Unbounded baggage on every header &rarr; bloated requests.</li>
+</ul>
+
+<h2 class="sec">11 &middot; Further reading</h2>
+<ul>
+<li><a href="https://research.google/pubs/pub36356/">Dapper, a Large-Scale Distributed Systems Tracing Infrastructure</a> (Google)</li>
+<li><a href="https://www.w3.org/TR/trace-context/">W3C Trace Context</a> &middot; <a href="https://opentelemetry.io/docs/">OpenTelemetry docs</a> &middot; <a href="../systems/s6.html">S6 observability</a></li>
+</ul>
+
+<div class="prevnext"><a href="p19.html">&larr; P19 &middot; CRDTs</a><a href="../systems/s1.html">S1 &middot; Rate limiter &rarr;</a></div>
+</div></main>
+</div>
+<a href="#top" class="backtop" title="Back to top">&uarr;</a>
+<script type="module">
+  import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+  mermaid.initialize({ startOnLoad: true, theme: 'neutral' });
+</script>
+<script>window.SITE_BASE="../";</script>
+<script src="../assets/site.js"></script>
+</body></html>

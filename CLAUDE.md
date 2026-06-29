@@ -179,7 +179,10 @@ allows this CDN. Keep diagrams simple (flowchart `graph LR/TD`, sequence).
   `.hard` (the hard constraint), `.newprob` (the new bottleneck a lever creates),
   `.example` (real-company example — put `<span class="tag">Company</span>` first),
   `.note` (asides), `.estimate` (back-of-envelope math), `.prims` (primitive refs).
-- Target ~800–1500 words of real content per page. Depth over breadth.
+- ~800 words is a *floor*, not a ceiling. **Page size and word count are never a
+  blocker or a limiting factor** — cover the topic completely so the reader can answer
+  any follow-up in the area. Trim padding, never depth. (See DEPTH-PASS.md; S6 ≈3.8k
+  for its full three-pillar treatment is correct, not bloated.)
 - US English. Be precise; explain *why*, not just *what*.
 
 ## Verifying your work

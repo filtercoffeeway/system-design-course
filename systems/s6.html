@@ -1,7 +1,7 @@
 <!DOCTYPE html>
 <html lang="en"><head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>6 Distributed Log + Metrics Platform (Datadog) — System Design Curriculum</title>
+<title>6 Distributed Metrics Logging &amp; Aggregation (Datadog) — System Design Curriculum</title>
 <link rel="stylesheet" href="../assets/style.css">
 </head><body>
 <div class="wrap">
@@ -9,234 +9,600 @@
 <main><div class="reading" id="top">
 
 <div class="crumb"><a href="../index.html">Curriculum</a> / Part III · Systems / Cluster A — Foundations</div>
-<h1>6 · Distributed Log + Metrics Platform (Datadog)</h1>
+<h1>6 · Distributed Metrics Logging &amp; Aggregation (Datadog)</h1>
 
 <div class="summary">
 <div class="hard"><b>Hard constraint:</b> cardinality — the number of unique tag combinations, not the point rate, drives cost and scalability.</div>
-<div class="prims"><b>Primitives exercised:</b> <a href="../primitives/p1.html">P1</a>, <a href="../primitives/p6.html">P6</a>, <a href="../primitives/p7.html">P7</a>, <a href="../primitives/p8.html">P8</a>, <a href="../primitives/p5.html">P5</a>, <a href="../primitives/p16.html">P16</a>.</div>
-<p>Agent-side batching + pre-aggregation; Gorilla compression; inverted index on tag space; write-time rollup vs read-time aggregation; index-everything vs archive-and-index-selectively; immutable time-partitioned blocks; scatter-gather MPP with pushdown.</p>
+<div class="prims"><b>Primitives exercised:</b> <a href="../primitives/p1.html">P1</a>, <a href="../primitives/p6.html">P6</a>, <a href="../primitives/p7.html">P7</a>, <a href="../primitives/p8.html">P8</a>, <a href="../primitives/p5.html">P5</a>, <a href="../primitives/p16.html">P16</a>, <a href="../primitives/p17.html">P17</a>, <a href="../primitives/p9.html">P9</a>, <a href="../primitives/p12.html">P12</a>, <a href="../primitives/p2.html">P2</a>.</div>
+<p>Push vs pull collection; agent-side batching + pre-aggregation; mergeable sketches; Gorilla compression; inverted index on tag space; columnar TSDB; logs index-vs-archive; head- vs tail-based trace sampling; the three pillars correlated on trace context; scatter-gather MPP with pushdown.</p>
 </div>
 
 <hr>
 
-<h2 class="sec">1 · Requirements &amp; scale</h2>
-<p><b>Functional:</b> ingest metrics, logs, and traces from millions of hosts;
-let users query and aggregate them ad hoc ("p99 latency of <code>checkout</code>
-by region over the last 4 hours"), build dashboards, and fire alerts on
-thresholds. <b>Non-functional:</b> ingest must never block or drop under load
-more than gracefully; queries over recent data should feel interactive
-(sub-second to seconds); retention spans from high-resolution recent data to
-cheap long-term rollups.</p>
+<h2 class="sec">1 · Requirements</h2>
+<p><b>Functional.</b> Ingest the <b>three pillars of observability</b> — <em>metrics</em>
+(numeric time series), <em>logs</em> (high-cardinality text events), and <em>traces</em>
+(per-request span trees) — from millions of hosts; let users query and aggregate them ad
+hoc (<code>"p99 latency of checkout by region, last 4h"</code>); search logs; inspect
+traces; build dashboards; fire threshold and anomaly alerts; <b>correlate</b> across the
+three (a metric spike → the traces behind it → the logs of those traces); and retain data
+from high-resolution recent to cheap long-term.</p>
+<p>The three pillars have very different shapes — that difference <em>is</em> the design:</p>
+<div class="tablewrap"><table>
+<tr><th>Pillar</th><th>Unit</th><th>Size</th><th>Cardinality</th><th>How it's stored</th></tr>
+<tr><td>Metric</td><td>(series, ts, value)</td><td>~16 B/point</td><td>Low (bounded tag sets)</td><td>Pre-aggregated, always indexed → columnar TSDB</td></tr>
+<tr><td>Log</td><td>Timestamped event</td><td>~1 KB/event (~62×)</td><td>High (free text, ids)</td><td>Archive all, index selectively</td></tr>
+<tr><td>Trace</td><td>Tree of spans</td><td>~500 B/span, 10–50/trace</td><td>Very high (per-request)</td><td>Sample, then store like logs</td></tr>
+</table></div>
+<p><b>Non-functional.</b> Ingest must <b>never block the app</b> and must shed gracefully
+under load; recent queries are interactive (sub-second to seconds); recent data is durable
+while old data can be lossy-rolled-up; ingest is <b>at-least-once with idempotent points</b>
+(a re-sent flush must not double-count). The cost axis to bound everywhere is
+<b>cardinality</b> (§9).</p>
 
-<div class="estimate">Back-of-envelope (metrics path)
-2,000,000 hosts × 200 metrics/host        = 4×10^8 active series
-each series: 1 point / 10s                 = 4×10^7 points/sec ingested
-naive: 1 UDP packet per app metric call    = 10^9+ calls/sec at the source (!!)
-  -> source pre-aggregation collapses this to ~ points/sec, not calls/sec
-storage: 4×10^7 pts/s × 16 B/pt (naive)    ≈ 640 MB/s, ~55 TB/day raw
-  -> Gorilla compression ~ 1.3 bytes/point  => ~10× smaller on disk
-</div>
-<p>Two numbers decide the architecture. The first is that raw <em>event</em> rate
-at the source is ~1000× the <em>point</em> rate — so you must aggregate before the
-wire (<a href="../primitives/p1.html">P1</a>). The second is that what actually
-blows up cost is not points but <b>cardinality</b>: every distinct combination of
-tags is a separate series to index and store.</p>
+<h2 class="sec">2 · Capacity estimation</h2>
+<p>Numbers first — they justify every later choice, and they explain why the three pillars
+get three different storage strategies.</p>
+<div class="estimate">METRICS
+  2,000,000 hosts × 200 metrics/host        = 4×10^8 active series
+  each series: 1 point / 10s                 = 4×10^7 points/sec
+  THE 1000× TRAP: 1 UDP packet per metric call ≈ 4×10^10 calls/s  → aggregate at source (§7)
+  storage  naive 16 B/pt ≈ 55 TB/day raw     →  Gorilla ~1.37 B/pt ≈ 4.5 TB/day ≈ 1.6 PB/yr (~12×)
 
-<h2 class="sec">2 · High-level architecture</h2>
+LOGS
+  2,000,000 hosts × ~5 logs/s                = 1×10^7 logs/s
+  × ~1 KB/log                                ≈ 10 GB/s ≈ 864 TB/day raw   (a log ≈ 62× a metric point!)
+  → can't index all → archive 100%, index ~5%  (decouple ingest from index, §10)
+
+TRACES
+  1,000,000 req/s × ~20 spans/trace          = 2×10^7 spans/s
+  × ~500 B/span                              ≈ 10 GB/s ≈ 864 TB/day raw
+  → sample: head 1% → 2×10^5 spans/s stored;  tail buffer = 2×10^7×10s×500B ≈ 100 GB (§11)
+
+CARDINALITY (the actual cost driver, all three pillars)
+  10 tags × 10 values each                   = 10^10 potential series
+  one high-card tag (user_id, ~10^7 users)   turns a 1k-series metric into 10^10</div>
+<p>Three takeaways drive the rest. (1) The metric <b>event rate is ~1000× the point
+rate</b>, so you aggregate before the wire (<a href="../primitives/p1.html">P1</a>). (2)
+Logs and traces are <b>huge and high-cardinality</b> — orders of magnitude more bytes than
+metrics — so you cannot index them wholesale; you archive cheaply and index/sample
+selectively. (3) What blows up cost across all three is <b>cardinality</b>, not raw point
+rate (§9).</p>
+
+<h2 class="sec">3 · API design</h2>
+<p>Four surfaces: three fire-and-forget <b>submit</b> paths (one per pillar, always
+<code>202</code> — the client never blocks on the backend) and a <b>query/search</b> path.</p>
+<div class="estimate">POST /api/v1/series                       (metrics; agent → intake)
+  { "series":[{ "metric":"request.latency", "type":"distribution", "interval":10,
+                "tags":["service:checkout","region:eu","host:i-09f"],
+                "points":[[1718000000, <DDSketch blob>]] }] }   → 202
+
+POST /api/v1/logs                         (logs; batched)
+  { "ddsource":"nginx", "service":"checkout", "hostname":"i-09f",
+    "trace_id":"4bf9…4736",                // ← carries trace context for correlation
+    "message":"127.0.0.1 - GET /checkout 200 1234" }            → 202
+
+POST /api/v1/traces                       (spans; batched per trace)
+  { "spans":[{ "trace_id":"4bf9…4736", "span_id":"00f0…02b7", "parent_id":"…",
+               "name":"checkout.handler", "service":"checkout",
+               "start":…, "duration":…, "tags":{…} }] }         → 202
+
+GET /api/v1/query    ?q = p99:request.latency{service:checkout} by {region} &from=now-4h
+GET /api/v1/logs/search   ?q = service:checkout status:error &from=now-15m
+GET /api/v1/trace/{trace_id}</div>
+<p>The metric query language carries the whole shape of the system: an <b>aggregator</b>
+(<code>p99</code>), a <b>metric</b>, a <b>tag filter</b> (resolved through the inverted
+index), and a <b>group-by</b> (the scatter-gather grouping key). The log search reads like
+a search engine query (facets + full-text), because that is exactly what it is (§10).</p>
+
+<h2 class="sec">4 · Data model &amp; store selection (metrics)</h2>
+<p>A metric point is logically <code>(series_key, timestamp, value)</code>, where
+<b>series_key</b> = metric name + sorted tag set. The honest way to pick a store is
+<b>start with SQL and escalate only when it breaks</b> — not "NoSQL because time-series."
+Walk the ladder, anchored to 4×10<sup>7</sup> points/s from §2. (Logs and traces land on
+different stores — §10, §11.)</p>
+
+<h4>Rung 0 — one SQL table <span style="font-weight:400">(right default at small scale)</span></h4>
+<p><code>points(series_key, ts, value)</code>, composite B-tree index on
+<code>(series_key, ts)</code>. Fetching one series over a time range is a contiguous range
+scan on that index — exactly what a B-tree is good at. Fine for thousands of series.</p>
+<div class="newprob"><b>Bottleneck:</b> at 4×10<sup>7</sup> inserts/s the index has <b>no
+insert locality</b> — points for thousands of distinct series interleave, so every insert
+lands at a random place in the B-tree. Once the index exceeds RAM, each insert is a random
+disk seek; you're also storing an 8-byte float in a ~40-byte row. Volume (1.6 PB/yr) and
+random-write amplification kill it together.</div>
+
+<h4>Rung 1 — time-partition + per-series clustering <span style="font-weight:400">(helps writes &amp; retention)</span></h4>
+<p>Cut the table into immutable <b>time-windowed partitions</b> (e.g. 2-hour blocks), and
+within a block cluster rows by series. Old blocks become read-only and tier off cheaply;
+deletes become a partition drop. Right shape — but still a <b>row store</b>.</p>
+<div class="newprob"><b>Bottleneck:</b> a query like "p99 by region over 4h" reads
+<em>millions of rows to touch one column</em> (the value). A row store pulls whole rows off
+disk, so you pay I/O for tags and timestamps you've already filtered on; random per-series
+writes still thrash the page cache. Two bottlenecks: <b>write amplification</b> and
+<b>scan I/O</b>.</div>
+
+<h4>Rung 2 — LSM-backed engine for the write side <span style="font-weight:400">(<a href="../primitives/p17.html">P17</a>)</span></h4>
+<p>Buffer writes in an in-memory <b>memtable</b> + write-ahead log, flush sorted runs
+sequentially — an <b>LSM tree</b> (log-structured merge: writes go to RAM and an append-only
+log, then merge into sorted files in the background, turning random writes into sequential
+ones; <a href="../primitives/p17.html">P17</a>). Absorbs 4×10<sup>7</sup> sequential writes/s.
+But it doesn't fix scan I/O — you still read rows to touch one column.</p>
+
+<h4>Rung 3 — columnar TSDB <span style="font-weight:400">(← pick; <a href="../primitives/p8.html">P8</a>)</span></h4>
+<p>Store each series as its own <b>column</b> of values in an immutable, time-partitioned
+block, compressed with <b>Gorilla</b> (delta-of-delta on timestamps, XOR on floats — §
+below). A scan now touches only the value column, decode is cheap, and the data is ~12×
+smaller. The memtable still absorbs writes (rung 2's LSM idea), but flushed blocks are
+columnar. This is what a purpose-built <b>TSDB</b> (Prometheus TSDB, Gorilla, M3, InfluxDB)
+<em>is</em> — and we arrived here because the access pattern is
+<b>scan-few-columns-over-many-rows</b>, the exact case a row store dies on.</p>
+<div class="tablewrap"><table>
+<tr><th>Rung</th><th>Good until</th><th>Breaks on</th></tr>
+<tr><td>One SQL table</td><td>thousands of series, index fits RAM</td><td>Random-seek inserts; 1.6 PB/yr on one node</td></tr>
+<tr><td>+ time-partition</td><td>retention &amp; drops easy</td><td>Row store: scan I/O reads whole rows; write amp</td></tr>
+<tr><td>LSM engine</td><td>absorbs sequential writes</td><td>Still scans rows to touch one column</td></tr>
+<tr><td>Columnar TSDB (← pick)</td><td>scan-optimized, 12× smaller</td><td>(accepted) immutable blocks → rewrite to update</td></tr>
+</table></div>
+
+<h4>Two layouts: point/scan values vs the tag index</h4>
+<p>One partition key can't serve both access patterns, so the store is <b>split</b>
+(<a href="../primitives/p2.html">P2</a>):</p>
+<div class="estimate">VALUE BLOCKS   partition by series_id (+ time window)   ← "give me series X's points, 4h"
+  series_id → [Gorilla-compressed (ts,value) column], immutable per 2h block
+
+TAG INDEX      partition by tag                          ← "which series match this filter?"
+  "service:checkout" → postings [12, 47, 88, 91, 140, 205]   (sorted series_ids)
+  "region:eu"        → postings [3, 47, 91, 140, 301]</div>
+<p>A query resolves the filter against the <b>tag-partitioned inverted index</b> first
+(intersect postings, §8), <em>then</em> fans out to the value blocks of just the matching
+series. The tag lookup does <b>not</b> scatter across every series shard — only the value
+scan does, and that fan-out is expected (<a href="../primitives/p7.html">P7</a>). That split
+is the answer to "which partition does this query hit?"</p>
+
+<h2 class="sec">5 · High-level architecture</h2>
 <pre class="mermaid">
 graph LR
   subgraph Host
-    APP[App + DogStatsD client] -->|aggregate, ~2s| AG[Datadog Agent]
+    APP[App + DogStatsD] -->|push, agg ~2s| AG[Agent]
+    LOGF[Log files / stdout] -->|tail| AG
+    SVC[Instrumented service] -->|spans| AG
   end
-  AG -->|aggregate 10s, compress, batch| INT[Intake / edge]
+  AG -->|push: batch, compress| INT[Intake / edge]
   INT --> KQ[(Kafka: durable buffer)]
-  KQ --> RU[Rollup + index workers]
-  RU --> HOT[(Hot TSDB: recent, indexed)]
-  RU --> COLD[(Cold object store: rolled-up blocks)]
-  Q[Query service] --> HOT
-  Q --> COLD
-  U[User / dashboard / alert] --> Q
+  KQ --> MET[Metrics: dedup, rollup, index] --> TSDB[(Columnar TSDB)]
+  KQ --> LOG[Logs: parse, index-vs-archive]
+  LOG --> LIDX[(Log search index)]
+  LOG --> ARCH[(Object-store archive)]
+  KQ --> TR[Trace assembly + tail-sample] --> TST[(Trace store)]
+  TSDB --> Q[Query / search / alert]
+  LIDX --> Q
+  TST --> Q
+  Q --> U[Dashboards / alerts / investigation]
 </pre>
-<p>Data is aggregated twice at the source, buffered durably in a log, rolled up
-and indexed by tag, written to a hot time-series store for recent data and tiered
-to cheap object storage for history. Queries scatter across the storage shards,
-aggregate partials, and gather.</p>
+<p>One agent collects all three pillars and <b>pushes</b> to intake (§6). A durable Kafka
+log decouples ingest from storage and fans into three pipelines: metrics are aggregated,
+rolled up, indexed by tag, and written to a columnar TSDB; logs are parsed and split
+between a search index (the few you choose to index) and a cheap archive (everything);
+traces are assembled by <code>trace_id</code>, sampled, and stored. Queries resolve through
+the relevant index, scatter across shards, aggregate partials, and gather. The pillars are
+stitched back together at query time by shared <code>trace_id</code> + tags (§12).</p>
 
-<h2 class="sec">3 · The hard constraint, in depth: cardinality</h2>
-<div class="hard">
-<p>A metric like <code>request.latency</code> isn't one series — it's one series
-<em>per unique tag combination</em>: <code>{service, host, endpoint, status,
-region, version, ...}</code>. Ten tags with ten values each is 10^10 potential
-series. The point rate might be modest, but each new series needs an index entry,
-its own compressed block, and memory in the write path. <b>High-cardinality tags
-(user_id, request_id, full URL) are the classic way to accidentally turn a cheap
-metric into a multi-million-series monster.</b></p>
-<p>This is why the design separates <em>metrics</em> (low-cardinality, indexed,
-pre-aggregated) from <em>logs/traces</em> (high-cardinality, archived, indexed
-selectively). It's also why naive "just put it in a SQL table with a tag column"
-fails: the index on the tag cross-product is the cost, and it grows
-combinatorially.</p>
+<h2 class="sec">6 · Collection model — push vs pull</h2>
+<p>Before the data is aggregated, you choose how it's <em>collected</em>. This is a classic
+interview probe, and the answer is derived from where your targets live, not from taste.</p>
+<h4>Push — the client/agent decides when to send</h4>
+<p>The app emits to a local agent (<b>DogStatsD</b>, the OpenTelemetry SDK) and the agent
+ships <em>outbound</em> to intake. Logs and traces are inherently push — they're events as
+they happen, not pollable state. <b>Pros:</b> works for <b>ephemeral/short-lived targets</b>
+(serverless functions, batch jobs, a request handler that lives 50 ms — there's nothing to
+scrape later); firewall/NAT-friendly (outbound only); and it crosses <b>trust boundaries</b>
+— a SaaS vendor can't reach <em>into</em> a customer's private network, but the customer's
+agent can push <em>out</em>. <b>Cons:</b> the server can be <b>flooded</b> (no rate control —
+you need backpressure, §16); target discovery is implicit; and a silent target is ambiguous
+— is it healthy-but-quiet or dead?</p>
+<h4>Pull — the server scrapes targets on a schedule</h4>
+<p>The <b>Prometheus</b> model: the server discovers targets via service discovery and
+<b>scrapes</b> each one's <code>/metrics</code> endpoint every N seconds. <b>Pros:</b> the
+server <b>controls the scrape interval and cardinality</b>; a failed scrape is an
+unambiguous "target down" signal (the synthetic <code>up</code> metric flips to 0); config
+is centralized. <b>Cons:</b> the server needs <b>network reachability to every target</b>
+(hard across NAT/firewalls and impossible across a SaaS trust boundary); and it <b>can't
+see short-lived jobs</b> that finish between scrapes — you bolt on a Pushgateway, which is
+admitting push was needed.</p>
+<div class="example">
+<span class="tag">push vs pull → when each wins</span>
+<p><b>Pull (Prometheus):</b> you own the network, targets are stable and discoverable
+(long-running services in your cluster) → server-controlled, down-detection for free →
+breaks on ephemeral jobs &amp; SaaS trust boundaries. &nbsp;<b>Push (Datadog):</b> targets are
+ephemeral, client-side, or across a trust boundary → universal coverage → server must rate-
+limit/backpressure, and "is it down?" needs a heartbeat.</p>
 </div>
+<p>This is precisely why a <b>SaaS</b> observability platform like Datadog is <b>push at the
+edge</b>: it cannot scrape into millions of customers' private networks, so the agent pushes
+out. Prometheus pulls because it lives <em>inside</em> the cluster it watches. (You can
+bridge: Datadog and the OTel collector can <em>scrape</em> Prometheus endpoints locally on
+the host, then <em>push</em> upstream — pull on the LAN, push across the WAN.)</p>
 
-<h2 class="sec">4 · Component deep dives</h2>
-
-<h3>Ingestion: aggregate at the source (P1)</h3>
-<p>The DogStatsD client aggregates in-process (counters summed, gauges last-write,
-distributions accumulated) and flushes every ~2&nbsp;s. The Agent's embedded
-DogStatsD server aggregates across all processes on the host over a 10&nbsp;s flush
-interval, then compresses and batches to intake. See
-<a href="../primitives/p1.html">P1</a> for the full mechanism — this is the layer
-that makes the 1000× event-to-point reduction real, and it's the part of the
-Datadog story you specifically wanted captured.</p>
-
-<h3>Percentiles you can merge: DDSketch</h3>
-<p>Averages merge trivially; percentiles don't. To compute a global p99 from
-per-host data you'd normally need the raw samples. Datadog builds a
-<a href="https://www.datadoghq.com/blog/engineering/computing-accurate-percentiles-with-ddsketch/">DDSketch</a>
-per series at the source — a fixed-size, fully mergeable quantile sketch with a
-relative-error guarantee (e.g. 1%). Per-host sketches merge on the backend into a
-global sketch, so distribution metrics cost a bounded amount regardless of sample
-count.</p>
-
-<h3>Compression: Gorilla for time series</h3>
-<p>Consecutive points in a series have near-identical timestamps and slowly-changing
-values. Gorilla-style compression (delta-of-delta on timestamps, XOR on float
-values) shrinks a 16-byte point to roughly 1–2 bytes amortized — an order of
-magnitude — which is what makes keeping months of data economical. This is the
-storage half of <a href="../primitives/p8.html">P8</a>.</p>
-
-<h3>Indexing the tag space: inverted index (P6)</h3>
-<p>To answer "all series where <code>service=checkout AND region=eu</code>", you keep
-an <a href="../primitives/p6.html">inverted index</a> from each tag value to the set
-of series IDs that carry it. A query intersects posting lists
-(<code>service=checkout</code> ∩ <code>region=eu</code>) to find matching series,
-then reads their compressed blocks. Cardinality is precisely the size of this
-index.</p>
-
-<h3>Write-time vs read-time rollup (P5)</h3>
-<p>You can roll up at write time (precompute 1-min, 1-hour aggregates as data
-arrives — fast reads, fixed granularities, more storage) or at read time (store
-fine points, aggregate on query — flexible, slower, cheaper to store). Real systems
-do both: hot recent data stays fine-grained for flexibility; older data is rolled
-up to coarser resolution and tiered to object storage. That's the
-<a href="../primitives/p5.html">P5</a> dial plus <a href="../primitives/p8.html">P8</a>
-tiering.</p>
-
-<h3>Query: scatter-gather MPP (P7)</h3>
-<p>A query like "p99 by region, last 4h" fans out to every storage shard holding
-relevant series, each shard decodes its blocks, applies the time filter and a
-<em>partial</em> aggregation (merging DDSketches, summing counters), and returns
-small partials that the coordinator merges. Pushing the aggregation down to the
-data — not shipping raw points to a central node — is the
-<a href="../primitives/p7.html">P7</a> pattern, and the slowest shard sets the
-latency (<a href="../primitives/p12.html">P12</a>).</p>
-
-<h3>Backpressure (P16)</h3>
-<p>When intake or downstream lags, the durable Kafka buffer absorbs the burst; if it
-keeps growing, the Agent must shed — sample, drop, or slow down — rather than fall
-over. The pipeline is built to degrade, not collapse. See
-<a href="../primitives/p16.html">P16</a>.</p>
-
-<h3>Alerting: deriving when (and whether) you need a stream processor</h3>
-<p>&ldquo;Fire alerts on thresholds&rdquo; sounds like it demands a real-time
-stream-processing engine (Flink/Kafka Streams). It usually doesn&rsquo;t. Derive the
-rung from the alert <em>condition</em>, don&rsquo;t reach for Flink because the diagram
-looks busier.</p>
-<h4>Rung 0 — evaluate rules by querying the store</h4>
-<p>An evaluator runs each rule (<code>avg(cpu) by region &gt; 0.9 for 5m</code>) on a
-schedule by querying the hot TSDB — the Prometheus model. The query path
-(<a href="../primitives/p7.html">P7</a> scatter-gather) already exists, so an alert is
-just a saved query plus a for-duration. Correct and cheap for threshold alerts,
-moderate rule counts, and ~10&nbsp;s–1&nbsp;min evaluation latency.</p>
-<div class="newprob"><b>Bottleneck:</b> two things break it. Re-running thousands of
-windowed aggregations against the store every tick re-scans the same recent blocks
-over and over; and because the Agent flushes on a ~10&nbsp;s interval and the network
-adds lag, points arrive <em>after</em> their timestamp — so a query-time window
-silently mixes late data, and the alert is computed on arrival-time, not event-time.</div>
-<h4>Rung 1 — evaluate against the rollups you already compute</h4>
-<p>The pipeline already produces write-time 1-min rollups (§4, <a href="../primitives/p5.html">P5</a>)
-and source pre-aggregates (<a href="../primitives/p1.html">P1</a>). Point the evaluator at
-those instead of raw series: far fewer rows per tick, and the rollup boundary gives a
-stable window. Reuses existing machinery, no new system.</p>
-<div class="newprob"><b>Bottleneck:</b> fixed rollup granularities can&rsquo;t express a
-<em>sliding</em> event-time window, late-data correction, sessionization, multi-stream
-joins, or anomaly/derivative conditions. When the alert logic needs keyed state over an
-event-time window, the rollups don&rsquo;t have it.</div>
-<h4>Rung 2 — stateful stream processor on the Kafka buffer (the Flink-class rung)</h4>
-<p>Now it&rsquo;s hard to avoid: a stream processor consumes the durable Kafka buffer
-already in the diagram and maintains keyed, event-time windowed state with watermarks,
-evaluating alert conditions <em>in-stream</em> as points flow — sliding p99 windows,
-late-data handling, complex-event and anomaly detection at the full 4&times;10<sup>7</sup>
-points/s. Its cost is the operational weight of managed state and checkpointing. Note it
-need not be Flink specifically — Kafka Streams, Spark Structured Streaming, or a streaming
-database (Materialize, RisingWave) sit on this same rung; Flink is strongest when you want
-large state + true event-time + low latency together.</p>
+<h2 class="sec">7 · The metrics write path — aggregate at the source (the ladder)</h2>
+<p>"Ingest metrics from millions of hosts" sounds like a throughput problem. It's really an
+<b>aggregation-placement</b> problem: the cheapest point is the one you never send. Derive
+it rung by rung.</p>
+<h4>Rung 0 — one packet per metric call</h4>
+<p>Every <code>statsd.increment()</code> sends a UDP packet. At ~1000 emissions per
+aggregated point that's <b>4×10<sup>10</sup> packets/s</b> across the fleet — the network
+stack and intake melt long before storage is reached.</p>
+<div class="newprob"><b>Bottleneck:</b> per-call network + syscall overhead, not data volume.</div>
+<h4>Rung 1 — aggregate in-process (client)</h4>
+<p>The <b>DogStatsD client</b> aggregates in the app process — counters summed, gauges
+last-write-wins, distributions accumulated — and flushes every ~2 s
+(<a href="../primitives/p1.html">P1</a> batching). A million calls/s collapse to one value
+per metric per flush.</p>
+<div class="newprob"><b>Bottleneck:</b> N processes per host each open a connection and ship
+a partial — the host still emits many small payloads, and per-process partials can't be
+merged for percentiles.</div>
+<h4>Rung 2 — host agent aggregates across processes</h4>
+<p>The <b>Agent</b>'s embedded DogStatsD server aggregates across all processes on the host
+over a <b>10 s flush interval</b>, then compresses and batches one stream to intake. Now the
+host emits <em>~points/s, not calls/s</em> — the 1000× reduction is real, one connection per
+host.</p>
+<h4>Rung 3 — mergeable sketches for percentiles (DDSketch)</h4>
+<p>Sums and counts merge trivially across hosts; <b>percentiles do not</b> — a global p99
+isn't the average of per-host p99s. The naive fix ships raw samples centrally, re-introducing
+the volume you just removed. Instead each host builds a <b>DDSketch</b>: a fixed-size quantile
+sketch that buckets values on a <em>logarithmic</em> scale, so it guarantees a <b>relative
+error</b> (1% accuracy → a true p99 of 100 ms reads back in [99, 101]) and is <b>fully
+mergeable</b> with no added error. For 1% accuracy over 1 ms–100 s:</p>
+<div class="estimate">gamma = (1+0.01)/(1−0.01) = 1.0202        bucket i covers ~ gamma^i
+buckets to span 1ms…100s (10^5 range) = ln(10^5)/ln(1.0202) ≈ 576 buckets
+  → a few hundred counts, FIXED regardless of how many samples flow through</div>
+<p>Per-host sketches merge on the backend into a global sketch, so a distribution metric
+costs a bounded amount no matter the sample count.</p>
+<h4>After the wire — buffer, dedup, roll up, index</h4>
+<p>Intake appends to a durable <b>Kafka</b> log (<a href="../systems/s2.html">S2</a>): it
+absorbs bursts, decouples ingest from storage, and gives at-least-once replay. Rollup workers
+then <b>dedup</b> each point by <code>(series_id, timestamp)</code> — last-write-wins makes a
+re-delivered flush idempotent (<a href="../primitives/p9.html">P9</a>), so at-least-once
+delivery doesn't double-count; <b>roll up</b> to 1-min/1-hour aggregates
+(<a href="../primitives/p5.html">P5</a> write-time rollup) for fast dashboards; <b>append</b>
+to the in-memory head block (memtable + WAL); and <b>index</b> the tags. When intake or
+rollup lags, Kafka holds the backlog; if it keeps growing the Agent must shed — sample, drop,
+slow down — rather than fall over (<a href="../primitives/p16.html">P16</a> backpressure).</p>
 <div class="example">
 <span class="tag">rung → good until → breaks on</span>
-<p><b>Query-the-store:</b> threshold alerts, moderate rules → expensive re-scan + no
-event-time correctness. &nbsp;<b>Evaluate-the-rollups:</b> fixed-window aggregates over
-existing roll-ups → no sliding/event-time/stateful conditions. &nbsp;<b>Stream processor:</b>
-event-time windowed + anomaly alerting at volume → managed state, checkpointing, ops weight.</p>
+<p><b>Per-call packets:</b> tiny fleets → 4×10<sup>10</sup>/s melts the network. &nbsp;<b>Client
+aggregation:</b> collapses calls per process → many small per-process streams. &nbsp;<b>Agent
+(10 s):</b> one stream/host at point-rate → percentiles still don't merge. &nbsp;<b>DDSketch:</b>
+bounded, mergeable percentiles → ~1% relative error (accepted).</p>
 </div>
-<p>So a stream processor becomes mandatory <em>only</em> once the spec includes
-event-time-correct windowed or anomaly alerting at high volume. The storage and
-threshold-alerting half of this system ships fine without one — which is exactly the
-requirement you should name out loud before adding it.</p>
 
-<h2 class="sec">5 · Real-world example</h2>
+<h2 class="sec">8 · The metrics read path — scatter-gather with pushdown</h2>
+<p>Take <code>p99:request.latency{service:checkout AND region:eu} by {region}, last 4h</code>:</p>
+<ol>
+<li><b>Resolve the filter</b> against the inverted index (<a href="../primitives/p6.html">P6</a>).
+Intersect the two sorted posting lists by a merge walk:
+<div class="estimate">service:checkout : [12, 47, 88, 91, 140, 205]
+region:eu        : [ 3, 47,     91, 140, 301]
+AND (intersect)  : [47, 91, 140]        ← only these 3 series get read</div>
+Cardinality is precisely the size of this index — it's why high-card tags are the cost.</li>
+<li><b>Scatter</b> to the value shards owning series 47/91/140 across the 4h window
+(<a href="../primitives/p7.html">P7</a>).</li>
+<li><b>Partial-aggregate at the shard</b> (pushdown): each shard decodes its Gorilla blocks,
+applies the time filter, and emits a <em>partial</em> — sum counters, <b>merge DDSketches</b>
+— not raw points. Shipping summaries instead of points keeps the coordinator cheap.</li>
+<li><b>Gather &amp; merge</b> partials by the <code>by {region}</code> key, finalize p99 from
+the merged sketch.</li>
+</ol>
+<div class="newprob"><b>Bottleneck — tail latency.</b> A query that fans out to 100 shards
+fails its budget if <em>any one</em> is slow: with each shard 1% likely slow, P(≥1 slow) =
+1−0.99<sup>100</sup> ≈ <b>63%</b> (<a href="../primitives/p12.html">P12</a>). Mitigate with
+hedged requests above p95 and keeping recent blocks in RAM. Older data reads from the cold
+object-store tier at coarser rolled-up resolution.</div>
+
+<h2 class="sec">9 · The hard constraint, in depth: cardinality</h2>
+<div class="hard">
+<p>A metric like <code>request.latency</code> isn't one series — it's one series <em>per
+unique tag combination</em> <code>{service, host, endpoint, status, region, version, …}</code>.
+Ten tags with ten values each is 10<sup>10</sup> potential series. The point rate may be
+modest, but <b>each new series needs an index entry, its own compressed block, and memory in
+the write path</b>. High-cardinality tags (<code>user_id</code>, <code>request_id</code>, full
+URL) are the classic way to turn a cheap metric into a multi-million-series monster —
+attaching a 10<sup>7</sup>-user <code>user_id</code> to a 1k-series metric yields
+10<sup>10</sup> series.</p>
+</div>
+<p>So "contain cardinality" is itself a ladder:</p>
+<div class="tablewrap"><table>
+<tr><th>Rung</th><th>Good until</th><th>Breaks on</th></tr>
+<tr><td>Index every tag combo</td><td>low-cardinality metrics</td><td>Combinatorial index blow-up; SQL tag cross-product</td></tr>
+<tr><td>Split metrics vs logs</td><td>most telemetry</td><td>Needs two engines (pre-agg TSDB + archived logs)</td></tr>
+<tr><td>Tag budgets / drop-or-alias</td><td>always-on guardrail</td><td>(accepted) loses the offending dimension</td></tr>
+</table></div>
+<p>This is why the design splits <b>metrics</b> (low-cardinality, pre-aggregated, always
+indexed) from <b>logs/traces</b> (high-cardinality, archived, indexed/sampled selectively).
+It's also why "just put it in a SQL table with a tag column" fails: the index on the tag
+cross-product <em>is</em> the cost, and it grows combinatorially. The same lens explains the
+logs (§10) and traces (§11) strategies — both refuse to index/keep everything.</p>
+
+<h2 class="sec">10 · Logs pipeline, in depth</h2>
+<p>A log is a timestamped event — often a raw text line, ideally structured JSON. At ~1 KB
+it's <b>~62× a metric point</b>, and its fields (request id, user id, full URL, stack trace)
+are <b>unbounded cardinality</b>. At 864 TB/day you cannot index it all; the whole logs
+design is about <em>what you choose to make searchable</em>.</p>
+<h4>Ingestion &amp; parsing</h4>
+<p>The agent <b>tails</b> files, journald, container <code>stdout</code>, or receives syslog
+/HTTP, batches, and pushes (§6). A <b>parsing</b> stage turns text into structured fields with
+<b>grok</b> patterns — named regexes that extract fields. For an nginx line:</p>
+<div class="estimate">raw:   127.0.0.1 - - [21/Jun/2026:10:00:00] "GET /checkout HTTP/1.1" 200 1234
+grok:  %{IP:client} … "%{WORD:method} %{URIPATH:path} …" %{NUMBER:status} %{NUMBER:bytes}
+out:   { client:"127.0.0.1", method:"GET", path:"/checkout", status:200, bytes:1234 }</div>
+<p>Then <b>enrich</b> (add host/service/env tags, geo-IP), <b>filter</b> (drop noise), and
+<b>route</b>. Structured fields are what make logs <em>facetable</em> — you can group by
+<code>status</code> or <code>path</code> only because parsing pulled them out.</p>
+<h4>The index-vs-archive ladder</h4>
+<p>The core decision is <em>what to index</em>, derived against the 864 TB/day.</p>
+<div class="tablewrap"><table>
+<tr><th>Rung</th><th>What it does</th><th>Breaks on</th></tr>
+<tr><td>Index everything (ES-style)</td><td>full inverted index on every field + full-text</td><td>Index ≈ raw size → 864 TB/day of index; cost explodes</td></tr>
+<tr><td>Index facets + full-text only</td><td>index chosen fields; full-text on message</td><td>Still indexing 100% of ingest; most logs never searched</td></tr>
+<tr><td>Decouple ingest from index (← pick)</td><td>archive 100% cheaply; index a chosen subset live</td><td>(accepted) un-indexed logs need rehydration to search</td></tr>
+</table></div>
+<p><b>Rung 2 is "Logging without Limits":</b> every log is written to a cheap, compressed
+<b>object-store archive</b> (columnar, partitioned by time — <a href="../primitives/p8.html">P8</a>),
+while <b>index filters</b> decide which logs also enter the <b>hot search index</b>. You pay
+the expensive index cost only for the ~5% you'll actually query interactively; the rest sits
+in archive at ~1/20th the price. To investigate an old or rare incident you <b>rehydrate</b>
+— pull the matching window back out of archive and index it on demand.</p>
+<h4>Search</h4>
+<p>The hot index is an <b>inverted index</b> — the same structure as a search engine
+(<a href="../systems/s7.html">S7</a>, <a href="../primitives/p6.html">P6</a>): facet terms
+(<code>status:error</code>) map to posting lists of log ids; full-text tokens map to the logs
+containing them; a query intersects/unions postings, then fetches and ranks. It's sharded by
+time so a "last 15 min" query hits only recent shards — and, like metrics, fans out
+scatter-gather with the slowest shard setting the tail (<a href="../primitives/p12.html">P12</a>).</p>
+<h4>Log-based metrics &amp; patterns</h4>
+<p>Two cost-savers fall out. <b>Log-based metrics:</b> generate a metric (e.g.
+<code>count(status:error) by service</code>) from the log stream <em>before</em> archiving, so
+you keep a cheap, permanent time series even after the raw logs age out — logs feeding the
+metrics pipeline. <b>Exclusion filters / sampling:</b> for high-volume low-value logs (health
+checks, 200s), keep 1-in-N or drop entirely from the index while still archiving. Both apply
+the cardinality lesson: don't keep at full fidelity what you won't query.</p>
+
+<h2 class="sec">11 · Distributed tracing, in depth</h2>
+<p>A <b>trace</b> is the tree of work for one request; each node is a <b>span</b>
+<code>{trace_id, span_id, parent_id, name, service, start, duration, tags}</code>. Spans for
+one trace are emitted by <em>many services</em> on <em>many hosts</em>, arrive out of order,
+and must be assembled by <code>trace_id</code>.</p>
+<h4>Context propagation (W3C traceparent)</h4>
+<p>For services to share a <code>trace_id</code>, each hop forwards a <b>traceparent</b> header.
+Its 55-char layout is exact:</p>
+<div class="estimate">traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+             ┌┘ └──────── trace-id (16 B) ────────┘ └─ span-id (8B) ┘ └┘
+           version                                                   flags
+  flags = 01  → "sampled" bit SET; the whole trace shares this one decision downstream
+  trace-id space = 2^128  → collision-free at any realistic rate</div>
+<p>The caller's <code>span_id</code> becomes the callee's <code>parent_id</code>; the
+<b>sampled flag</b> is propagated so every service makes the <em>same</em> keep/drop choice —
+otherwise you'd store half a trace.</p>
+<h4>The sampling ladder — head vs tail</h4>
+<p>At 2×10<sup>7</sup> spans/s (864 TB/day) you can't keep everything. <em>When</em> you
+decide what to keep is the whole game.</p>
+<div class="estimate">Rung 0  keep 100%                  → 864 TB/day. Unaffordable. Forces a decision.
+Rung 1  HEAD sampling, fixed rate  → decide at the root, propagate the flag. Stateless, cheap.
+          breaks on: you decide BEFORE you know the outcome — errors & slow traces get dropped.
+Rung 2  HEAD, adaptive/per-service → rate-limit per endpoint, boost rare routes. Still outcome-blind.
+Rung 3  TAIL sampling (← want)     → buffer ALL spans of a trace until it completes, THEN decide
+          on the whole trace: keep if error / p99-slow / rare. Catches exactly the interesting ones.
+          costs: (a) buffer = 2×10^7 × ~10s × 500B ≈ 100 GB across collectors;
+                 (b) ALL spans of one trace must reach the SAME collector → route by hash(trace_id)%N;
+                 (c) a decision-wait delay before the trace is stored.
+Rung 4  HYBRID (production norm)   → low head baseline (e.g. 10–20% for healthy-traffic stats)
+                                     + tail rules that always keep errors/slow/rare.</div>
+<p><b>Head-based</b> sampling is stateless and free but blind: the keep/drop bit is set when
+the root span starts, before any error has happened, so it can't preferentially keep failures.
+<b>Tail-based</b> sampling holds every in-flight trace's spans in a collector until a
+<code>decision_wait</code> timer expires, then judges the <em>complete</em> trace — which is
+why it can "always keep traces that errored." Its price is real: gigabytes of in-memory
+buffer, and a <b>load-balancing constraint</b> — since the decision needs all of a trace's
+spans, they must be routed to one collector by <code>hash(trace_id) % N</code> (consistent
+hashing, <a href="../primitives/p2.html">P2</a>). Most shops run the <b>hybrid</b>: cheap head
+baseline for representative volume, tail rules for the traces that matter.</p>
+<h4>Trace-based metrics — compute before you sample</h4>
+<p>Key trick: derive the <b>RED metrics</b> (Rate, Errors, Duration) from <b>100% of spans
+before sampling</b>, then sample only what you <em>store</em>. So your dashboards and alerts
+see exact request/error/latency numbers even though you keep a tiny fraction of full traces —
+the same "aggregate the cheap summary, archive/sample the expensive raw" move as metrics (§7)
+and logs (§10).</p>
+<h4>Storage &amp; the service map</h4>
+<p>Sampled traces are stored like logs — high-cardinality events indexed by
+<code>trace_id</code>, service, resource, and tags, time-partitioned and tiered. From the span
+parent/child edges plus service tags you derive a <b>service dependency map</b> (who calls
+whom, with latency/error rates on each edge) — computed by aggregating span relationships,
+again from the full stream, not the sampled store.</p>
+
+<h2 class="sec">12 · Correlation — unifying the three pillars</h2>
+<p>Three pipelines are only an observability <em>platform</em> if you can pivot between them.
+They unify on <b>shared identity</b>: a consistent tag set (<code>service, env, version,
+host</code>) on everything, plus the <b>trace_id</b> propagated into logs and spans. The
+investigation flow becomes: a <b>metric</b> spike on a dashboard → pivot to the <b>traces</b>
+in that window with the same tags (often via an <b>exemplar</b> — a metric bucket carries a
+sample <code>trace_id</code>) → open a slow/errored trace → jump to the <b>logs</b> emitted
+during its spans (they carry the same <code>trace_id</code>). This is why context propagation
+and a unified tagging scheme are foundational, not cosmetic: without a shared key, the three
+stores are three islands. It's also the answer to the cross-cutting "async work is a debugging
+black hole" check — carry trace context through every queue and deferred job so a side effect
+firing minutes later still stitches back to the originating request.</p>
+
+<h2 class="sec">13 · Alerting — deriving when you need a stream processor</h2>
+<p>"Fire alerts on thresholds" sounds like it demands a real-time stream engine
+(Flink/Kafka Streams). It usually doesn't. Derive the rung from the alert <em>condition</em>.</p>
+<h4>Rung 0 — evaluate rules by querying the store</h4>
+<p>An evaluator runs each rule (<code>avg(cpu) by region &gt; 0.9 for 5m</code>) on a schedule
+against the hot TSDB — the Prometheus model. The query path (§8) already exists, so an alert is
+a saved query plus a for-duration. Correct and cheap for threshold alerts at ~10 s–1 min
+latency.</p>
+<div class="newprob"><b>Bottleneck:</b> re-running thousands of windowed aggregations every
+tick re-scans the same recent blocks; and because the Agent flushes on ~10 s and the network
+adds lag, points arrive <em>after</em> their event-time, so a query-time window silently mixes
+late data and computes on arrival-time, not event-time.</div>
+<h4>Rung 1 — evaluate against the rollups you already compute</h4>
+<p>The pipeline already produces write-time 1-min rollups (§7, <a href="../primitives/p5.html">P5</a>).
+Point the evaluator at those: far fewer rows per tick, and the rollup boundary gives a stable
+window. Reuses existing machinery, no new system.</p>
+<div class="newprob"><b>Bottleneck:</b> fixed rollup granularities can't express a
+<em>sliding</em> event-time window, late-data correction, sessionization, multi-stream joins,
+or anomaly/derivative conditions.</div>
+<h4>Rung 2 — stateful stream processor on the Kafka buffer (the Flink-class rung)</h4>
+<p>Now it's hard to avoid: a stream processor consumes the durable Kafka buffer already in the
+diagram and maintains keyed, event-time windowed state with <b>watermarks</b> (a moving
+"event-time is now at least T" marker that lets it close a window while tolerating bounded
+lateness), evaluating conditions in-stream — sliding p99 windows, late-data handling, anomaly
+detection at the full 4×10<sup>7</sup> points/s. Its cost is the operational weight of managed
+state and checkpointing. It need not be Flink — Kafka Streams, Spark Structured Streaming, or a
+streaming database (Materialize, RisingWave) sit on this same rung.</p>
+<div class="example">
+<span class="tag">rung → good until → breaks on</span>
+<p><b>Query-the-store:</b> threshold alerts, moderate rules → expensive re-scan + no event-time
+correctness. &nbsp;<b>Evaluate-the-rollups:</b> fixed-window aggregates → no sliding/event-time
+/stateful conditions. &nbsp;<b>Stream processor:</b> event-time windowed + anomaly alerting at
+volume → managed state, checkpointing, ops weight.</p>
+</div>
+<p>So a stream processor becomes mandatory <em>only</em> once the spec includes event-time-
+correct windowed or anomaly alerting at high volume. The storage and threshold half ships fine
+without one — exactly the requirement to name out loud before adding it.</p>
+
+<h2 class="sec">14 · Scaling &amp; bottlenecks</h2>
+<p>At 10× the design stresses on axes that are mostly <em>not</em> point rate. <b>Cardinality</b>
+grows the inverted index and per-series memory (metrics), the log index, and trace volume —
+guarded by tag budgets, the metrics/logs split, index-vs-archive, and trace sampling.
+<b>Query/search fan-out</b> widens, so the tail worsens (63% → near-certain a slow shard
+appears) — bound it with hedging and tighter per-query shard counts
+(<a href="../primitives/p12.html">P12</a>). <b>Storage</b> grows linearly — relieved by rolling
+up harder, archiving logs, sampling traces, and tiering to object storage sooner
+(<a href="../primitives/p8.html">P8</a>). The ingest tier scales horizontally because Kafka
+partitions and the metric/log workers are stateless; the two stateful pieces are the metric
+<b>head block</b> (bounded by WAL replay of only the active ~2 h window) and the trace
+<b>tail-sampling buffer</b> (bounded by <code>decision_wait</code> and sharded by
+<code>trace_id</code>).</p>
+
+<h2 class="sec">15 · Tradeoffs &amp; alternatives</h2>
+<p>If you needed arbitrary high-cardinality metric slicing (per-user metrics), you'd stop
+pre-aggregating and move toward a <a href="../systems/s8.html">columnar analytics engine</a>
+over raw events — far more flexible, far more expensive, slower. If you needed <em>exact</em>
+percentiles rather than 1%-relative, you'd ship more data. <b>Write-time vs read-time rollup</b>
+is a dial: precompute fixed granularities (fast reads, more storage) vs store fine points and
+aggregate on query (flexible, slower, cheaper). <b>Pull vs push</b> (§6): pull gives free
+down-detection and server-side control but can't cross trust boundaries; push is universal but
+needs backpressure. <b>Head vs tail sampling</b> (§11): head is cheap and stateless but
+outcome-blind; tail keeps the interesting traces but costs buffer + routing. The whole platform
+is a set of dials between <em>cost</em>, <em>query flexibility</em>, <em>resolution</em>, and
+<em>fidelity</em>.</p>
+
+<h2 class="sec">16 · Real-world example</h2>
 <div class="example">
 <span class="tag">Datadog</span>
-<p>The two-tier source aggregation above (DogStatsD client → Agent, 10&nbsp;s flush,
-DDSketch for distributions) is exactly how Datadog keeps cost proportional to unique
-series instead of raw event volume. The deliberate split between <b>metrics</b>
-(pre-aggregated, low-cardinality, always indexed) and <b>logs</b> (high-cardinality,
-archived to object storage, with their
-<a href="https://www.datadoghq.com/blog/logging-without-limits/">"Logging without
-Limits"</a> model of decoupling ingestion from indexing so you choose what to index
-after the fact) is the productized form of the cardinality constraint: it lets
-customers send everything cheaply and pay the index cost only where they need
-search.</p>
+<p>The two-tier source aggregation (DogStatsD client → Agent, 10 s flush, DDSketch for
+distributions) is exactly how Datadog keeps metric cost proportional to unique series instead
+of raw event volume, and it's <b>push</b>-based because a SaaS can't scrape into customer
+networks. Logs use
+<a href="https://www.datadoghq.com/blog/logging-without-limits/">"Logging without Limits"</a>:
+ingestion is decoupled from indexing, so customers archive everything cheaply and pay the
+search-index cost only for the logs they choose — the productized form of the cardinality
+constraint. Traces use ingestion-time sampling with retention filters (a head baseline plus
+tail-style rules that keep errors and high-latency traces). Percentile metrics use
+<a href="https://www.datadoghq.com/blog/engineering/computing-accurate-percentiles-with-ddsketch/">DDSketch</a>
+(1%-relative-error, fully mergeable, open-sourced and published at VLDB 2019).</p>
 </div>
-<div class="note">Other telemetry stacks make the same moves under different names:
-Prometheus pulls and stores locally with its own TSDB and warns hard about
-high-cardinality labels; Facebook's original Gorilla paper is the source of the
-compression scheme; M3 (Uber) and Mimir/Thanos scale the Prometheus model with
-object-storage tiering.</div>
+<div class="note">Other stacks make the same moves under different names: <b>Prometheus</b> pulls
+and stores locally in its own columnar TSDB and warns hard about high-cardinality labels;
+<b>Facebook Gorilla</b> is the source of the compression scheme (16 B → ~1.37 B/point, ~12×, 96%
+of timestamps to a single bit via delta-of-delta); <b>OpenTelemetry</b> standardizes traceparent
+propagation and the head/tail sampling collectors; <b>Elasticsearch</b> is the canonical
+index-everything logs engine the "without Limits" model reacts against; <b>M3</b> (Uber) and
+<b>Mimir/Thanos</b> scale the Prometheus model with object-storage tiering.</div>
 
-<h2 class="sec">6 · Tradeoffs &amp; alternatives</h2>
-<p>If you needed arbitrary high-cardinality slicing (per-user metrics), you'd stop
-pre-aggregating and move toward a <a href="../systems/s8.html">columnar analytics
-engine</a> over raw events — far more flexible, far more expensive, slower queries.
-If you needed exact percentiles rather than 1%-relative, you'd ship more data or
-accept higher cost. If retention mattered more than query flexibility, you'd roll up
-harder at write time and tier sooner. The whole design is a set of dials between
-<em>cost</em>, <em>query flexibility</em>, and <em>resolution</em>.</p>
+<h2 class="sec">17 · Interview follow-ups (Q&amp;A)</h2>
+<p><b>Push or pull for metrics — which and why?</b> Derive from where targets live. <b>Pull</b>
+(Prometheus) when you own the network and targets are stable + discoverable: server controls
+interval/cardinality and gets down-detection free. <b>Push</b> (Datadog/StatsD) when targets are
+ephemeral (serverless), client-side, or across a trust boundary — a SaaS can't scrape into
+customer networks, so the agent pushes out. Logs/traces are inherently push (events). Common
+hybrid: scrape Prometheus endpoints locally, push upstream.</p>
+<p><b>Which partition does <code>service=checkout AND region=eu</code> hit?</b> The
+<b>tag-partitioned inverted index</b>, not the series shards. Intersect the two posting lists to
+get matching series_ids, <em>then</em> the value scan fans out only to those series. A
+series_id-partitioned design would force the tag query to scatter every partition — which is why
+the store is two layouts (§4).</p>
+<p><b>An ingest node holding the in-memory head block crashes — recovery time?</b> Bound it: each
+ingest shard's head block is the active ~2 h window backed by a WAL; on failover the new owner
+<b>replays only that head block's WAL</b> (~10<sup>8</sup> points/shard), not the 1.6 PB/yr
+history. Flushed columnar blocks are already durable and immutable.</p>
+<p><b>Kafka is at-least-once — won't a re-delivered flush double-count?</b> Points are idempotent
+on <code>(series_id, timestamp)</code> with last-write-wins, and counters are aggregated at the
+source per flush — so re-applying a flush <b>replaces</b> that interval's value rather than adding
+(<a href="../primitives/p9.html">P9</a>). At-least-once + idempotent point = effectively-once
+storage.</p>
+<p><b>How do you compute a global p99 from per-host data?</b> You can't average per-host p99s.
+Each host ships a <b>mergeable DDSketch</b>; the backend merges them with no added error and reads
+the quantile off the merged sketch (§7).</p>
+<p><b>You can't store every log — how do you keep them useful?</b> Decouple ingest from index:
+archive 100% to cheap object storage, index only the ~5% you'll search live, and <b>rehydrate</b>
+older windows on demand. Generate <b>log-based metrics</b> (error counts) before archiving so you
+keep a permanent cheap signal even after raw logs age out (§10).</p>
+<p><b>Head or tail sampling for traces?</b> <b>Head</b> = decide at the root, stateless and cheap,
+but blind to outcome (drops errors). <b>Tail</b> = buffer all spans of a trace until it completes,
+then keep errors/slow/rare — needs ~100 GB of buffer and routing all of a trace's spans to one
+collector via <code>hash(trace_id)%N</code>. Production answer is <b>hybrid</b>: head baseline +
+tail rules for what matters (§11).</p>
+<p><b>If traces are sampled, how are trace dashboards accurate?</b> Compute <b>RED metrics</b>
+(rate/errors/duration) and the service map from <b>100% of spans before sampling</b>; sample only
+what you <em>store</em>. Aggregate signals are exact; only full-trace retrieval is sampled.</p>
+<p><b>How do you pivot from a metric spike to a root cause?</b> Shared identity: consistent
+<code>service/env/version</code> tags everywhere plus a propagated <code>trace_id</code>. Click a
+spike → exemplar trace_id → the trace → its logs (same trace_id). Without a shared key the three
+stores are islands (§12).</p>
+<p><b>A team ships a metric tagged with <code>user_id</code> and cardinality explodes — what
+happens, what do you do?</b> The index and write-path memory blow up first (cost is the index, not
+the points). Guard with a <b>tag budget</b>: cap series per metric, drop/alias the offending tag,
+and route that dimension to <b>logs</b> (archived, selectively indexed) instead of metrics.</p>
+<p><b>An alert rule takes longer to evaluate than its interval — overlap?</b> Single-flight per
+rule: <b>skip</b> the next tick while the prior evaluation is in flight (or queue at most one), so
+slow rules don't pile up and stampede the query path.</p>
 
-<h2 class="sec">7 · Key talking points</h2>
+<h2 class="sec">18 · Key talking points</h2>
 <ul>
-<li>Lead with the hard constraint: <i>"the cost driver is cardinality — unique tag
-combinations — not point rate."</i></li>
-<li>Aggregate at the source in two tiers; ship summaries, not events
-(<a href="../primitives/p1.html">P1</a>).</li>
-<li>Use mergeable sketches (DDSketch) so percentiles combine across hosts.</li>
-<li>Time-series compression (Gorilla) + immutable time-partitioned blocks
-(<a href="../primitives/p8.html">P8</a>).</li>
-<li>Inverted index on tags; intersect posting lists to resolve queries
-(<a href="../primitives/p6.html">P6</a>).</li>
-<li>Scatter-gather with pushdown aggregation; merge partials
-(<a href="../primitives/p7.html">P7</a>).</li>
-<li>Separate metrics from logs; index logs selectively to contain cardinality.</li>
-<li>Derive alerting by rung: query-the-store → evaluate-the-rollups → stateful stream
-processor (Flink-class) — the last is forced only by event-time windowed / anomaly alerts
-at volume, not by &ldquo;we have alerts.&rdquo;</li>
+<li>Lead with the hard constraint: <i>"the cost driver is <b>cardinality</b> — unique tag
+combinations — not point rate,"</i> and it governs all three pillars.</li>
+<li>Three pillars, three strategies: metrics <b>pre-aggregate + always index</b>; logs
+<b>archive all, index selectively</b>; traces <b>sample, then store</b>.</li>
+<li><b>Push at the edge</b> because a SaaS can't pull into customer networks; pull (Prometheus)
+when you own the network and want free down-detection (§6).</li>
+<li>Aggregate metrics at the source in two tiers; ship summaries not events
+(<a href="../primitives/p1.html">P1</a>) — the 1000× reduction — and use <b>mergeable DDSketch</b>
+for percentiles.</li>
+<li>Derive the metric store: SQL → time-partition → LSM → <b>columnar TSDB</b> with Gorilla
+(16 B → ~1.37 B/pt, ~12×; <a href="../primitives/p8.html">P8</a>/<a href="../primitives/p17.html">P17</a>),
+plus <b>two layouts</b> (values by series_id + inverted index by tag).</li>
+<li>Logs: "<b>Logging without Limits</b>" — decouple ingest from index, rehydrate on demand;
+log-based metrics keep a cheap permanent signal.</li>
+<li>Traces: <b>head vs tail sampling</b> (hybrid in practice); compute RED metrics from 100% of
+spans before sampling; propagate <b>W3C traceparent</b>.</li>
+<li>Correlate the pillars on shared <b>trace_id + tags</b>; query is <b>scatter-gather with
+pushdown</b>, slowest shard sets the tail (<a href="../primitives/p7.html">P7</a>,
+<a href="../primitives/p12.html">P12</a>).</li>
+<li>At-least-once ingest + idempotent points; Kafka buffer + backpressure
+(<a href="../primitives/p9.html">P9</a>, <a href="../primitives/p16.html">P16</a>).</li>
+<li>Derive alerting by rung: query-store → evaluate-rollups → stream processor (forced only by
+event-time/anomaly alerting at volume).</li>
 </ul>
 
-<h2 class="sec">8 · Further reading</h2>
+<h2 class="sec">19 · Further reading</h2>
 <ul>
 <li><a href="https://docs.datadoghq.com/developers/dogstatsd/">Datadog — DogStatsD</a> · <a href="https://docs.datadoghq.com/metrics/distributions/">Distributions</a></li>
-<li><a href="https://www.datadoghq.com/blog/engineering/computing-accurate-percentiles-with-ddsketch/">Datadog — Computing accurate percentiles with DDSketch</a></li>
-<li><a href="https://www.datadoghq.com/blog/logging-without-limits/">Datadog — Logging without Limits</a></li>
+<li><a href="https://www.datadoghq.com/blog/engineering/computing-accurate-percentiles-with-ddsketch/">Datadog — Computing accurate percentiles with DDSketch</a> · <a href="https://www.vldb.org/pvldb/vol12/p2195-masson.pdf">DDSketch paper (VLDB 2019)</a></li>
+<li><a href="https://www.datadoghq.com/blog/logging-without-limits/">Datadog — Logging without Limits</a> (decouple ingestion from indexing)</li>
+<li><a href="https://opentelemetry.io/docs/concepts/sampling/">OpenTelemetry — Sampling (head vs tail)</a> · <a href="https://www.w3.org/TR/trace-context/">W3C Trace Context</a></li>
 <li><a href="https://www.vldb.org/pvldb/vol8/p1816-teller.pdf">Gorilla: A Fast, Scalable, In-Memory Time Series Database</a> (Facebook, VLDB 2015)</li>
+<li><a href="https://prometheus.io/docs/introduction/overview/">Prometheus</a> — the pull model and its own TSDB</li>
 </ul>
 
 <div class="prevnext">
